@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use sugie::config::{self, SugieConfig};
 use sugie::github::auth::GitHubAuthManager;
-use sugie::metrics;
+use sugie::metrics::MetricsReporter;
 use sugie::notifications::NotificationDispatcher;
 use sugie::server::{create_router, AppState};
 use sugie::stale::StaleManager;
@@ -87,15 +87,16 @@ async fn main() -> anyhow::Result<()> {
                 auth.clone(),
             );
 
-            // Spawn background task for stale issues maintenance (runs every 6 hours)
+            // 1. Configurable background task for stale issues maintenance
             let stale_triage = triage.clone();
             let stale_storage = storage.clone();
             let stale_rules = config.default_rules.stale.clone();
             let stale_notifier = notifier.clone();
+            let stale_interval_secs = (stale_rules.check_interval_hours.max(1) as u64) * 3600;
 
             tokio::spawn(async move {
                 let stale_mgr = StaleManager::new(stale_rules, stale_storage.clone(), stale_notifier);
-                let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600));
+                let mut interval = tokio::time::interval(Duration::from_secs(stale_interval_secs));
 
                 loop {
                     interval.tick().await;
@@ -107,6 +108,46 @@ async fn main() -> anyhow::Result<()> {
                                 if parts.len() == 2 {
                                     if let Err(e) = stale_mgr.process_repository(&client, parts[0], parts[1]).await {
                                         error!("Error in stale processor for {}: {:?}", full_name, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            // 2. Configurable background scheduler for Weekly & Monthly Reports
+            let report_triage = triage.clone();
+            let report_storage = storage.clone();
+            let report_cfg = config.default_rules.reports.clone();
+            let report_notifier = notifier.clone();
+
+            tokio::spawn(async move {
+                let weekly_interval_secs = (report_cfg.weekly_interval_days.max(1) as u64) * 86400;
+                let mut weekly_timer = tokio::time::interval(Duration::from_secs(weekly_interval_secs));
+                let reporter = MetricsReporter::new(report_cfg.clone(), report_notifier.clone());
+
+                loop {
+                    weekly_timer.tick().await;
+                    if !report_cfg.weekly_enabled {
+                        continue;
+                    }
+                    info!("Running scheduled weekly triage report generator...");
+                    if let Ok(repos) = report_storage.list_repositories() {
+                        for (_, full_name, inst_id) in repos {
+                            if let Ok(client) = report_triage.get_client_for_installation(inst_id).await {
+                                let parts: Vec<&str> = full_name.split('/').collect();
+                                if parts.len() == 2 {
+                                    match reporter
+                                        .generate_report(&client, parts[0], parts[1], report_cfg.weekly_interval_days as i64, "Weekly")
+                                        .await
+                                    {
+                                        Ok(metrics_data) => {
+                                            if let Err(e) = reporter.publish_report(&client, parts[0], parts[1], &metrics_data).await {
+                                                error!("Failed to publish weekly report for {}: {:?}", full_name, e);
+                                            }
+                                        }
+                                        Err(e) => error!("Failed to generate weekly report for {}: {:?}", full_name, e),
                                     }
                                 }
                             }
@@ -203,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 report_cfg.publish_as_issue = true;
             }
 
-            let reporter = metrics::MetricsReporter::new(report_cfg, notifier);
+            let reporter = MetricsReporter::new(report_cfg, notifier);
             let metrics_data = reporter.generate_report(&client, parts[0], parts[1], days, label).await?;
             let md = reporter.format_markdown_report(&metrics_data);
 

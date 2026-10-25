@@ -4,11 +4,11 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::Arc;
-use sugie::config::{DcoConfig, DuplicateConfig, GrowthConfig, GrowthMilestone, RepoConfig, ReviewersConfig, SugieConfig};
+use sugie::config::{CommandsConfig, DcoConfig, DuplicateConfig, GrowthConfig, GrowthMilestone, RepoConfig, ReviewersConfig, SugieConfig};
 use sugie::github::auth::GitHubAuthManager;
 use sugie::github::models::{CommitDetails, CommitItem, Issue, User};
 use sugie::metrics::{MetricsReporter, TriageMetrics};
-use sugie::notifications::NotificationDispatcher;
+use sugie::notifications::{NotificationDispatcher, NotificationLevel, SugieEventType};
 use sugie::server::{create_router, AppState};
 use sugie::storage::Storage;
 use sugie::triage::commands::{CommandParser, SlashCommand};
@@ -120,13 +120,13 @@ async fn test_growth_tracker_milestones() {
         thresholds: vec![
             GrowthMilestone {
                 merged_prs: 3,
-                message: "3 PRs reached!".to_string(),
+                message: "3 PRs reached for @{author}!".to_string(),
                 notify_channels: false,
                 recommend_role: Some("triage".to_string()),
             },
             GrowthMilestone {
                 merged_prs: 10,
-                message: "10 PRs reached!".to_string(),
+                message: "10 PRs reached for @{author}!".to_string(),
                 notify_channels: false,
                 recommend_role: Some("maintainer".to_string()),
             },
@@ -151,6 +151,7 @@ async fn test_growth_tracker_milestones() {
     let alert = res3.unwrap();
     assert_eq!(alert.merged_prs, 3);
     assert_eq!(alert.recommend_role.as_deref(), Some("triage"));
+    assert!(alert.message.contains("@contributor-bob"));
 
     // PR #4 merged -> no duplicate milestone notification
     let res4 = tracker.on_pr_merged(user, repo, 104, None).await.unwrap();
@@ -163,29 +164,27 @@ async fn test_reviewer_load_balancing_workload() {
     let config = ReviewersConfig {
         enabled: true,
         pool: vec!["reviewer-a".to_string(), "reviewer-b".to_string()],
+        reviewers_per_pr: 1,
         max_active_reviews: 3,
         load_balancing: "least_busy".to_string(),
         out_of_office: vec![],
+        component_pools: Default::default(),
     };
 
     let balancer = ReviewerLoadBalancer::new(config, storage.clone());
     let repo = "my-org/my-repo";
 
-    let chosen = balancer.select_best_reviewer(repo, &[], &[]).unwrap().unwrap();
-    // Initially both at 0, picks reviewer-a
-    assert_eq!(chosen, "reviewer-a");
+    let chosen = balancer.select_best_reviewers(repo, &[], &[], 1).unwrap();
+    assert_eq!(chosen, vec!["reviewer-a".to_string()]);
 
     balancer.on_review_requested(repo, "reviewer-a").unwrap();
-    // Now reviewer-a has 1, reviewer-b has 0
-    let next_chosen = balancer.select_best_reviewer(repo, &[], &[]).unwrap().unwrap();
-    assert_eq!(next_chosen, "reviewer-b");
+    let next_chosen = balancer.select_best_reviewers(repo, &[], &[], 1).unwrap();
+    assert_eq!(next_chosen, vec!["reviewer-b".to_string()]);
 
     balancer.on_review_requested(repo, "reviewer-b").unwrap();
-    // When reviewer-a finishes review:
     balancer.on_review_completed_or_closed(repo, "reviewer-a").unwrap();
-    // reviewer-a has 0, reviewer-b has 1
-    let third_chosen = balancer.select_best_reviewer(repo, &[], &[]).unwrap().unwrap();
-    assert_eq!(third_chosen, "reviewer-a");
+    let third_chosen = balancer.select_best_reviewers(repo, &[], &[], 1).unwrap();
+    assert_eq!(third_chosen, vec!["reviewer-a".to_string()]);
 }
 
 #[test]
@@ -201,7 +200,7 @@ fn test_slash_commands_parser() {
     /duplicate #99
     "#;
 
-    let cmds = CommandParser::parse_comment(body);
+    let cmds = CommandParser::parse_comment(body, &CommandsConfig::default());
     assert_eq!(cmds.len(), 8);
     assert!(cmds.contains(&SlashCommand::Assign(vec!["ferris".to_string()])));
     assert!(cmds.contains(&SlashCommand::Unlabel(vec!["wip".to_string()])));
@@ -216,7 +215,11 @@ fn test_duplicate_detector() {
     let config = DuplicateConfig {
         enabled: true,
         threshold: 0.60,
+        auto_close_threshold: Some(0.95),
         add_label: Some("possible-duplicate".to_string()),
+        search_open_only: true,
+        max_search_candidates: 100,
+        algorithm: "combined".to_string(),
         comment_template: None,
     };
     let detector = DuplicateDetector::new(config);
@@ -253,7 +256,7 @@ fn test_duplicate_detector() {
     assert_eq!(matches[0].issue_number, 10);
     assert!(matches[0].similarity > 0.70);
 
-    let comment = detector.build_comment_body(&matches);
+    let comment = detector.build_comment_body("bob", 11, &matches, false);
     assert!(comment.contains("Potential Duplicate Detected"));
     assert!(comment.contains("#10"));
 }
@@ -284,7 +287,7 @@ fn test_dco_validator() {
         },
     ];
 
-    let result = validator.validate_commits(&commits);
+    let result = validator.validate_commits(&commits, "Dev");
     assert!(result.is_valid);
     assert!(result.unsigned_commits.is_empty());
 }
@@ -317,4 +320,33 @@ fn test_metrics_report_formatting() {
     assert!(md.contains("83.3%"));
     assert!(md.contains("@ferris"));
     assert!(md.contains("+330"));
+}
+
+#[tokio::test]
+async fn test_notification_event_routing() {
+    let cfg = sugie::config::NotificationsConfig::default();
+    let notifier = NotificationDispatcher::new(&cfg);
+
+    // Tests dispatch without panicking even without real endpoints
+    notifier
+        .dispatch_event(
+            SugieEventType::Assigned,
+            "Assign test",
+            "Assign description",
+            None,
+            NotificationLevel::Info,
+            Vec::new(),
+        )
+        .await;
+
+    notifier
+        .dispatch_event(
+            SugieEventType::WeeklyReport,
+            "Weekly Report Test",
+            "Report content",
+            None,
+            NotificationLevel::Info,
+            Vec::new(),
+        )
+        .await;
 }

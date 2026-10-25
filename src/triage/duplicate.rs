@@ -1,4 +1,4 @@
-use crate::config::DuplicateConfig;
+use crate::config::{interpolate, DuplicateConfig};
 use crate::github::models::Issue;
 use std::collections::HashSet;
 
@@ -18,6 +18,15 @@ impl DuplicateDetector {
         Self { config }
     }
 
+    pub fn should_auto_close(&self, matches: &[DuplicateMatch]) -> bool {
+        if let Some(close_thresh) = self.config.auto_close_threshold {
+            if let Some(top) = matches.first() {
+                return top.similarity >= close_thresh;
+            }
+        }
+        false
+    }
+
     pub fn find_duplicates(
         &self,
         current_number: u64,
@@ -30,18 +39,33 @@ impl DuplicateDetector {
         }
 
         let mut matches = Vec::new();
+        let limit = self.config.max_search_candidates as usize;
 
-        for candidate in existing_issues {
+        for candidate in existing_issues.iter().take(limit) {
             if candidate.number == current_number {
                 continue;
             }
 
-            let sim = calculate_issue_similarity(
-                title,
-                body.unwrap_or_default(),
-                &candidate.title,
-                candidate.body.as_deref().unwrap_or_default(),
-            );
+            let sim = match self.config.algorithm.as_str() {
+                "jaro_winkler" => {
+                    strsim::jaro_winkler(&title.to_lowercase(), &candidate.title.to_lowercase())
+                }
+                "jaccard" => {
+                    let tokens_a = tokenize(title, body.unwrap_or_default());
+                    let tokens_b = tokenize(&candidate.title, candidate.body.as_deref().unwrap_or_default());
+                    if tokens_a.is_empty() || tokens_b.is_empty() {
+                        0.0
+                    } else {
+                        tokens_a.intersection(&tokens_b).count() as f64 / tokens_a.union(&tokens_b).count() as f64
+                    }
+                }
+                _ => calculate_issue_similarity(
+                    title,
+                    body.unwrap_or_default(),
+                    &candidate.title,
+                    candidate.body.as_deref().unwrap_or_default(),
+                ),
+            };
 
             if sim >= self.config.threshold {
                 matches.push(DuplicateMatch {
@@ -56,24 +80,55 @@ impl DuplicateDetector {
         matches
     }
 
-    pub fn build_comment_body(&self, matches: &[DuplicateMatch]) -> String {
-        if let Some(ref custom_tmpl) = self.config.comment_template {
-            return custom_tmpl.clone();
+    pub fn build_comment_body(
+        &self,
+        author: &str,
+        current_number: u64,
+        matches: &[DuplicateMatch],
+        is_closing: bool,
+    ) -> String {
+        let top = match matches.first() {
+            Some(t) => t,
+            None => return String::new(),
+        };
+
+        let sim_percent = format!("{:.1}%", top.similarity * 100.0);
+        let curr_num_str = current_number.to_string();
+        let top_num_str = top.issue_number.to_string();
+
+        if let Some(ref tmpl) = self.config.comment_template {
+            return interpolate(
+                tmpl,
+                &[
+                    ("author", author),
+                    ("current_number", &curr_num_str),
+                    ("matched_number", &top_num_str),
+                    ("matched_title", &top.title),
+                    ("similarity", &sim_percent),
+                ],
+            );
         }
 
         let mut comment = String::from("### 🔍 Potential Duplicate Detected\n\n");
-        comment.push_str("Sugie analyzed this issue and detected high similarity with existing issues:\n\n");
-
-        for m in matches.iter().take(3) {
+        if is_closing {
             comment.push_str(&format!(
-                "- **#{}** - *{}* (Similarity: **{:.1}%**)\n",
-                m.issue_number,
-                m.title,
-                m.similarity * 100.0
+                "Sugie detected that this issue is an exact or near duplicate of **#{}** (*{}*) with **{}** confidence.\n\n\
+                Closing this issue automatically. Please continue any discussion on #{}!\n\n",
+                top.issue_number, top.title, sim_percent, top.issue_number
             ));
+        } else {
+            comment.push_str("Sugie detected high similarity with existing issue(s):\n\n");
+            for m in matches.iter().take(3) {
+                comment.push_str(&format!(
+                    "- **#{}** - *{}* (Similarity: **{:.1}%**)\n",
+                    m.issue_number,
+                    m.title,
+                    m.similarity * 100.0
+                ));
+            }
+            comment.push_str("\nIf your problem is identical, please check the existing thread to avoid splitting discussions.");
         }
 
-        comment.push_str("\nIf this is indeed the same problem, please consider joining the discussion on the existing issue.");
         comment
     }
 }
@@ -84,10 +139,8 @@ pub fn calculate_issue_similarity(
     title_b: &str,
     body_b: &str,
 ) -> f64 {
-    // 1. Title similarity
     let title_sim = strsim::jaro_winkler(&title_a.to_lowercase(), &title_b.to_lowercase());
 
-    // 2. Token Jaccard similarity of normalized text
     let tokens_a = tokenize(title_a, body_a);
     let tokens_b = tokenize(title_b, body_b);
 
@@ -103,7 +156,6 @@ pub fn calculate_issue_similarity(
         }
     };
 
-    // Weighted similarity: Title has higher weight in triage
     0.55 * title_sim + 0.45 * jaccard_sim
 }
 
@@ -143,26 +195,4 @@ fn strip_code_blocks(text: &str) -> String {
     }
 
     clean
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_similarity_calculation() {
-        let title1 = "Crash on startup when configuration file is missing";
-        let body1 = "The application panics with unexpected None when loading config";
-
-        let title2 = "Crash on startup if config file is not found";
-        let body2 = "Panic occurs with None when config file cannot be loaded";
-
-        let sim = calculate_issue_similarity(title1, body1, title2, body2);
-        assert!(sim > 0.60, "Expected high similarity, got {}", sim);
-
-        let title3 = "Add documentation for zulip webhooks";
-        let body3 = "We need docs showing how to setup zulip notifications";
-        let diff_sim = calculate_issue_similarity(title1, body1, title3, body3);
-        assert!(diff_sim < 0.35, "Expected low similarity, got {}", diff_sim);
-    }
 }

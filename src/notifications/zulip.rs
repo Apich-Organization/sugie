@@ -8,6 +8,15 @@ pub struct ZulipNotifier {
     http: Client,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ZulipTopicCategory {
+    Triage,
+    Reports,
+    Alerts,
+    Assignments,
+    Custom(&'static str),
+}
+
 impl ZulipNotifier {
     pub fn new(config: ZulipConfig) -> Self {
         Self {
@@ -16,8 +25,15 @@ impl ZulipNotifier {
         }
     }
 
-    pub async fn send_message(&self, topic_override: Option<&str>, content: &str) -> Result<()> {
-        let topic = topic_override.unwrap_or(&self.config.topic);
+    pub async fn send_message(&self, category: ZulipTopicCategory, content: &str) -> Result<()> {
+        let topic = match category {
+            ZulipTopicCategory::Triage => &self.config.topic_triage,
+            ZulipTopicCategory::Reports => &self.config.topic_reports,
+            ZulipTopicCategory::Alerts => &self.config.topic_alerts,
+            ZulipTopicCategory::Assignments => &self.config.topic_assigns,
+            ZulipTopicCategory::Custom(c) => c,
+        };
+
         let endpoint = format!("{}/api/v1/messages", self.config.site_url.trim_end_matches('/'));
 
         let params = [

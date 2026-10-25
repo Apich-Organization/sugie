@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,30 +59,21 @@ impl GitHubAuthConfig {
 pub struct NotificationsConfig {
     pub discord: Option<DiscordConfig>,
     pub zulip: Option<ZulipConfig>,
+    #[serde(default)]
+    pub events: NotificationEventsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordConfig {
     pub webhook_url: String,
+    pub reports_webhook_url: Option<String>,
     #[serde(default = "default_discord_username")]
     pub username: String,
     pub avatar_url: Option<String>,
-    #[serde(default)]
-    pub notify_on_stale: bool,
-    #[serde(default = "default_true")]
-    pub notify_on_growth: bool,
-    #[serde(default = "default_true")]
-    pub notify_on_report: bool,
-    #[serde(default)]
-    pub notify_on_ci_failure: bool,
 }
 
 fn default_discord_username() -> String {
     "sugie-bot".to_string()
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,24 +83,101 @@ pub struct ZulipConfig {
     pub bot_api_key: String,
     #[serde(default = "default_zulip_stream")]
     pub stream: String,
-    #[serde(default = "default_zulip_topic")]
-    pub topic: String,
-    #[serde(default)]
-    pub notify_on_stale: bool,
-    #[serde(default = "default_true")]
-    pub notify_on_growth: bool,
-    #[serde(default = "default_true")]
-    pub notify_on_report: bool,
-    #[serde(default)]
-    pub notify_on_ci_failure: bool,
+    #[serde(default = "default_zulip_topic_triage")]
+    pub topic_triage: String,
+    #[serde(default = "default_zulip_topic_reports")]
+    pub topic_reports: String,
+    #[serde(default = "default_zulip_topic_alerts")]
+    pub topic_alerts: String,
+    #[serde(default = "default_zulip_topic_assigns")]
+    pub topic_assigns: String,
 }
 
 fn default_zulip_stream() -> String {
     "github-triage".to_string()
 }
 
-fn default_zulip_topic() -> String {
-    "sugie-alerts".to_string()
+fn default_zulip_topic_triage() -> String {
+    "triage".to_string()
+}
+
+fn default_zulip_topic_reports() -> String {
+    "reports".to_string()
+}
+
+fn default_zulip_topic_alerts() -> String {
+    "alerts".to_string()
+}
+
+fn default_zulip_topic_assigns() -> String {
+    "assignments".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationEventsConfig {
+    #[serde(default = "default_true")]
+    pub weekly_report: bool,
+    #[serde(default = "default_true")]
+    pub monthly_report: bool,
+    #[serde(default = "default_true")]
+    pub assigned: bool,
+    #[serde(default = "default_true")]
+    pub unassigned: bool,
+    #[serde(default = "default_true")]
+    pub issue_opened: bool,
+    #[serde(default = "default_true")]
+    pub issue_closed: bool,
+    #[serde(default = "default_true")]
+    pub pr_opened: bool,
+    #[serde(default = "default_true")]
+    pub pr_merged: bool,
+    #[serde(default = "default_true")]
+    pub label_changed: bool,
+    #[serde(default = "default_true")]
+    pub stale_warned: bool,
+    #[serde(default = "default_true")]
+    pub stale_closed: bool,
+    #[serde(default = "default_true")]
+    pub ci_failure: bool,
+    #[serde(default = "default_true")]
+    pub duplicate_detected: bool,
+    #[serde(default = "default_true")]
+    pub dco_failed: bool,
+    #[serde(default = "default_true")]
+    pub growth_milestone: bool,
+    #[serde(default = "default_true")]
+    pub cross_repo_move: bool,
+}
+
+impl Default for NotificationEventsConfig {
+    fn default() -> Self {
+        Self {
+            weekly_report: true,
+            monthly_report: true,
+            assigned: true,
+            unassigned: true,
+            issue_opened: true,
+            issue_closed: true,
+            pr_opened: true,
+            pr_merged: true,
+            label_changed: true,
+            stale_warned: true,
+            stale_closed: true,
+            ci_failure: true,
+            duplicate_detected: true,
+            dco_failed: true,
+            growth_milestone: true,
+            cross_repo_move: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -135,9 +204,11 @@ pub struct RepoConfig {
     pub growth: GrowthConfig,
     #[serde(default)]
     pub reports: ReportsConfig,
+    #[serde(default)]
+    pub commands: CommandsConfig,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabelsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -147,11 +218,128 @@ pub struct LabelsConfig {
     pub keyword_rules: Vec<KeywordLabelRule>,
     #[serde(default)]
     pub template_rules: Vec<TemplateLabelRule>,
+    #[serde(default)]
+    pub size_rules: SizeLabelConfig,
+    #[serde(default)]
+    pub draft_rules: DraftLabelConfig,
+    #[serde(default)]
+    pub conventional_commits: ConventionalCommitsConfig,
+}
+
+impl Default for LabelsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path_rules: Vec::new(),
+            keyword_rules: Vec::new(),
+            template_rules: Vec::new(),
+            size_rules: SizeLabelConfig::default(),
+            draft_rules: DraftLabelConfig::default(),
+            conventional_commits: ConventionalCommitsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SizeLabelConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_size_xs")]
+    pub xs_max: u64,
+    #[serde(default = "default_size_s")]
+    pub s_max: u64,
+    #[serde(default = "default_size_m")]
+    pub m_max: u64,
+    #[serde(default = "default_size_l")]
+    pub l_max: u64,
+    #[serde(default = "default_size_labels")]
+    pub labels: Vec<String>, // [XS, S, M, L, XL]
+}
+
+impl Default for SizeLabelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            xs_max: 10,
+            s_max: 50,
+            m_max: 250,
+            l_max: 800,
+            labels: default_size_labels(),
+        }
+    }
+}
+
+fn default_size_xs() -> u64 { 10 }
+fn default_size_s() -> u64 { 50 }
+fn default_size_m() -> u64 { 250 }
+fn default_size_l() -> u64 { 800 }
+fn default_size_labels() -> Vec<String> {
+    vec![
+        "size/XS".to_string(),
+        "size/S".to_string(),
+        "size/M".to_string(),
+        "size/L".to_string(),
+        "size/XL".to_string(),
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftLabelConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_draft_label")]
+    pub draft_label: String,
+    #[serde(default = "default_true")]
+    pub remove_on_ready: bool,
+}
+
+impl Default for DraftLabelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            draft_label: "work-in-progress".to_string(),
+            remove_on_ready: true,
+        }
+    }
+}
+
+fn default_draft_label() -> String {
+    "work-in-progress".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConventionalCommitsConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_conventional_mappings")]
+    pub mappings: HashMap<String, String>,
+}
+
+impl Default for ConventionalCommitsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mappings: default_conventional_mappings(),
+        }
+    }
+}
+
+fn default_conventional_mappings() -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert("feat".to_string(), "enhancement".to_string());
+    m.insert("fix".to_string(), "bug".to_string());
+    m.insert("docs".to_string(), "documentation".to_string());
+    m.insert("perf".to_string(), "performance".to_string());
+    m.insert("test".to_string(), "testing".to_string());
+    m.insert("ci".to_string(), "ci".to_string());
+    m
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathLabelRule {
     pub pattern: String,
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
     pub labels: Vec<String>,
 }
 
@@ -181,8 +369,15 @@ pub struct DuplicateConfig {
     pub enabled: bool,
     #[serde(default = "default_duplicate_threshold")]
     pub threshold: f64,
+    pub auto_close_threshold: Option<f64>,
     #[serde(default = "default_duplicate_label")]
     pub add_label: Option<String>,
+    #[serde(default = "default_true")]
+    pub search_open_only: bool,
+    #[serde(default = "default_max_search_candidates")]
+    pub max_search_candidates: u32,
+    #[serde(default = "default_duplicate_algorithm")]
+    pub algorithm: String, // "combined", "jaccard", "jaro_winkler", "token_cosine"
     pub comment_template: Option<String>,
 }
 
@@ -191,7 +386,11 @@ impl Default for DuplicateConfig {
         Self {
             enabled: true,
             threshold: 0.65,
+            auto_close_threshold: Some(0.90),
             add_label: Some("possible-duplicate".to_string()),
+            search_open_only: true,
+            max_search_candidates: 100,
+            algorithm: "combined".to_string(),
             comment_template: None,
         }
     }
@@ -203,6 +402,14 @@ fn default_duplicate_threshold() -> f64 {
 
 fn default_duplicate_label() -> Option<String> {
     Some("possible-duplicate".to_string())
+}
+
+fn default_max_search_candidates() -> u32 {
+    100
+}
+
+fn default_duplicate_algorithm() -> String {
+    "combined".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +453,12 @@ pub struct CodeownerRule {
 pub struct StaleConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_stale_check_interval_hours")]
+    pub check_interval_hours: u32,
+    #[serde(default = "default_true")]
+    pub enable_issues: bool,
+    #[serde(default = "default_true")]
+    pub enable_prs: bool,
     #[serde(default = "default_stale_warn_days")]
     pub warn_days: u32,
     #[serde(default = "default_stale_close_days")]
@@ -253,8 +466,13 @@ pub struct StaleConfig {
     pub lock_days: Option<u32>,
     #[serde(default = "default_stale_label")]
     pub stale_label: String,
+    pub closed_label: Option<String>,
     #[serde(default = "default_exempt_labels")]
     pub exempt_labels: Vec<String>,
+    #[serde(default)]
+    pub exempt_milestones: Vec<String>,
+    #[serde(default)]
+    pub exempt_authors: Vec<String>,
     #[serde(default = "default_stale_warn_message")]
     pub warn_message: String,
     #[serde(default = "default_stale_close_message")]
@@ -265,15 +483,25 @@ impl Default for StaleConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            check_interval_hours: 6,
+            enable_issues: true,
+            enable_prs: true,
             warn_days: 30,
             close_days: 7,
             lock_days: Some(14),
             stale_label: "stale".to_string(),
+            closed_label: None,
             exempt_labels: vec!["pinned".to_string(), "security".to_string(), "never-stale".to_string()],
-            warn_message: "This issue/PR has been marked as stale due to inactivity. It will be closed in 7 days if no further activity occurs. Thank you for your contributions!".to_string(),
-            close_message: "This issue/PR was closed because it has been inactive for 7 days since being marked as stale. Feel free to reopen or open a new issue if needed.".to_string(),
+            exempt_milestones: Vec::new(),
+            exempt_authors: Vec::new(),
+            warn_message: "This item has been marked as stale due to inactivity ({days} days without updates). It will be closed in {close_days} days if no further activity occurs.".to_string(),
+            close_message: "This item was automatically closed because it has been inactive for {close_days} days since being marked as stale. Feel free to reopen if you are still actively working on it.".to_string(),
         }
     }
+}
+
+fn default_stale_check_interval_hours() -> u32 {
+    6
 }
 
 fn default_stale_warn_days() -> u32 {
@@ -293,38 +521,52 @@ fn default_exempt_labels() -> Vec<String> {
 }
 
 fn default_stale_warn_message() -> String {
-    "This issue/PR has been marked as stale due to inactivity. It will be closed in 7 days if no further activity occurs. Thank you for your contributions!".to_string()
+    "This item has been marked as stale due to inactivity ({days} days without updates). It will be closed in {close_days} days if no further activity occurs.".to_string()
 }
 
 fn default_stale_close_message() -> String {
-    "This issue/PR was closed because it has been inactive for 7 days since being marked as stale. Feel free to reopen or open a new issue if needed.".to_string()
+    "This item was automatically closed because it has been inactive for {close_days} days since being marked as stale. Feel free to reopen if you are still actively working on it.".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirstTimeConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_welcome_comment")]
-    pub welcome_comment: String,
-    #[serde(default = "default_first_time_labels")]
-    pub labels: Vec<String>,
+    #[serde(default = "default_welcome_issue_comment")]
+    pub welcome_issue_comment: String,
+    #[serde(default = "default_welcome_pr_comment")]
+    pub welcome_pr_comment: String,
+    #[serde(default = "default_first_time_issue_labels")]
+    pub issue_labels: Vec<String>,
+    #[serde(default = "default_first_time_pr_labels")]
+    pub pr_labels: Vec<String>,
 }
 
 impl Default for FirstTimeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            welcome_comment: "👋 Thank you for opening your first contribution! A maintainer will review it shortly.".to_string(),
-            labels: vec!["first-time-contributor".to_string()],
+            welcome_issue_comment: "👋 Welcome @{author}! Thank you for opening your first issue in this repository. Our maintainers will triage it shortly.".to_string(),
+            welcome_pr_comment: "🎉 Welcome @{author}! Thank you for your first pull request! Please make sure tests pass and commits follow our guidelines.".to_string(),
+            issue_labels: vec!["first-time-contributor".to_string()],
+            pr_labels: vec!["first-time-contributor".to_string()],
         }
     }
 }
 
-fn default_welcome_comment() -> String {
-    "👋 Thank you for opening your first contribution! A maintainer will review it shortly.".to_string()
+fn default_welcome_issue_comment() -> String {
+    "👋 Welcome @{author}! Thank you for opening your first issue in this repository. Our maintainers will triage it shortly.".to_string()
 }
 
-fn default_first_time_labels() -> Vec<String> {
+fn default_welcome_pr_comment() -> String {
+    "🎉 Welcome @{author}! Thank you for your first pull request! Please make sure tests pass and commits follow our guidelines.".to_string()
+}
+
+fn default_first_time_issue_labels() -> Vec<String> {
+    vec!["first-time-contributor".to_string()]
+}
+
+fn default_first_time_pr_labels() -> Vec<String> {
     vec!["first-time-contributor".to_string()]
 }
 
@@ -332,13 +574,11 @@ fn default_first_time_labels() -> Vec<String> {
 pub struct ProjectsConfig {
     #[serde(default = "default_false")]
     pub enabled: bool,
-    pub project_number: Option<i64>,
+    pub issue_project_number: Option<i64>,
+    pub pr_project_number: Option<i64>,
+    pub project_number: Option<i64>, // Fallback
     pub project_owner: Option<String>,
     pub initial_status: Option<String>,
-}
-
-fn default_false() -> bool {
-    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,8 +589,12 @@ pub struct DcoConfig {
     pub require_signoff: bool,
     #[serde(default = "default_true")]
     pub set_commit_status: bool,
+    #[serde(default = "default_dco_status_context")]
+    pub status_context: String,
     #[serde(default = "default_dco_missing_label")]
     pub missing_label: Option<String>,
+    #[serde(default = "default_exempt_authors")]
+    pub exempt_authors: Vec<String>,
     #[serde(default = "default_dco_comment")]
     pub failure_comment: Option<String>,
 }
@@ -361,10 +605,20 @@ impl Default for DcoConfig {
             enabled: true,
             require_signoff: true,
             set_commit_status: true,
+            status_context: "sugie/dco".to_string(),
             missing_label: Some("dco-missing".to_string()),
-            failure_comment: Some("⚠️ Some commits are missing a valid `Signed-off-by` line. Please sign your commits using `git commit --amend -s` or `git rebase --signoff`.".to_string()),
+            exempt_authors: default_exempt_authors(),
+            failure_comment: Some("⚠️ Some commits in this PR are missing a valid `Signed-off-by` trailer. Please sign your commits using `git commit --amend -s` or `git rebase --signoff`.".to_string()),
         }
     }
+}
+
+fn default_dco_status_context() -> String {
+    "sugie/dco".to_string()
+}
+
+fn default_exempt_authors() -> Vec<String> {
+    vec!["dependabot[bot]".to_string(), "renovate[bot]".to_string()]
 }
 
 fn default_dco_missing_label() -> Option<String> {
@@ -372,7 +626,7 @@ fn default_dco_missing_label() -> Option<String> {
 }
 
 fn default_dco_comment() -> Option<String> {
-    Some("⚠️ Some commits are missing a valid `Signed-off-by` line. Please sign your commits using `git commit --amend -s` or `git rebase --signoff`.".to_string())
+    Some("⚠️ Some commits in this PR are missing a valid `Signed-off-by` trailer. Please sign your commits using `git commit --amend -s` or `git rebase --signoff`.".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,6 +637,8 @@ pub struct CiSummaryConfig {
     pub comment_on_failure: bool,
     #[serde(default = "default_true")]
     pub sticky: bool,
+    #[serde(default = "default_true")]
+    pub notify_on_failure: bool,
 }
 
 impl Default for CiSummaryConfig {
@@ -391,6 +647,7 @@ impl Default for CiSummaryConfig {
             enabled: true,
             comment_on_failure: true,
             sticky: true,
+            notify_on_failure: true,
         }
     }
 }
@@ -401,12 +658,20 @@ pub struct ReviewersConfig {
     pub enabled: bool,
     #[serde(default)]
     pub pool: Vec<String>,
+    #[serde(default = "default_reviewers_per_pr")]
+    pub reviewers_per_pr: usize,
     #[serde(default = "default_max_active_reviews")]
     pub max_active_reviews: u32,
     #[serde(default = "default_review_load_balancing")]
     pub load_balancing: String, // "least_busy" or "round_robin"
     #[serde(default)]
     pub out_of_office: Vec<String>,
+    #[serde(default)]
+    pub component_pools: HashMap<String, Vec<String>>,
+}
+
+fn default_reviewers_per_pr() -> usize {
+    1
 }
 
 fn default_max_active_reviews() -> u32 {
@@ -447,13 +712,13 @@ fn default_growth_thresholds() -> Vec<GrowthMilestone> {
     vec![
         GrowthMilestone {
             merged_prs: 3,
-            message: "🎉 Contributor has merged 3 PRs! Consider inviting them to the Triage team.".to_string(),
+            message: "🎉 Contributor @{author} has merged 3 PRs! Consider inviting them to the Triage team.".to_string(),
             notify_channels: true,
             recommend_role: Some("triage".to_string()),
         },
         GrowthMilestone {
             merged_prs: 10,
-            message: "🚀 Outstanding contributor! 10 merged PRs! Consider inviting them to the Maintainer/Committer team.".to_string(),
+            message: "🚀 Outstanding contributor @{author} with 10 merged PRs! Consider inviting them to the Committer/Maintainer team.".to_string(),
             notify_channels: true,
             recommend_role: Some("committer".to_string()),
         },
@@ -466,10 +731,22 @@ pub struct ReportsConfig {
     pub weekly_enabled: bool,
     #[serde(default = "default_true")]
     pub monthly_enabled: bool,
+    #[serde(default = "default_weekly_interval_days")]
+    pub weekly_interval_days: u32,
+    #[serde(default = "default_monthly_interval_days")]
+    pub monthly_interval_days: u32,
     #[serde(default = "default_false")]
     pub publish_as_issue: bool,
+    #[serde(default = "default_true")]
+    pub sync_to_discord: bool,
+    #[serde(default = "default_true")]
+    pub sync_to_zulip: bool,
     #[serde(default = "default_report_labels")]
     pub issue_labels: Vec<String>,
+    #[serde(default = "default_top_contributors_limit")]
+    pub top_contributors_limit: usize,
+    pub custom_header: Option<String>,
+    pub custom_footer: Option<String>,
 }
 
 impl Default for ReportsConfig {
@@ -477,14 +754,53 @@ impl Default for ReportsConfig {
         Self {
             weekly_enabled: true,
             monthly_enabled: true,
+            weekly_interval_days: 7,
+            monthly_interval_days: 30,
             publish_as_issue: false,
+            sync_to_discord: true,
+            sync_to_zulip: true,
             issue_labels: vec!["report".to_string(), "metrics".to_string()],
+            top_contributors_limit: 10,
+            custom_header: None,
+            custom_footer: None,
         }
     }
 }
 
+fn default_weekly_interval_days() -> u32 { 7 }
+fn default_monthly_interval_days() -> u32 { 30 }
+fn default_top_contributors_limit() -> usize { 10 }
 fn default_report_labels() -> Vec<String> {
     vec!["report".to_string(), "metrics".to_string()]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandsConfig {
+    #[serde(default = "default_command_prefix")]
+    pub prefix: String,
+    #[serde(default)]
+    pub allowed_roles: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub aliases: HashMap<String, String>,
+}
+
+impl Default for CommandsConfig {
+    fn default() -> Self {
+        let mut aliases = HashMap::new();
+        aliases.insert("l".to_string(), "label".to_string());
+        aliases.insert("a".to_string(), "assign".to_string());
+        aliases.insert("c".to_string(), "close".to_string());
+
+        Self {
+            prefix: "/".to_string(),
+            allowed_roles: HashMap::new(),
+            aliases,
+        }
+    }
+}
+
+fn default_command_prefix() -> String {
+    "/".to_string()
 }
 
 impl SugieConfig {
@@ -498,7 +814,6 @@ impl SugieConfig {
         if path.as_ref().exists() {
             Self::load_from_file(path)
         } else {
-            // Attempt to build from environment variables
             let app_id: u64 = std::env::var("SUGIE_GITHUB_APP_ID")
                 .map_err(|_| anyhow::anyhow!("SUGIE_GITHUB_APP_ID not set"))?
                 .parse()?;
@@ -532,7 +847,6 @@ impl RepoConfig {
         match repo_override {
             None => self.clone(),
             Some(mut overridden) => {
-                // If overridden has empty rules, keep defaults if appropriate
                 if overridden.labels.path_rules.is_empty() {
                     overridden.labels.path_rules = self.labels.path_rules.clone();
                 }
@@ -546,4 +860,13 @@ impl RepoConfig {
             }
         }
     }
+}
+
+pub fn interpolate(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut result = template.to_string();
+    for (key, val) in vars {
+        let placeholder = format!("{{{}}}", key);
+        result = result.replace(&placeholder, val);
+    }
+    result
 }

@@ -1,0 +1,27 @@
+# Podman Quadlet container definition for Sugie Bot
+# Install location: ~/.config/containers/systemd/sugie.container (user mode)
+# Or system-wide:   /etc/containers/systemd/sugie.container
+#
+# After placing this file, run:
+#   systemctl --user daemon-reload
+#   systemctl --user start sugie.service
+
+[Unit]
+Description=Sugie GitHub Triage Bot Container
+After=network-online.target
+
+[Container]
+ContainerName=sugie-bot
+Image=localhost/sugie:latest
+PublishPort=8080:8080
+Volume=%h/sugie/data:/app/data:Z
+Volume=%h/sugie/sugie.toml:/app/sugie.toml:ro,Z
+Environment=RUST_LOG=info
+Environment=SUGIE_DB_PATH=/app/data/sugie.db
+Exec=serve --config /app/sugie.toml
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

@@ -1,203 +1,181 @@
 # 🦀 Sugie (杉枝)
 
-> A powerful, production-ready GitHub triage bot engineered in Rust for open-source organizations and high-velocity engineering teams.
+> A powerful, highly configurable GitHub triage bot engineered in Rust for open-source organizations, mono-repos, and modern engineering teams. Native **Podman** containerized deployment with deep **Discord** & **Zulip** event synchronization.
 
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![Podman Ready](https://img.shields.io/badge/container-podman%20native-purple.svg)](https://podman.io)
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
 ---
 
-## 🌟 Key Features
+## 🌟 Key Features & Deep Configurability
 
-| Capability | Description |
+| Capability | Configurable Features & Logic |
 | :--- | :--- |
 | 🔐 **GitHub App + Webhook Auth** | Standard GitHub App architecture with RS256 JWT generation, expiring installation token caching, and constant-time HMAC-SHA256 webhook signature verification (`X-Hub-Signature-256`). |
 | 🏢 **Multi-Repo Dynamic Onboarding** | Listens to `installation_repositories` and `installation` events to automatically onboard new repositories added to an organization without restarting the server. |
-| 🏷️ **TOML-Driven Labeling** | Path-based rules (`globset`), title/body keyword matching, regex rules, and issue template word detection. Supports organization-level defaults with repo-level `.github/sugie.toml` overrides. |
-| 🔍 **Duplicate Issue/PR Detection** | Fast, tokenized n-gram Jaccard and string distance similarity algorithms. Flags duplicate issues above configurable thresholds with friendly links to existing issues. |
-| 👥 **CODEOWNERS & Maintainer Routing** | Parses `.github/CODEOWNERS` and custom TOML maintainer rules. Automatically assigns maintainers or mentions them in comments based on changed files or keywords. |
-| ⏳ **Tiered Stale Management** | 3-stage lifecycle engine: **Warn** after inactivity period → **Close** if inactive after warning → **Lock** conversation. Honors exempt labels (`pinned`, `security`, etc.). |
-| 👋 **First-Time Contributor Greeting** | Detects first-time contributors (`author_association` or commit history), welcomes them with customizable onboarding messages, and adds triage tags (`first-time-contributor`). |
-| 📋 **GitHub Projects v2 Board Integration** | Uses GitHub GraphQL API (`addProjectV2ItemById`) to automatically route new issues and PRs onto GitHub Project boards and set initial column status (e.g. `Triage`, `Backlog`). |
-| ✍️ **DCO Commit Sign-off Validation** | Verifies that all commits in pull requests contain valid `Signed-off-by` trailers (`git commit -s`), updates commit status (`sugie/dco`), flags unsigned PRs, and provides fix instructions. |
+| 🏷️ **Advanced Labeling Engine** | • **Path Globs**: `globset` matching with positive and negative patterns (`ignore_patterns`).<br>• **Conventional Commits**: maps PR title prefixes (`feat:`, `fix:`, `docs:`) to labels.<br>• **Size-based Labeling**: calculates changed lines into `size/XS`, `size/S`, `size/M`, `size/L`, `size/XL` with custom thresholds.<br>• **Draft Handling**: automatically tags draft PRs with `work-in-progress` and removes it when marked ready.<br>• **Template Words & Regex**: targeted to title, body, or both. |
+| 🔍 **Duplicate Issue/PR Detection** | • Tokenized n-gram Jaccard, Jaro-Winkler, and combined distance algorithms.<br>• **Auto-Close**: automatically close obvious duplicates when similarity exceeds `auto_close_threshold` (e.g. 92%).<br>• Fully customizable comment templates with `{author}`, `{matched_number}`, `{similarity}`, `{matched_title}`. |
+| 👥 **CODEOWNERS & Component Routing** | Parses standard `.github/CODEOWNERS` and custom TOML rules. Supports component-specific reviewer pools and maintainer assignment. |
+| ⏳ **Tiered Stale Lifecycle Engine** | • 3-stage lifecycle: **Warn** after `warn_days` → **Close** after `close_days` → **Lock** after `lock_days`.<br>• **Configurable Interval**: background check frequency in hours.<br>• **Target Filters**: selectively enable for issues, PRs, or both.<br>• Exempt labels (`pinned`, `security`), exempt authors (`dependabot`), and exempt milestones.<br>• Dynamic comment templates with runtime variable interpolation. |
+| 👋 **First-Time Contributor Greeting** | Separate customizable welcome templates and labels for first-time Issues vs first-time PRs with `{author}` interpolation. |
+| 📋 **GitHub Projects v2 Board Integration** | Uses GitHub GraphQL API (`addProjectV2ItemById` & `updateProjectV2ItemFieldValue`) to route items onto organization project boards with separate project numbers for Issues and PRs. |
+| ✍️ **DCO Commit Sign-off Validation** | Verifies `Signed-off-by` trailers (`git commit -s`), updates commit status (`sugie/dco`), provides fix instructions, and allows bot author exemptions (`dependabot[bot]`, `renovate[bot]`). |
 | 🚦 **CI Results Sticky Summary** | Aggregates check runs and check suites. Posts and updates a single sticky summary table on PRs with status, failure summaries, and direct logs links. |
-| ⚖️ **Reviewer Load Balancing** | Distributes PR review requests across team pools using workload tracking (`least_busy`), out-of-office exclusions, and active review capacity limits. |
-| 🚀 **Contributor Growth Tracking** | Tracks contributor milestones (e.g., 3 merged PRs, 10 merged PRs) in persistent SQLite storage. Celebrates milestones and alerts maintainers to consider granting triage or committer rights. |
-| 📊 **Weekly & Monthly Triage Reports** | Aggregates metrics: new vs closed issues, close rate, time-to-first-response (TTFR), active contributors, net code lines added/deleted, and commit counts. Formats markdown digests and posts to GitHub issues, Discord, and Zulip. |
-| 💬 **Zulip & Discord Integrations** | Direct push notifications to Zulip streams/topics and Discord incoming webhooks with rich embeds for stale alerts, growth milestones, CI failures, and periodic reports. |
-| ⚡ **Interactive Slash Commands** | Full command support in comments: `/assign`, `/unassign`, `/label`, `/unlabel`, `/close`, `/reopen`, `/retest`, `/project`, `/move` (cross-repo issue transfer), `/duplicate`, and `/help`. |
+| ⚖️ **Reviewer Load Balancing** | Distributes PR reviews using workload tracking (`least_busy` or `round_robin`), path-based component pools, configurable `reviewers_per_pr`, out-of-office exclusions, and capacity limits. |
+| 🚀 **Contributor Growth Tracking** | Tracks contributor milestone thresholds in persistent SQLite storage. Celebrates milestones and alerts maintainers to consider granting triage or committer rights. |
+| 📊 **Weekly & Monthly Triage Reports** | Aggregates metrics: new vs closed issues, close rate, time-to-first-response (TTFR), active contributors, net code lines added/deleted, and commit counts. Formats markdown digests and posts to GitHub issues, Discord, and Zulip on a configurable schedule. |
+| 💬 **Discord & Zulip Deep Sync** | Full two-way notifications for: weekly/monthly reports, assignments/unassignments, new issues/PRs, closes/merges, label updates, cross-repo moves, CI failures, duplicate alerts, DCO failures, and growth celebrations. |
+| ⚡ **Interactive Slash Commands** | Commands in comments: `/assign`, `/unassign`, `/label`, `/unlabel`, `/close`, `/reopen`, `/retest`, `/project`, `/move` (cross-repo issue transfer), `/duplicate`, and `/help`. Supports custom command prefix and aliases (`/l` for `/label`, `/a` for `/assign`). |
 
 ---
 
-## 🚀 Quickstart
+## 💬 Discord & Zulip Notification Events
 
-### 1. Create a GitHub App
-1. Go to your GitHub Organization: **Settings → Developer Settings → GitHub Apps → New GitHub App**.
-2. Set **Webhook URL** to your server: `https://your-domain.com/webhook` (or `/api/github/webhook`).
-3. Set **Webhook Secret** (e.g. generate with `openssl rand -hex 20`).
-4. Generate and download a **Private Key** (`.pem`).
-5. Grant the following permissions:
-   - **Repository Permissions**:
-     - *Issues*: Read & Write
-     - *Pull Requests*: Read & Write
-     - *Commit Statuses*: Read & Write
-     - *Checks*: Read & Write
-     - *Contents*: Read (to fetch `.github/sugie.toml` and `CODEOWNERS`)
-     - *Projects*: Read & Write
-   - **Subscribe to events**:
-     - `Issues`
-     - `Issue comment`
-     - `Pull request`
-     - `Pull request review comment`
-     - `Check suite`
-     - `Check run`
-     - `Installation`
-     - `Installation repositories`
-6. Install the App onto your organization's repositories.
+Every event can be toggled individually in `sugie.toml`:
 
----
-
-### 2. Configure Sugie
-
-Initialize configuration templates:
-```bash
-sugie init
-```
-
-This creates:
-- `sugie.toml`: Global server and default triage configuration.
-- `.env.example`: Environment variables template.
-- `.github/sugie.toml`: Repository-specific override file.
-- `.github/CODEOWNERS`: Example CODEOWNERS file.
-
-Example `sugie.toml`:
 ```toml
-host = "0.0.0.0"
-port = 8080
-db_path = "sugie.db"
+[notifications.events]
+weekly_report = true      # Scheduled weekly metrics report
+monthly_report = true     # Scheduled monthly metrics report
+assigned = true           # Assigning reviewers/maintainers
+unassigned = true         # Removing assignment
+issue_opened = true       # New issue opened
+issue_closed = true       # Issue closed
+pr_opened = true          # New pull request opened
+pr_merged = true          # Pull request merged
+label_changed = true      # Labels added/removed
+stale_warned = true       # Item marked as stale
+stale_closed = true       # Stale item closed
+ci_failure = true         # CI checks failed
+duplicate_detected = true # Potential duplicate found
+dco_failed = true         # Commits missing sign-off
+growth_milestone = true   # Contributor reached merged PR threshold
+cross_repo_move = true    # Issue migrated across repos
+```
 
-[github]
-app_id = 123456
-webhook_secret = "your-github-webhook-secret"
-private_key_path = "sugie.private-key.pem"
-
+### Discord Configuration
+Supports a main webhook and a dedicated reports channel:
+```toml
 [notifications.discord]
-webhook_url = "https://discord.com/api/webhooks/..."
-notify_on_growth = true
-notify_on_report = true
+webhook_url = "https://discord.com/api/webhooks/.../alerts"
+reports_webhook_url = "https://discord.com/api/webhooks/.../reports"
+username = "sugie-bot"
+```
 
+### Zulip Configuration
+Supports dedicated stream topics for clear separation of concerns:
+```toml
 [notifications.zulip]
-site_url = "https://your-zulip.org"
-bot_email = "sugie-bot@your-zulip.org"
-bot_api_key = "secret-api-key"
+site_url = "https://your-zulip.example.com"
+bot_email = "sugie-bot@your-zulip.example.com"
+bot_api_key = "secret-key"
 stream = "github-triage"
-topic = "sugie-alerts"
-
-[default_rules.labels]
-enabled = true
-
-[[default_rules.labels.path_rules]]
-pattern = "crates/core/**"
-labels = ["area-core"]
-
-[[default_rules.labels.keyword_rules]]
-keywords = ["crash", "panic", "segfault"]
-target = "both"
-labels = ["bug", "severity-high"]
-
-[default_rules.duplicates]
-enabled = true
-threshold = 0.65
-add_label = "possible-duplicate"
-
-[default_rules.dco]
-enabled = true
-require_signoff = true
-missing_label = "dco-missing"
-
-[default_rules.reviewers]
-enabled = true
-pool = ["alice", "bob", "carol"]
-max_active_reviews = 4
-load_balancing = "least_busy"
-
-[default_rules.growth]
-enabled = true
-[[default_rules.growth.thresholds]]
-merged_prs = 3
-message = "🎉 Contributor has reached 3 merged PRs! Consider inviting them to the Triage team."
+topic_triage = "triage"
+topic_reports = "reports"
+topic_alerts = "alerts"
+topic_assigns = "assignments"
 ```
 
 ---
 
-### 3. Run Sugie
+## 🦭 Podman Deployment Guide (No Docker Required)
 
-#### Using Cargo
+Sugie is containerized specifically for **Podman** environments, supporting rootless execution and SELinux volume relabeling (`:Z`).
+
+### Method 1: Using `podman-run.sh` (Recommended)
+
+An all-in-one management script is provided:
+
 ```bash
-# Validate configuration and credentials
-sugie validate --config sugie.toml
+# Initialize configuration files
+./target/release/sugie init --output-dir .
 
-# Start the webhook server and background schedulers
-sugie serve --config sugie.toml
+# Start the bot (automatically builds container image if needed)
+./podman-run.sh start
+
+# View real-time logs
+./podman-run.sh logs
+
+# Check container status
+./podman-run.sh status
+
+# Stop or restart
+./podman-run.sh stop
+./podman-run.sh restart
 ```
 
-#### Using Docker Compose
+### Method 2: Manual Podman CLI
+
 ```bash
-docker compose up -d
+# 1. Build the container image using the native Containerfile
+podman build -t sugie:latest -f Containerfile .
+
+# 2. Run the rootless container with volume relabeling
+podman run -d \
+  --name sugie-bot \
+  --restart always \
+  -p 8080:8080 \
+  -v $(pwd)/data:/app/data:Z \
+  -v $(pwd)/sugie.toml:/app/sugie.toml:ro,Z \
+  -e RUST_LOG=info \
+  -e SUGIE_DB_PATH=/app/data/sugie.db \
+  sugie:latest serve --config /app/sugie.toml
+```
+
+### Method 3: Podman Quadlet / Systemd Service
+
+For production servers on Linux (RHEL, Fedora, Rocky, Debian, Ubuntu), install the provided `sugie.container` file to run as a native systemd unit:
+
+```bash
+# User-level service (rootless)
+mkdir -p ~/.config/containers/systemd
+cp sugie.container ~/.config/containers/systemd/
+
+systemctl --user daemon-reload
+systemctl --user enable --now sugie.service
+
+# Check service status
+systemctl --user status sugie.service
 ```
 
 ---
 
 ## ⌨️ Slash Commands Cheat Sheet
 
-Users and maintainers can trigger actions by commenting on Issues or PRs:
-
-| Command | Example | Description |
-| :--- | :--- | :--- |
-| `/assign` | `/assign @alice @bob` or `/assign` | Assigns specified user(s) or self |
-| `/unassign` | `/unassign @bob` or `/unassign` | Removes assignment |
-| `/label` | `/label +bug +area-net -wip` | Adds (`+`) or removes (`-`) labels |
-| `/unlabel` | `/unlabel wip` | Removes label |
-| `/close` | `/close not planned` | Closes issue or PR with reason |
-| `/reopen` | `/reopen` | Reopens closed issue or PR |
-| `/retest` | `/retest` | Retriggers failed CI checks for PR |
-| `/project` | `/project 1 In Progress` | Adds item to GitHub Project v2 board and sets status |
-| `/move` | `/move other-org/target-repo` | **Cross-repo migration**: Copies issue to target repo, copies labels, links back, and closes original issue |
-| `/duplicate` | `/duplicate #123` | Marks as duplicate of #123, adds label and closes issue |
-| `/help` | `/help` | Displays interactive bot command help |
+| Command | Alias | Example | Description |
+| :--- | :---: | :--- | :--- |
+| `/assign` | `/a` | `/assign @alice @bob` or `/a` | Assigns specified user(s) or self |
+| `/unassign` | - | `/unassign @bob` | Removes assignment |
+| `/label` | `/l` | `/label +bug +area-core -wip` | Adds (`+`) or removes (`-`) labels |
+| `/unlabel` | - | `/unlabel wip` | Removes a label |
+| `/close` | `/c` | `/close completed` | Closes issue or PR with reason |
+| `/reopen` | - | `/reopen` | Reopens closed issue or PR |
+| `/retest` | `/r` | `/retest` | Retriggers failed CI check suites (PRs only) |
+| `/project` | `/p` | `/project 1 In Progress` | Adds item to GitHub Project v2 board |
+| `/move` | `/m` | `/move other-org/target-repo` | **Cross-repo migration**: Copies issue, transfers labels, references author, and closes original |
+| `/duplicate`| - | `/duplicate #123` | Closes issue as duplicate of #123 |
+| `/help` | - | `/help` | Displays command usage manual |
 
 ---
 
-## 🛠️ CLI Operations
+## ⚙️ Configuration Reference
 
-```bash
-# Start webhook server
-sugie serve --host 0.0.0.0 --port 8080
+### Global Server Configuration (`sugie.toml`)
+Run `sugie init` to generate a pre-configured template with exhaustive comments.
 
-# Run one-off stale issue sweep
-sugie stale --repo owner/repo
-
-# Generate weekly report and print markdown
-sugie report --repo owner/repo --weekly
-
-# Generate monthly report and publish as GitHub Issue + broadcast to Discord/Zulip
-sugie report --repo owner/repo --monthly --publish
-
-# Validate configuration
-sugie validate --config sugie.toml
-```
+### Repository-Level Overrides (`.github/sugie.toml`)
+Place `.github/sugie.toml` in your repository's default branch to customize behavior per repository (e.g. custom component reviewer pools, unique stale thresholds, repository-specific size limits).
 
 ---
 
 ## 🧪 Testing
 
-Sugie includes full unit and integration test suites:
-
 ```bash
-# Run all tests
+# Run all unit and integration tests
 cargo test
 
-# Run integration tests
+# Run integration tests only
 cargo test --test integration_tests
 ```
 

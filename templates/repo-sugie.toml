@@ -1,4 +1,7 @@
+# ==============================================================================
 # Repository-level override for Sugie Bot (.github/sugie.toml)
+# Placed in the default branch of your repository.
+# ==============================================================================
 
 [labels]
 enabled = true
@@ -11,14 +14,21 @@ labels = ["area-compiler"]
 pattern = "crates/runtime/**"
 labels = ["area-runtime"]
 
-[[labels.keyword_rules]]
-keywords = ["bug", "crash", "segmentation fault"]
-target = "both"
-labels = ["bug"]
+[labels.size_rules]
+enabled = true
+xs_max = 15
+s_max = 60
+m_max = 300
+l_max = 1000
+
+[labels.draft_rules]
+enabled = true
+draft_label = "draft"
 
 [duplicates]
 enabled = true
 threshold = 0.70
+auto_close_threshold = 0.95
 
 [codeowners]
 enabled = true
@@ -28,6 +38,7 @@ auto_assign = true
 [reviewers]
 enabled = true
 pool = ["alice", "bob"]
+reviewers_per_pr = 1
 max_active_reviews = 5
 load_balancing = "least_busy"
 out_of_office = []
@@ -35,3 +46,10 @@ out_of_office = []
 [dco]
 enabled = true
 require_signoff = true
+exempt_authors = ["dependabot[bot]"]
+
+[stale]
+warn_days = 45
+close_days = 10
+stale_label = "stale"
+exempt_labels = ["pinned", "security", "tracking-issue"]

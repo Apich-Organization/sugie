@@ -49,7 +49,17 @@ impl DiscordNotifier {
         url: Option<&str>,
         color: u32,
         fields: Vec<DiscordEmbedField>,
+        is_report: bool,
     ) -> Result<()> {
+        let target_url = if is_report {
+            self.config
+                .reports_webhook_url
+                .as_ref()
+                .unwrap_or(&self.config.webhook_url)
+        } else {
+            &self.config.webhook_url
+        };
+
         let embed = DiscordEmbed {
             title: title.to_string(),
             description: description.to_string(),
@@ -58,7 +68,7 @@ impl DiscordNotifier {
             fields,
             timestamp: Utc::now().to_rfc3339(),
             footer: Some(DiscordFooter {
-                text: "sugie triage bot".to_string(),
+                text: "sugie bot".to_string(),
             }),
         };
 
@@ -73,7 +83,7 @@ impl DiscordNotifier {
 
         let resp = self
             .http
-            .post(&self.config.webhook_url)
+            .post(target_url)
             .json(&payload)
             .send()
             .await

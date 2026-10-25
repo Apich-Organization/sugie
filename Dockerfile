@@ -1,4 +1,4 @@
-# Multi-stage build for Sugie GitHub Triage Bot
+# Multi-stage Containerfile/Dockerfile for Sugie GitHub Triage Bot
 FROM rust:1.80-bullseye as builder
 
 WORKDIR /app
@@ -18,6 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=builder /app/target/release/sugie /usr/local/bin/sugie
 COPY templates/sugie.toml /app/sugie.toml
+
+# Rootless container support
+RUN useradd -m -u 1000 -U sugie && \
+    mkdir -p /app/data && \
+    chown -R sugie:sugie /app
+
+USER sugie
 
 EXPOSE 8080
 

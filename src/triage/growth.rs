@@ -1,5 +1,5 @@
-use crate::config::GrowthConfig;
-use crate::notifications::{NotificationDispatcher, NotificationLevel};
+use crate::config::{interpolate, GrowthConfig};
+use crate::notifications::{NotificationDispatcher, NotificationLevel, SugieEventType};
 use crate::storage::Storage;
 use anyhow::Result;
 
@@ -42,7 +42,6 @@ impl GrowthTracker {
         let stats = self.storage.get_contributor_stats(username, repo)?;
         let last_milestone = stats.map(|s| s.last_milestone_notified).unwrap_or(0);
 
-        // Find applicable milestone that has not been notified yet
         let mut triggered_milestone = None;
         for ms in &self.config.thresholds {
             if count >= ms.merged_prs && ms.merged_prs > last_milestone {
@@ -54,27 +53,29 @@ impl GrowthTracker {
             self.storage
                 .update_last_milestone_notified(username, repo, milestone.merged_prs)?;
 
+            let formatted_message = interpolate(&milestone.message, &[("author", username)]);
+
             let alert = MilestoneAlert {
                 username: username.to_string(),
                 repo: repo.to_string(),
                 merged_prs: milestone.merged_prs,
-                message: milestone.message.clone(),
+                message: formatted_message.clone(),
                 recommend_role: milestone.recommend_role.clone(),
             };
 
-            // Notify channels if configured
             if milestone.notify_channels {
                 let title = format!(
                     "🌟 Contributor Growth Alert: @{} ({} PRs)",
                     username, milestone.merged_prs
                 );
                 let desc = format!(
-                    "Contributor **@{}** has merged **{}** pull requests in `{}`!\n\n**Note**: {}\n\nPR #{}",
-                    username, milestone.merged_prs, repo, milestone.message, pr_number
+                    "Contributor **@{}** reached **{}** merged pull requests in `{}`!\n\n**Note**: {}\n\nPR #{}",
+                    username, milestone.merged_prs, repo, formatted_message, pr_number
                 );
 
                 self.notifier
-                    .dispatch(
+                    .dispatch_event(
+                        SugieEventType::GrowthMilestone,
                         &title,
                         &desc,
                         pr_url,
@@ -95,7 +96,7 @@ impl GrowthTracker {
             "### 🌟 Contributor Milestone Reached!\n\n\
             Congratulations @{}! You have successfully merged **{}** pull requests into this repository.\n\n\
             {}\n\n\
-            *Thank you for being an active part of our open source community!*",
+            *Thank you for your valuable contributions to our open source community!*",
             alert.username, alert.merged_prs, alert.message
         )
     }

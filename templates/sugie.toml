@@ -1,9 +1,14 @@
-# Sugie Bot Configuration File
+# ==============================================================================
+# 🦀 Sugie GitHub Triage Bot - Server & Global Configuration
+# ==============================================================================
 
 host = "0.0.0.0"
 port = 8080
 db_path = "sugie.db"
 
+# ------------------------------------------------------------------------------
+# 1. GitHub App Authentication
+# ------------------------------------------------------------------------------
 [github]
 app_id = 123456
 webhook_secret = "your-github-webhook-secret"
@@ -11,30 +16,54 @@ private_key_path = "sugie.private-key.pem"
 # Or provide PEM string directly:
 # private_key_pem = """-----BEGIN RSA PRIVATE KEY-----..."""
 
+# ------------------------------------------------------------------------------
+# 2. Discord & Zulip Integrations & Granular Event Sync
+# ------------------------------------------------------------------------------
 [notifications.discord]
-webhook_url = "https://discord.com/api/webhooks/your/webhook/url"
+webhook_url = "https://discord.com/api/webhooks/your/main/webhook"
+# Optional dedicated channel for weekly/monthly digests:
+reports_webhook_url = "https://discord.com/api/webhooks/your/reports/webhook"
 username = "sugie-bot"
-notify_on_stale = true
-notify_on_growth = true
-notify_on_report = true
-notify_on_ci_failure = true
 
 [notifications.zulip]
 site_url = "https://your-zulip.example.com"
 bot_email = "sugie-bot@your-zulip.example.com"
 bot_api_key = "your-zulip-bot-api-key"
 stream = "github-triage"
-topic = "sugie-alerts"
-notify_on_stale = true
-notify_on_growth = true
-notify_on_report = true
-notify_on_ci_failure = true
+# Specific topic categories:
+topic_triage = "triage"
+topic_reports = "reports"
+topic_alerts = "alerts"
+topic_assigns = "assignments"
 
+# Toggles for syncing specific events to Discord and Zulip:
+[notifications.events]
+weekly_report = true
+monthly_report = true
+assigned = true
+unassigned = true
+issue_opened = true
+issue_closed = true
+pr_opened = true
+pr_merged = true
+label_changed = true
+stale_warned = true
+stale_closed = true
+ci_failure = true
+duplicate_detected = true
+dco_failed = true
+growth_milestone = true
+cross_repo_move = true
+
+# ------------------------------------------------------------------------------
+# 3. Labeling Rules (Paths, Keywords, Conventional Commits, PR Size, Drafts)
+# ------------------------------------------------------------------------------
 [default_rules.labels]
 enabled = true
 
 [[default_rules.labels.path_rules]]
 pattern = "crates/core/**"
+ignore_patterns = ["crates/core/**/*.md"]
 labels = ["area-core", "component-core"]
 
 [[default_rules.labels.path_rules]]
@@ -59,11 +88,49 @@ labels = ["enhancement"]
 pattern = "### Steps to Reproduce"
 labels = ["has-repro"]
 
+# Conventional commits title prefix matching:
+[default_rules.labels.conventional_commits]
+enabled = true
+[default_rules.labels.conventional_commits.mappings]
+feat = "enhancement"
+fix = "bug"
+docs = "documentation"
+perf = "performance"
+test = "testing"
+ci = "ci"
+
+# PR Size labeling based on lines changed:
+[default_rules.labels.size_rules]
+enabled = true
+xs_max = 10
+s_max = 50
+m_max = 250
+l_max = 800
+labels = ["size/XS", "size/S", "size/M", "size/L", "size/XL"]
+
+# Draft PR status labeling:
+[default_rules.labels.draft_rules]
+enabled = true
+draft_label = "work-in-progress"
+remove_on_ready = true
+
+# ------------------------------------------------------------------------------
+# 4. Duplicate Issue/PR Detection
+# ------------------------------------------------------------------------------
 [default_rules.duplicates]
 enabled = true
 threshold = 0.65
+auto_close_threshold = 0.92   # Automatically close as duplicate if similarity >= 92%
 add_label = "possible-duplicate"
+search_open_only = true
+max_search_candidates = 100
+algorithm = "combined"        # "combined", "jaccard", "jaro_winkler"
+# Variables available in template: {author}, {current_number}, {matched_number}, {matched_title}, {similarity}
+# comment_template = "Hey @{author}, issue #{current_number} seems duplicate of #{matched_number} with {similarity} match."
 
+# ------------------------------------------------------------------------------
+# 5. CODEOWNERS & Maintainer Auto-Assignment
+# ------------------------------------------------------------------------------
 [default_rules.codeowners]
 enabled = true
 file_path = ".github/CODEOWNERS"
@@ -74,62 +141,120 @@ mention_in_comment = false
 path_pattern = "benches/**"
 maintainers = ["@performance-team"]
 
+# ------------------------------------------------------------------------------
+# 6. Tiered Stale Issue & PR Management
+# ------------------------------------------------------------------------------
 [default_rules.stale]
 enabled = true
+check_interval_hours = 6      # Background sweep frequency in hours
+enable_issues = true
+enable_prs = true
 warn_days = 30
 close_days = 7
 lock_days = 14
 stale_label = "stale"
 exempt_labels = ["pinned", "security", "never-stale", "tracking-issue"]
-warn_message = "This issue or pull request has been automatically marked as stale because it has not had recent activity. It will be closed in 7 days if no further activity occurs. Thank you for your contributions!"
-close_message = "This item was closed because it has been inactive for 7 days since being marked as stale. Feel free to reopen if you are still working on it."
+exempt_authors = ["dependabot[bot]", "renovate[bot]"]
+# Variables: {author}, {number}, {title}, {days}, {warn_days}, {close_days}, {stale_label}
+warn_message = "This item has been automatically marked as stale due to {days} days of inactivity. It will be closed in {close_days} days if no further activity occurs. Thank you for your contributions!"
+close_message = "This item was closed because it has been inactive for {close_days} days since being marked as stale. Feel free to reopen if you are still working on it."
 
+# ------------------------------------------------------------------------------
+# 7. First-Time Contributor Greeting & Onboarding
+# ------------------------------------------------------------------------------
 [default_rules.first_time]
 enabled = true
-welcome_comment = "Thank you for creating your first contribution! A maintainer will review your issue or pull request soon."
-labels = ["first-time-contributor"]
+welcome_issue_comment = "👋 Welcome @{author}! Thank you for opening your first issue in this repository. Our maintainers will triage it shortly."
+welcome_pr_comment = "🎉 Welcome @{author}! Thank you for your first pull request! Please ensure all tests and CI checks pass."
+issue_labels = ["first-time-contributor"]
+pr_labels = ["first-time-contributor"]
 
+# ------------------------------------------------------------------------------
+# 8. GitHub Projects v2 Integration
+# ------------------------------------------------------------------------------
 [default_rules.projects]
 enabled = false
-project_number = 1
 project_owner = "your-org"
+issue_project_number = 1
+pr_project_number = 2
 initial_status = "Triage"
 
+# ------------------------------------------------------------------------------
+# 9. DCO (Signed-off-by) Verification
+# ------------------------------------------------------------------------------
 [default_rules.dco]
 enabled = true
 require_signoff = true
 set_commit_status = true
+status_context = "sugie/dco"
 missing_label = "dco-missing"
+exempt_authors = ["dependabot[bot]", "renovate[bot]"]
 
+# ------------------------------------------------------------------------------
+# 10. CI Results Summary
+# ------------------------------------------------------------------------------
 [default_rules.ci_summary]
 enabled = true
 comment_on_failure = true
 sticky = true
+notify_on_failure = true
 
+# ------------------------------------------------------------------------------
+# 11. Reviewer Load Balancing & Rotation
+# ------------------------------------------------------------------------------
 [default_rules.reviewers]
 enabled = true
 pool = ["alice", "bob", "charlie"]
+reviewers_per_pr = 1
 max_active_reviews = 4
-load_balancing = "least_busy"
+load_balancing = "least_busy" # "least_busy" or "round_robin"
 out_of_office = []
 
+[default_rules.reviewers.component_pools]
+"crates/core/**" = ["alice", "bob"]
+"docs/**" = ["charlie"]
+
+# ------------------------------------------------------------------------------
+# 12. Contributor Growth Thresholds
+# ------------------------------------------------------------------------------
 [default_rules.growth]
 enabled = true
 
 [[default_rules.growth.thresholds]]
 merged_prs = 3
-message = "🎉 Contributor has reached 3 merged PRs! Consider inviting them to the Triage team."
+message = "🎉 Contributor @{author} has reached 3 merged PRs! Consider inviting them to the Triage team."
 notify_channels = true
 recommend_role = "triage"
 
 [[default_rules.growth.thresholds]]
 merged_prs = 10
-message = "🚀 Outstanding contributor with 10 merged PRs! Consider nominating them for Committer/Reviewer status."
+message = "🚀 Outstanding contributor @{author} with 10 merged PRs! Consider nominating them for Committer/Reviewer status."
 notify_channels = true
 recommend_role = "committer"
 
+# ------------------------------------------------------------------------------
+# 13. Automated Weekly & Monthly Triage Reports
+# ------------------------------------------------------------------------------
 [default_rules.reports]
 weekly_enabled = true
 monthly_enabled = true
+weekly_interval_days = 7
+monthly_interval_days = 30
 publish_as_issue = false
+sync_to_discord = true
+sync_to_zulip = true
 issue_labels = ["report", "metrics"]
+top_contributors_limit = 10
+
+# ------------------------------------------------------------------------------
+# 14. Interactive Slash Commands Configuration
+# ------------------------------------------------------------------------------
+[default_rules.commands]
+prefix = "/"
+[default_rules.commands.aliases]
+l = "label"
+a = "assign"
+c = "close"
+r = "retest"
+p = "project"
+m = "move"

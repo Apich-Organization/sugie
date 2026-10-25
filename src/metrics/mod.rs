@@ -1,6 +1,6 @@
 use crate::config::ReportsConfig;
 use crate::github::client::GitHubClient;
-use crate::notifications::{DiscordEmbedField, NotificationDispatcher, NotificationLevel};
+use crate::notifications::{DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType};
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ pub struct TriageMetrics {
 
     pub avg_first_response_hours: f64,
 
-    pub active_contributors: Vec<(String, u32)>, // (username, actions count)
+    pub active_contributors: Vec<(String, u32)>,
     pub lines_added: u64,
     pub lines_deleted: u64,
     pub total_commits: u64,
@@ -52,7 +52,6 @@ impl MetricsReporter {
         let start_time = now - Duration::days(days);
         let repo_full_name = format!("{}/{}", owner, repo);
 
-        // Fetch recent issues and pulls
         let all_issues = client.list_repo_issues(owner, repo, "all", 100).await?;
         let all_pulls = client.list_repo_pulls(owner, repo, "all", 100).await?;
 
@@ -70,10 +69,8 @@ impl MetricsReporter {
                 new_issues_count += 1;
                 *contributor_actions.entry(issue.user.login.clone()).or_insert(0) += 1;
 
-                // Approximate first response time if comments exist
                 if let Some(c) = issue.comments {
                     if c > 0 {
-                        // Check comment times if available
                         let elapsed = (issue.updated_at - issue.created_at).num_minutes() as f64 / 60.0;
                         if elapsed > 0.0 && elapsed < 720.0 {
                             response_times_hours.push(elapsed);
@@ -126,7 +123,7 @@ impl MetricsReporter {
         let avg_first_response_hours = if !response_times_hours.is_empty() {
             response_times_hours.iter().sum::<f64>() / response_times_hours.len() as f64
         } else {
-            4.2 // Default fallback baseline
+            4.2
         };
 
         let mut sorted_contributors: Vec<(String, u32)> = contributor_actions.into_iter().collect();
@@ -164,6 +161,11 @@ impl MetricsReporter {
             "# 📊 {} Report: {}\n\n**Period**: {} to {}\n\n",
             metrics.period_name, metrics.repo, start_str, end_str
         );
+
+        if let Some(ref header) = self.config.custom_header {
+            md.push_str(header);
+            md.push_str("\n\n");
+        }
 
         md.push_str("## 🎯 Key Performance Indicators (KPIs)\n\n");
         md.push_str("| Metric | Value | Status |\n");
@@ -208,7 +210,12 @@ impl MetricsReporter {
         } else {
             md.push_str("| Rank | Contributor | Contributions (Issues / PRs) |\n");
             md.push_str("| :---: | :--- | :---: |\n");
-            for (idx, (user, count)) in metrics.active_contributors.iter().take(10).enumerate() {
+            for (idx, (user, count)) in metrics
+                .active_contributors
+                .iter()
+                .take(self.config.top_contributors_limit)
+                .enumerate()
+            {
                 let medal = match idx {
                     0 => "🥇",
                     1 => "🥈",
@@ -220,7 +227,12 @@ impl MetricsReporter {
             md.push('\n');
         }
 
-        md.push_str("---\n*Generated automatically by [Sugie Bot](https://github.com).*");
+        if let Some(ref footer) = self.config.custom_footer {
+            md.push_str(footer);
+        } else {
+            md.push_str("---\n*Generated automatically by [Sugie Bot](https://github.com).*");
+        }
+
         md
     }
 
@@ -239,9 +251,10 @@ impl MetricsReporter {
             metrics.end_time.format("%Y-%m-%d")
         );
 
-        // Optionally create GitHub issue
+        let mut issue_url = None;
+
         if self.config.publish_as_issue {
-            client
+            let created = client
                 .create_issue(
                     owner,
                     repo,
@@ -252,9 +265,9 @@ impl MetricsReporter {
                 )
                 .await?;
             info!("Published report as GitHub issue in {}/{}", owner, repo);
+            issue_url = Some(format!("https://github.com/{}/{}/issues/{}", owner, repo, created.number));
         }
 
-        // Notify Discord & Zulip
         let fields = vec![
             DiscordEmbedField {
                 name: "Issues (New / Closed)".to_string(),
@@ -287,11 +300,18 @@ impl MetricsReporter {
             },
         ];
 
+        let event_type = if metrics.period_name.eq_ignore_ascii_case("monthly") {
+            SugieEventType::MonthlyReport
+        } else {
+            SugieEventType::WeeklyReport
+        };
+
         self.notifier
-            .dispatch(
+            .dispatch_event(
+                event_type,
                 &title,
                 &format!("Automated triage digest for `{}`", metrics.repo),
-                None,
+                issue_url.as_deref(),
                 NotificationLevel::Info,
                 fields,
             )

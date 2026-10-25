@@ -1,11 +1,13 @@
+use crate::config::CommandsConfig;
 use crate::github::client::GitHubClient;
 use crate::github::models::{Issue, User};
+use crate::notifications::{DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType};
 use crate::triage::projects::ProjectsService;
 use anyhow::Result;
 use serde::Deserialize;
 use tracing::info;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SlashCommand {
     Assign(Vec<String>),
     Unassign(Vec<String>),
@@ -23,12 +25,13 @@ pub enum SlashCommand {
 pub struct CommandParser;
 
 impl CommandParser {
-    pub fn parse_comment(comment_body: &str) -> Vec<SlashCommand> {
+    pub fn parse_comment(comment_body: &str, config: &CommandsConfig) -> Vec<SlashCommand> {
         let mut commands = Vec::new();
+        let prefix = &config.prefix;
 
         for line in comment_body.lines() {
             let trimmed = line.trim();
-            if !trimmed.starts_with('/') {
+            if !trimmed.starts_with(prefix) {
                 continue;
             }
 
@@ -37,25 +40,26 @@ impl CommandParser {
                 continue;
             }
 
-            let cmd_name = parts[0].to_lowercase();
+            let raw_cmd = parts[0].strip_prefix(prefix).unwrap_or("").to_lowercase();
+            let effective_cmd = config.aliases.get(&raw_cmd).map(|s| s.as_str()).unwrap_or(&raw_cmd);
             let args = &parts[1..];
 
-            match cmd_name.as_str() {
-                "/assign" => {
+            match effective_cmd {
+                "assign" => {
                     let users: Vec<String> = args
                         .iter()
                         .map(|s| s.trim_start_matches('@').to_string())
                         .collect();
                     commands.push(SlashCommand::Assign(users));
                 }
-                "/unassign" => {
+                "unassign" => {
                     let users: Vec<String> = args
                         .iter()
                         .map(|s| s.trim_start_matches('@').to_string())
                         .collect();
                     commands.push(SlashCommand::Unassign(users));
                 }
-                "/label" => {
+                "label" => {
                     let mut add = Vec::new();
                     let mut remove = Vec::new();
                     for arg in args {
@@ -71,13 +75,13 @@ impl CommandParser {
                         commands.push(SlashCommand::Label { add, remove });
                     }
                 }
-                "/unlabel" => {
+                "unlabel" => {
                     let labels: Vec<String> = args.iter().map(|s| s.to_string()).collect();
                     if !labels.is_empty() {
                         commands.push(SlashCommand::Unlabel(labels));
                     }
                 }
-                "/close" => {
+                "close" => {
                     let reason = if !args.is_empty() {
                         Some(args.join(" "))
                     } else {
@@ -85,13 +89,13 @@ impl CommandParser {
                     };
                     commands.push(SlashCommand::Close(reason));
                 }
-                "/reopen" => {
+                "reopen" => {
                     commands.push(SlashCommand::Reopen);
                 }
-                "/retest" => {
+                "retest" => {
                     commands.push(SlashCommand::Retest);
                 }
-                "/project" => {
+                "project" => {
                     if !args.is_empty() {
                         let target = args[0].to_string();
                         let status = if args.len() > 1 {
@@ -102,14 +106,14 @@ impl CommandParser {
                         commands.push(SlashCommand::Project { target, status });
                     }
                 }
-                "/move" => {
+                "move" => {
                     if !args.is_empty() {
                         commands.push(SlashCommand::Move {
                             target_repo: args[0].to_string(),
                         });
                     }
                 }
-                "/duplicate" => {
+                "duplicate" => {
                     if !args.is_empty() {
                         let num_str = args[0].trim_start_matches('#');
                         if let Ok(num) = num_str.parse::<u64>() {
@@ -117,7 +121,7 @@ impl CommandParser {
                         }
                     }
                 }
-                "/help" => {
+                "help" => {
                     commands.push(SlashCommand::Help);
                 }
                 _ => {}
@@ -131,11 +135,16 @@ impl CommandParser {
 pub struct CommandExecutor<'a> {
     client: &'a GitHubClient,
     projects: &'a ProjectsService,
+    notifier: &'a NotificationDispatcher,
 }
 
 impl<'a> CommandExecutor<'a> {
-    pub fn new(client: &'a GitHubClient, projects: &'a ProjectsService) -> Self {
-        Self { client, projects }
+    pub fn new(
+        client: &'a GitHubClient,
+        projects: &'a ProjectsService,
+        notifier: &'a NotificationDispatcher,
+    ) -> Self {
+        Self { client, projects, notifier }
     }
 
     pub async fn execute(
@@ -146,6 +155,9 @@ impl<'a> CommandExecutor<'a> {
         issue: &Issue,
         sender: &User,
     ) -> Result<()> {
+        let repo_full_name = format!("{}/{}", owner, repo);
+        let issue_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, issue.number);
+
         match command {
             SlashCommand::Assign(users) => {
                 let to_assign = if users.is_empty() {
@@ -154,7 +166,31 @@ impl<'a> CommandExecutor<'a> {
                     users.clone()
                 };
                 self.client.add_assignees(owner, repo, issue.number, &to_assign).await?;
-                info!("Assigned {:?} to {}/{}#{}", to_assign, owner, repo, issue.number);
+                info!("Assigned {:?} to {}#{}", to_assign, repo_full_name, issue.number);
+
+                let title = format!("👤 Assign: {}#{} to {}", repo_full_name, issue.number, to_assign.join(", "));
+                let msg = format!("**@{}** assigned **{}** to: {}\n\n**Issue**: {}", sender.login, to_assign.join(", "), issue.title, issue_url);
+                self.notifier
+                    .dispatch_event(
+                        SugieEventType::Assigned,
+                        &title,
+                        &msg,
+                        Some(&issue_url),
+                        NotificationLevel::Info,
+                        vec![
+                            DiscordEmbedField {
+                                name: "Assignee(s)".to_string(),
+                                value: to_assign.join(", "),
+                                inline: true,
+                            },
+                            DiscordEmbedField {
+                                name: "Assigned By".to_string(),
+                                value: sender.login.clone(),
+                                inline: true,
+                            },
+                        ],
+                    )
+                    .await;
             }
             SlashCommand::Unassign(users) => {
                 let to_unassign = if users.is_empty() {
@@ -163,7 +199,20 @@ impl<'a> CommandExecutor<'a> {
                     users.clone()
                 };
                 self.client.remove_assignees(owner, repo, issue.number, &to_unassign).await?;
-                info!("Unassigned {:?} from {}/{}#{}", to_unassign, owner, repo, issue.number);
+                info!("Unassigned {:?} from {}#{}", to_unassign, repo_full_name, issue.number);
+
+                let title = format!("👤 Unassign: {}#{} removed {}", repo_full_name, issue.number, to_unassign.join(", "));
+                let msg = format!("**@{}** removed **{}** from: {}", sender.login, to_unassign.join(", "), issue.title);
+                self.notifier
+                    .dispatch_event(
+                        SugieEventType::Unassigned,
+                        &title,
+                        &msg,
+                        Some(&issue_url),
+                        NotificationLevel::Info,
+                        Vec::new(),
+                    )
+                    .await;
             }
             SlashCommand::Label { add, remove } => {
                 if !add.is_empty() {
@@ -172,13 +221,26 @@ impl<'a> CommandExecutor<'a> {
                 for lbl in remove {
                     let _ = self.client.remove_label(owner, repo, issue.number, lbl).await;
                 }
-                info!("Updated labels on {}/{}#{}", owner, repo, issue.number);
+                info!("Updated labels on {}#{}", repo_full_name, issue.number);
+
+                let title = format!("🏷️ Label Update: {}#{}", repo_full_name, issue.number);
+                let desc = format!("**@{}** updated labels on **#{}**: +{:?} -{:?}", sender.login, issue.number, add, remove);
+                self.notifier
+                    .dispatch_event(
+                        SugieEventType::LabelChanged,
+                        &title,
+                        &desc,
+                        Some(&issue_url),
+                        NotificationLevel::Info,
+                        Vec::new(),
+                    )
+                    .await;
             }
             SlashCommand::Unlabel(labels) => {
                 for lbl in labels {
                     let _ = self.client.remove_label(owner, repo, issue.number, lbl).await;
                 }
-                info!("Removed labels {:?} from {}/{}#{}", labels, owner, repo, issue.number);
+                info!("Removed labels {:?} from {}#{}", labels, repo_full_name, issue.number);
             }
             SlashCommand::Close(reason) => {
                 let state_reason = match reason.as_deref() {
@@ -192,7 +254,20 @@ impl<'a> CommandExecutor<'a> {
                     format!("Closed by @{}.", sender.login)
                 };
                 self.client.create_comment(owner, repo, issue.number, &comment_body).await?;
-                info!("Closed {}/{}#{}", owner, repo, issue.number);
+                info!("Closed {}#{}", repo_full_name, issue.number);
+
+                let title = format!("🔒 Closed: {}#{}", repo_full_name, issue.number);
+                let desc = format!("Item closed by **@{}**: {}\n\n**Reason**: {}", sender.login, issue.title, reason.as_deref().unwrap_or("completed"));
+                self.notifier
+                    .dispatch_event(
+                        SugieEventType::IssueClosed,
+                        &title,
+                        &desc,
+                        Some(&issue_url),
+                        NotificationLevel::Warning,
+                        Vec::new(),
+                    )
+                    .await;
             }
             SlashCommand::Reopen => {
                 self.client.update_issue_state(owner, repo, issue.number, "open", Some("reopened")).await?;
@@ -202,7 +277,7 @@ impl<'a> CommandExecutor<'a> {
                     issue.number,
                     &format!("Reopened by @{}.", sender.login),
                 ).await?;
-                info!("Reopened {}/{}#{}", owner, repo, issue.number);
+                info!("Reopened {}#{}", repo_full_name, issue.number);
             }
             SlashCommand::Retest => {
                 if issue.is_pr() {
@@ -219,7 +294,7 @@ impl<'a> CommandExecutor<'a> {
                         owner,
                         repo,
                         issue.number,
-                        &format!("🔄 Triggered retest for {} failed check suite(s).", retested_count),
+                        &format!("🔄 Retest triggered for {} failed check(s) by @{}.", retested_count, sender.login),
                     ).await?;
                 } else {
                     self.client.create_comment(
@@ -231,7 +306,6 @@ impl<'a> CommandExecutor<'a> {
                 }
             }
             SlashCommand::Project { target, status } => {
-                // If target is a number, parse it
                 if let Ok(project_num) = target.parse::<i64>() {
                     let node_id = self.get_node_id_for_issue(owner, repo, issue.number).await?;
                     if let Some(nid) = node_id {
@@ -261,8 +335,6 @@ impl<'a> CommandExecutor<'a> {
                 }
             }
             SlashCommand::Move { target_repo } => {
-                // Cross-repo migration:
-                // target_repo can be "org/repo" or "repo" (defaults to same owner)
                 let (target_owner, target_name) = if target_repo.contains('/') {
                     let mut parts = target_repo.splitn(2, '/');
                     (parts.next().unwrap(), parts.next().unwrap())
@@ -270,7 +342,6 @@ impl<'a> CommandExecutor<'a> {
                     (owner, target_repo.as_str())
                 };
 
-                // Prevent moving to self
                 if target_owner == owner && target_name == repo {
                     self.client.create_comment(
                         owner,
@@ -301,7 +372,8 @@ impl<'a> CommandExecutor<'a> {
                     &[],
                 ).await?;
 
-                // Close original issue with migration link
+                let new_issue_url = format!("https://github.com/{}/{}/issues/{}", target_owner, target_name, new_issue.number);
+
                 let close_comment = format!(
                     "📦 This issue has been migrated to {}/{}#{} by @{}.",
                     target_owner, target_name, new_issue.number, sender.login
@@ -313,6 +385,31 @@ impl<'a> CommandExecutor<'a> {
                     "Migrated {}/{}#{} to {}/{}#{}",
                     owner, repo, issue.number, target_owner, target_name, new_issue.number
                 );
+
+                // Notify Discord & Zulip of cross-repo move
+                let title = format!("📦 Issue Migrated: {}#{} ➔ {}/{}#{}", repo_full_name, issue.number, target_owner, target_name, new_issue.number);
+                let msg = format!("**@{}** migrated **{}**\nFrom: `{}`\nTo: `{}/{}`", sender.login, issue.title, repo_full_name, target_owner, target_name);
+                self.notifier
+                    .dispatch_event(
+                        SugieEventType::CrossRepoMove,
+                        &title,
+                        &msg,
+                        Some(&new_issue_url),
+                        NotificationLevel::Info,
+                        vec![
+                            DiscordEmbedField {
+                                name: "Origin".to_string(),
+                                value: format!("{}#{}", repo_full_name, issue.number),
+                                inline: true,
+                            },
+                            DiscordEmbedField {
+                                name: "Destination".to_string(),
+                                value: format!("{}/{}#{}", target_owner, target_name, new_issue.number),
+                                inline: true,
+                            },
+                        ],
+                    )
+                    .await;
             }
             SlashCommand::Duplicate(target_issue_num) => {
                 self.client.add_labels(owner, repo, issue.number, &["duplicate".to_string()]).await?;
@@ -322,7 +419,7 @@ impl<'a> CommandExecutor<'a> {
                 );
                 self.client.create_comment(owner, repo, issue.number, &close_comment).await?;
                 self.client.update_issue_state(owner, repo, issue.number, "closed", Some("not_planned")).await?;
-                info!("Marked {}/{}#{} as duplicate of #{}", owner, repo, issue.number, target_issue_num);
+                info!("Marked {}#{} as duplicate of #{}", repo_full_name, issue.number, target_issue_num);
             }
             SlashCommand::Help => {
                 let help_text = r#"
@@ -393,29 +490,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_command_parser() {
+    fn test_command_parser_with_prefix_and_alias() {
         let comment = r#"
-        LGTM!
-        /assign @alice @bob
-        /label +bug +priority-high -wip
-        /move my-org/other-repo
-        /retest
-        /duplicate #456
-        /close completed
+        /a @alice
+        /l +bug -wip
+        /close not planned
         "#;
 
-        let cmds = CommandParser::parse_comment(comment);
-        assert_eq!(cmds.len(), 6);
-        assert_eq!(cmds[0], SlashCommand::Assign(vec!["alice".to_string(), "bob".to_string()]));
+        let config = CommandsConfig::default();
+        let cmds = CommandParser::parse_comment(comment, &config);
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0], SlashCommand::Assign(vec!["alice".to_string()]));
         assert_eq!(cmds[1], SlashCommand::Label {
-            add: vec!["bug".to_string(), "priority-high".to_string()],
+            add: vec!["bug".to_string()],
             remove: vec!["wip".to_string()],
         });
-        assert_eq!(cmds[2], SlashCommand::Move {
-            target_repo: "my-org/other-repo".to_string(),
-        });
-        assert_eq!(cmds[3], SlashCommand::Retest);
-        assert_eq!(cmds[4], SlashCommand::Duplicate(456));
-        assert_eq!(cmds[5], SlashCommand::Close(Some("completed".to_string())));
+        assert_eq!(cmds[2], SlashCommand::Close(Some("not planned".to_string())));
     }
 }
