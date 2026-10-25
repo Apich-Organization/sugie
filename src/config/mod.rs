@@ -821,6 +821,40 @@ fn default_command_prefix() -> String {
     "/".to_string()
 }
 
+pub fn load_dotenv() {
+    let candidates = [
+        Path::new(".env"),
+        Path::new("../.env"),
+    ];
+    for path in &candidates {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((key, value)) = line.split_once('=') {
+                        let key = key.trim();
+                        let mut value = value.trim();
+                        if (value.starts_with('"') && value.ends_with('"'))
+                            || (value.starts_with('\'') && value.ends_with('\''))
+                        {
+                            if value.len() >= 2 {
+                                value = &value[1..value.len() - 1];
+                            }
+                        }
+                        if std::env::var(key).is_err() {
+                            std::env::set_var(key, value);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+}
+
 impl SugieConfig {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
         let content = std::fs::read_to_string(path)?;
@@ -829,24 +863,26 @@ impl SugieConfig {
     }
 
     pub fn load_from_env_or_file<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
-        if path.as_ref().exists() {
-            Self::load_from_file(path)
+        load_dotenv();
+
+        let mut config = if path.as_ref().exists() {
+            Self::load_from_file(path)?
         } else {
             let app_id: u64 = std::env::var("SUGIE_GITHUB_APP_ID")
-                .map_err(|_| anyhow::anyhow!("SUGIE_GITHUB_APP_ID not set"))?
+                .map_err(|_| anyhow::anyhow!("SUGIE_GITHUB_APP_ID not set. Please provide sugie.toml or set SUGIE_GITHUB_APP_ID in .env or environment."))?
                 .parse()?;
             let private_key_pem = std::env::var("SUGIE_GITHUB_PRIVATE_KEY_PEM").ok();
             let private_key_path = std::env::var("SUGIE_GITHUB_PRIVATE_KEY_PATH").ok();
             let webhook_secret = std::env::var("SUGIE_GITHUB_WEBHOOK_SECRET")
                 .unwrap_or_else(|_| "secret".to_string());
 
-            Ok(SugieConfig {
+            SugieConfig {
                 host: std::env::var("SUGIE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
                 port: std::env::var("SUGIE_PORT")
                     .ok()
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(8080),
-                db_path: std::env::var("SUGIE_DB_PATH").unwrap_or_else(|_| "sugie.db".to_string()),
+                db_path: std::env::var("SUGIE_DB_PATH").unwrap_or_else(|_| "data/sugie.db".to_string()),
                 github: GitHubAuthConfig {
                     app_id,
                     private_key_pem,
@@ -855,8 +891,47 @@ impl SugieConfig {
                 },
                 notifications: NotificationsConfig::default(),
                 default_rules: RepoConfig::default(),
-            })
+            }
+        };
+
+        // Environment overrides
+        if let Ok(host) = std::env::var("SUGIE_HOST") {
+            if !host.trim().is_empty() {
+                config.host = host;
+            }
         }
+        if let Ok(port) = std::env::var("SUGIE_PORT") {
+            if let Ok(p) = port.parse() {
+                config.port = p;
+            }
+        }
+        if let Ok(db) = std::env::var("SUGIE_DB_PATH") {
+            if !db.trim().is_empty() {
+                config.db_path = db;
+            }
+        }
+        if let Ok(app_id_str) = std::env::var("SUGIE_GITHUB_APP_ID") {
+            if let Ok(id) = app_id_str.parse() {
+                config.github.app_id = id;
+            }
+        }
+        if let Ok(secret) = std::env::var("SUGIE_GITHUB_WEBHOOK_SECRET") {
+            if !secret.trim().is_empty() {
+                config.github.webhook_secret = secret;
+            }
+        }
+        if let Ok(pk_pem) = std::env::var("SUGIE_GITHUB_PRIVATE_KEY_PEM") {
+            if !pk_pem.trim().is_empty() {
+                config.github.private_key_pem = Some(pk_pem);
+            }
+        }
+        if let Ok(pk_path) = std::env::var("SUGIE_GITHUB_PRIVATE_KEY_PATH") {
+            if !pk_path.trim().is_empty() {
+                config.github.private_key_path = Some(pk_path);
+            }
+        }
+
+        Ok(config)
     }
 }
 

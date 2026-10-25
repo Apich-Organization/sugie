@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, Level};
+use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
@@ -63,8 +63,13 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    sugie::config::load_dotenv();
+
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
@@ -303,8 +308,67 @@ async fn main() -> anyhow::Result<()> {
         Commands::Validate => {
             let config = SugieConfig::load_from_env_or_file(&cli.config)?;
             let pk = config.github.get_private_key()?;
-            let _ = GitHubAuthManager::new(config.github.app_id, pk).generate_jwt()?;
-            println!("✅ Configuration file and GitHub App RSA private key are valid!");
+            let auth = GitHubAuthManager::new(config.github.app_id, pk);
+            let _ = auth.generate_jwt()?;
+            println!("✅ Local configuration file and RSA private key are valid!");
+
+            println!("🔄 Testing outbound connection to GitHub API (App ID: {})...", config.github.app_id);
+            match auth.get_app_info().await {
+                Ok(app) => {
+                    let name = app.get("name").and_then(|v| v.as_str()).unwrap_or("Unknown");
+                    let slug = app.get("slug").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let owner = app.get("owner").and_then(|o| o.get("login")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                    println!("✅ Successfully authenticated with GitHub API as App '{}' (slug: {}, owner: {})", name, slug, owner);
+
+                    match auth.get_installations().await {
+                        Ok(installs) => {
+                            if installs.is_empty() {
+                                println!("ℹ️  App has 0 active installations. Install the GitHub App on your account/repository to begin receiving events.");
+                            } else {
+                                println!("📦 Found {} active installation(s):", installs.len());
+                                let storage = Storage::new(&config.db_path).ok();
+                                for inst in installs {
+                                    let id = inst.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let acc = inst.get("account").and_then(|a| a.get("login")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                                    let target_type = inst.get("target_type").and_then(|v| v.as_str()).unwrap_or("");
+                                    println!("   • Installation ID: {} (Target: {} [{}])", id, acc, target_type);
+
+                                    match auth.get_installation_repositories(id).await {
+                                        Ok(repos) => {
+                                            if repos.is_empty() {
+                                                println!("     └─ (No repositories selected or granted yet)");
+                                            } else {
+                                                println!("     └─ Repositories ({}) :", repos.len());
+                                                for repo in repos {
+                                                    let repo_id = repo.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                    let full_name = repo.get("full_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                                    let is_private = repo.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
+                                                    let visibility = if is_private { "private" } else { "public" };
+                                                    let default_branch = repo.get("default_branch").and_then(|v| v.as_str()).unwrap_or("main");
+                                                    println!("        - {} ({}, default branch: {})", full_name, visibility, default_branch);
+
+                                                    if let Some(ref s) = storage {
+                                                        let _ = s.upsert_repository(repo_id, full_name, id);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => println!("     └─ ⚠️ Failed to fetch repositories for installation {}: {}", id, e),
+                                    }
+                                }
+                                if storage.is_some() {
+                                    println!("💾 Synced active repositories to local database ({}).", config.db_path);
+                                }
+                            }
+                        }
+                        Err(e) => println!("⚠️  Could not retrieve installations list: {}", e),
+                    }
+                }
+                Err(e) => {
+                    println!("❌ Failed to authenticate with GitHub API: {}", e);
+                    println!("💡 Verify that SUGIE_GITHUB_APP_ID matches your GitHub App and that the private key is active.");
+                }
+            }
         }
     }
 
