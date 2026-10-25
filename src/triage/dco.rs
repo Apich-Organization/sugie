@@ -20,7 +20,10 @@ impl DcoValidator {
     }
 
     pub fn is_author_exempt(&self, author: &str) -> bool {
-        self.config.exempt_authors.iter().any(|ea| ea.eq_ignore_ascii_case(author))
+        self.config
+            .exempt_authors
+            .iter()
+            .any(|ea| ea.eq_ignore_ascii_case(author))
     }
 
     pub fn status_context(&self) -> &str {
@@ -40,7 +43,11 @@ impl DcoValidator {
         for commit_item in commits {
             let msg = &commit_item.commit.message;
             if !self.regex.is_match(msg) {
-                let first_line = msg.lines().next().unwrap_or("No commit message").to_string();
+                let first_line = msg
+                    .lines()
+                    .next()
+                    .unwrap_or("No commit message")
+                    .to_string();
                 let short_sha = commit_item.sha.chars().take(7).collect::<String>();
                 unsigned_commits.push((short_sha, first_line));
             }
@@ -58,7 +65,8 @@ impl DcoValidator {
             return custom_tmpl.clone();
         }
 
-        let mut comment = String::from("### ⚠️ Developer Certificate of Origin (DCO) Sign-off Missing\n\n");
+        let mut comment =
+            String::from("### ⚠️ Developer Certificate of Origin (DCO) Sign-off Missing\n\n");
         comment.push_str("To maintain open-source compliance, every commit in this PR must include a `Signed-off-by` trailer.\n\n");
         comment.push_str("The following commit(s) are missing a valid sign-off:\n");
 

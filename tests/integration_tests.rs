@@ -4,7 +4,10 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::Arc;
-use sugie::config::{CommandsConfig, DcoConfig, DuplicateConfig, GrowthConfig, GrowthMilestone, RepoConfig, ReviewersConfig, SugieConfig};
+use sugie::config::{
+    CommandsConfig, DcoConfig, DuplicateConfig, GrowthConfig, GrowthMilestone, RepoConfig,
+    ReviewersConfig, SugieConfig,
+};
 use sugie::github::auth::GitHubAuthManager;
 use sugie::github::models::{CommitDetails, CommitItem, Issue, User};
 use sugie::metrics::{MetricsReporter, TriageMetrics};
@@ -46,12 +49,7 @@ fn create_test_state() -> (AppState, Storage) {
     let storage = Storage::new_in_memory().unwrap();
     let auth = Arc::new(GitHubAuthManager::new(12345, "dummy-key".to_string()));
     let notifier = NotificationDispatcher::new(&config.notifications);
-    let triage = TriageService::new(
-        Arc::new(config.clone()),
-        storage.clone(),
-        notifier,
-        auth,
-    );
+    let triage = TriageService::new(Arc::new(config.clone()), storage.clone(), notifier, auth);
 
     let state = AppState {
         config: Arc::new(config),
@@ -182,7 +180,9 @@ async fn test_reviewer_load_balancing_workload() {
     assert_eq!(next_chosen, vec!["reviewer-b".to_string()]);
 
     balancer.on_review_requested(repo, "reviewer-b").unwrap();
-    balancer.on_review_completed_or_closed(repo, "reviewer-a").unwrap();
+    balancer
+        .on_review_completed_or_closed(repo, "reviewer-a")
+        .unwrap();
     let third_chosen = balancer.select_best_reviewers(repo, &[], &[], 1).unwrap();
     assert_eq!(third_chosen, vec!["reviewer-a".to_string()]);
 }

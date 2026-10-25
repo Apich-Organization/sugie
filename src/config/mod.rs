@@ -269,10 +269,18 @@ impl Default for SizeLabelConfig {
     }
 }
 
-fn default_size_xs() -> u64 { 10 }
-fn default_size_s() -> u64 { 50 }
-fn default_size_m() -> u64 { 250 }
-fn default_size_l() -> u64 { 800 }
+fn default_size_xs() -> u64 {
+    10
+}
+fn default_size_s() -> u64 {
+    50
+}
+fn default_size_m() -> u64 {
+    250
+}
+fn default_size_l() -> u64 {
+    800
+}
 fn default_size_labels() -> Vec<String> {
     vec![
         "size/XS".to_string(),
@@ -517,7 +525,11 @@ fn default_stale_label() -> String {
 }
 
 fn default_exempt_labels() -> Vec<String> {
-    vec!["pinned".to_string(), "security".to_string(), "never-stale".to_string()]
+    vec![
+        "pinned".to_string(),
+        "security".to_string(),
+        "never-stale".to_string(),
+    ]
 }
 
 fn default_stale_warn_message() -> String {
@@ -767,9 +779,15 @@ impl Default for ReportsConfig {
     }
 }
 
-fn default_weekly_interval_days() -> u32 { 7 }
-fn default_monthly_interval_days() -> u32 { 30 }
-fn default_top_contributors_limit() -> usize { 10 }
+fn default_weekly_interval_days() -> u32 {
+    7
+}
+fn default_monthly_interval_days() -> u32 {
+    30
+}
+fn default_top_contributors_limit() -> usize {
+    10
+}
 fn default_report_labels() -> Vec<String> {
     vec!["report".to_string(), "metrics".to_string()]
 }

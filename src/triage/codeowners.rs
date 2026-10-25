@@ -108,11 +108,7 @@ impl CodeownersEngine {
         maintainers
     }
 
-    pub fn find_maintainers_for_issue(
-        &self,
-        title: &str,
-        body: Option<&str>,
-    ) -> HashSet<String> {
+    pub fn find_maintainers_for_issue(&self, title: &str, body: Option<&str>) -> HashSet<String> {
         let mut maintainers = HashSet::new();
         if !self.config.enabled {
             return maintainers;

@@ -45,7 +45,10 @@ impl LabelEngine {
         for path in file_paths {
             for (include_set, ignore_set, labels) in &self.path_matchers {
                 if include_set.is_match(path) {
-                    let is_ignored = ignore_set.as_ref().map(|s| s.is_match(path)).unwrap_or(false);
+                    let is_ignored = ignore_set
+                        .as_ref()
+                        .map(|s| s.is_match(path))
+                        .unwrap_or(false);
                     if !is_ignored {
                         for label in labels {
                             matched_labels.insert(label.clone());
@@ -71,11 +74,23 @@ impl LabelEngine {
         // 1. Keyword / Regex rules
         for rule in &self.config.keyword_rules {
             let matches_target = match rule.target.as_str() {
-                "title" => Self::check_keywords_and_regex(&rule.keywords, &rule.regex, &title_lower, title),
-                "body" => Self::check_keywords_and_regex(&rule.keywords, &rule.regex, &body_lower, body_str),
+                "title" => {
+                    Self::check_keywords_and_regex(&rule.keywords, &rule.regex, &title_lower, title)
+                }
+                "body" => Self::check_keywords_and_regex(
+                    &rule.keywords,
+                    &rule.regex,
+                    &body_lower,
+                    body_str,
+                ),
                 _ => {
                     Self::check_keywords_and_regex(&rule.keywords, &rule.regex, &title_lower, title)
-                        || Self::check_keywords_and_regex(&rule.keywords, &rule.regex, &body_lower, body_str)
+                        || Self::check_keywords_and_regex(
+                            &rule.keywords,
+                            &rule.regex,
+                            &body_lower,
+                            body_str,
+                        )
                 }
             };
 
@@ -180,13 +195,11 @@ mod tests {
     fn test_label_path_matching_with_ignore() {
         let config = LabelsConfig {
             enabled: true,
-            path_rules: vec![
-                PathLabelRule {
-                    pattern: "crates/core/**".to_string(),
-                    ignore_patterns: vec!["crates/core/**/*.md".to_string()],
-                    labels: vec!["area-core".to_string()],
-                },
-            ],
+            path_rules: vec![PathLabelRule {
+                pattern: "crates/core/**".to_string(),
+                ignore_patterns: vec!["crates/core/**/*.md".to_string()],
+                labels: vec!["area-core".to_string()],
+            }],
             keyword_rules: vec![],
             template_rules: vec![],
             size_rules: SizeLabelConfig::default(),

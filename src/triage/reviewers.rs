@@ -64,7 +64,12 @@ impl ReviewerLoadBalancer {
         count: usize,
     ) -> Result<Vec<String>> {
         let excluded: HashSet<&str> = exclude_users.iter().map(|s| s.as_str()).collect();
-        let ooo: HashSet<&str> = self.config.out_of_office.iter().map(|s| s.as_str()).collect();
+        let ooo: HashSet<&str> = self
+            .config
+            .out_of_office
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
 
         let pool = if !candidate_pool.is_empty() {
             candidate_pool

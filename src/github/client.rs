@@ -1,6 +1,4 @@
-use super::models::{
-    CheckRun, Comment, CommitItem, Issue, PullRequest, PullRequestFile,
-};
+use super::models::{CheckRun, Comment, CommitItem, Issue, PullRequest, PullRequestFile};
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
@@ -60,7 +58,10 @@ impl GitHubClient {
     // --- Issues API ---
 
     pub async fn get_issue(&self, owner: &str, repo: &str, issue_number: u64) -> Result<Issue> {
-        let url = format!("{}/repos/{}/{}/issues/{}", self.base_url, owner, repo, issue_number);
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}",
+            self.base_url, owner, repo, issue_number
+        );
         let resp = self.http.get(&url).send().await?.error_for_status()?;
         let issue = resp.json::<Issue>().await?;
         Ok(issue)
@@ -89,7 +90,13 @@ impl GitHubClient {
             payload["assignees"] = json!(assignees);
         }
 
-        let resp = self.http.post(&url).json(&payload).send().await?.error_for_status()?;
+        let resp = self
+            .http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         let issue = resp.json::<Issue>().await?;
         Ok(issue)
     }
@@ -99,15 +106,23 @@ impl GitHubClient {
         owner: &str,
         repo: &str,
         issue_number: u64,
-        state: &str, // "open" or "closed"
+        state: &str,                // "open" or "closed"
         state_reason: Option<&str>, // "completed", "not_planned", "reopened"
     ) -> Result<()> {
-        let url = format!("{}/repos/{}/{}/issues/{}", self.base_url, owner, repo, issue_number);
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}",
+            self.base_url, owner, repo, issue_number
+        );
         let mut payload = json!({ "state": state });
         if let Some(reason) = state_reason {
             payload["state_reason"] = json!(reason);
         }
-        self.http.patch(&url).json(&payload).send().await?.error_for_status()?;
+        self.http
+            .patch(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -123,7 +138,13 @@ impl GitHubClient {
             self.base_url, owner, repo, issue_number
         );
         let payload = json!({ "body": body });
-        let resp = self.http.post(&url).json(&payload).send().await?.error_for_status()?;
+        let resp = self
+            .http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         let comment = resp.json::<Comment>().await?;
         Ok(comment)
     }
@@ -140,7 +161,12 @@ impl GitHubClient {
             self.base_url, owner, repo, comment_id
         );
         let payload = json!({ "body": body });
-        self.http.patch(&url).json(&payload).send().await?.error_for_status()?;
+        self.http
+            .patch(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -174,7 +200,12 @@ impl GitHubClient {
             self.base_url, owner, repo, issue_number
         );
         let payload = json!({ "labels": labels });
-        self.http.post(&url).json(&payload).send().await?.error_for_status()?;
+        self.http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -208,7 +239,12 @@ impl GitHubClient {
             self.base_url, owner, repo, issue_number
         );
         let payload = json!({ "assignees": assignees });
-        self.http.post(&url).json(&payload).send().await?.error_for_status()?;
+        self.http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -227,7 +263,12 @@ impl GitHubClient {
             self.base_url, owner, repo, issue_number
         );
         let payload = json!({ "assignees": assignees });
-        self.http.delete(&url).json(&payload).send().await?.error_for_status()?;
+        self.http
+            .delete(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -246,7 +287,12 @@ impl GitHubClient {
         if let Some(r) = lock_reason {
             payload["lock_reason"] = json!(r);
         }
-        self.http.put(&url).json(&payload).send().await?.error_for_status()?;
+        self.http
+            .put(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -274,7 +320,10 @@ impl GitHubClient {
         repo: &str,
         pr_number: u64,
     ) -> Result<PullRequest> {
-        let url = format!("{}/repos/{}/{}/pulls/{}", self.base_url, owner, repo, pr_number);
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}",
+            self.base_url, owner, repo, pr_number
+        );
         let resp = self.http.get(&url).send().await?.error_for_status()?;
         let pr = resp.json::<PullRequest>().await?;
         Ok(pr)
@@ -325,7 +374,12 @@ impl GitHubClient {
             self.base_url, owner, repo, pr_number
         );
         let payload = json!({ "reviewers": reviewers });
-        self.http.post(&url).json(&payload).send().await?.error_for_status()?;
+        self.http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -369,7 +423,12 @@ impl GitHubClient {
         if let Some(target) = target_url {
             payload["target_url"] = json!(target);
         }
-        self.http.post(&url).json(&payload).send().await?.error_for_status()?;
+        self.http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -464,7 +523,13 @@ impl GitHubClient {
             "variables": variables,
         });
 
-        let resp = self.http.post(&url).json(&payload).send().await?.error_for_status()?;
+        let resp = self
+            .http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         let result = resp.json::<GraphQLResponse<T>>().await?;
         if let Some(errors) = result.errors {
             let err_msgs: Vec<String> = errors.into_iter().map(|e| e.message).collect();

@@ -43,7 +43,11 @@ async fn health_check() -> impl IntoResponse {
 }
 
 async fn status_check(State(state): State<AppState>) -> impl IntoResponse {
-    let repos = state.triage.storage().list_repositories().unwrap_or_default();
+    let repos = state
+        .triage
+        .storage()
+        .list_repositories()
+        .unwrap_or_default();
     (
         StatusCode::OK,
         Json(json!({
@@ -120,16 +124,14 @@ async fn github_webhook_handler(
                     Err(e) => warn!("Failed to parse installation event: {:?}", e),
                 }
             }
-            "issues" => {
-                match serde_json::from_slice::<IssueWebhookEvent>(&body_bytes) {
-                    Ok(payload) => {
-                        if let Err(e) = triage.handle_issue(payload).await {
-                            error!("Error in handle_issue: {:?}", e);
-                        }
+            "issues" => match serde_json::from_slice::<IssueWebhookEvent>(&body_bytes) {
+                Ok(payload) => {
+                    if let Err(e) = triage.handle_issue(payload).await {
+                        error!("Error in handle_issue: {:?}", e);
                     }
-                    Err(e) => warn!("Failed to parse issues event: {:?}", e),
                 }
-            }
+                Err(e) => warn!("Failed to parse issues event: {:?}", e),
+            },
             "pull_request" => {
                 match serde_json::from_slice::<PullRequestWebhookEvent>(&body_bytes) {
                     Ok(payload) => {
@@ -150,16 +152,14 @@ async fn github_webhook_handler(
                     Err(e) => warn!("Failed to parse issue_comment event: {:?}", e),
                 }
             }
-            "check_suite" => {
-                match serde_json::from_slice::<CheckSuiteWebhookEvent>(&body_bytes) {
-                    Ok(payload) => {
-                        if let Err(e) = triage.handle_check_suite(payload).await {
-                            error!("Error in handle_check_suite: {:?}", e);
-                        }
+            "check_suite" => match serde_json::from_slice::<CheckSuiteWebhookEvent>(&body_bytes) {
+                Ok(payload) => {
+                    if let Err(e) = triage.handle_check_suite(payload).await {
+                        error!("Error in handle_check_suite: {:?}", e);
                     }
-                    Err(e) => warn!("Failed to parse check_suite event: {:?}", e),
                 }
-            }
+                Err(e) => warn!("Failed to parse check_suite event: {:?}", e),
+            },
             other => {
                 info!("Ignored unhandled GitHub event: {}", other);
             }

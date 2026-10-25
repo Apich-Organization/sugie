@@ -37,13 +37,19 @@ impl CiSummarizer {
         md.push_str("### 🚦 CI Results Summary\n\n");
 
         let total = runs.len();
-        let passed = runs.iter().filter(|r| r.conclusion.as_deref() == Some("success")).count();
-        let failed = runs.iter().filter(|r| {
-            matches!(
-                r.conclusion.as_deref(),
-                Some("failure") | Some("timed_out") | Some("action_required")
-            )
-        }).count();
+        let passed = runs
+            .iter()
+            .filter(|r| r.conclusion.as_deref() == Some("success"))
+            .count();
+        let failed = runs
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.conclusion.as_deref(),
+                    Some("failure") | Some("timed_out") | Some("action_required")
+                )
+            })
+            .count();
         let pending = total - passed - failed;
 
         md.push_str(&format!(
@@ -116,14 +122,18 @@ impl CiSummarizer {
             for comment in comments {
                 if comment.body.contains("<!-- sugie:ci-summary -->") {
                     // Update existing comment
-                    client.update_comment(owner, repo, comment.id, &summary_text).await?;
+                    client
+                        .update_comment(owner, repo, comment.id, &summary_text)
+                        .await?;
                     return Ok(());
                 }
             }
         }
 
         // Otherwise post a new comment
-        client.create_comment(owner, repo, pr_number, &summary_text).await?;
+        client
+            .create_comment(owner, repo, pr_number, &summary_text)
+            .await?;
         Ok(())
     }
 }

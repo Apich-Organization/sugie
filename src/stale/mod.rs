@@ -1,6 +1,8 @@
 use crate::config::{interpolate, StaleConfig};
 use crate::github::client::GitHubClient;
-use crate::notifications::{DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType};
+use crate::notifications::{
+    DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType,
+};
 use crate::storage::Storage;
 use anyhow::Result;
 use chrono::{Duration, Utc};
@@ -68,8 +70,14 @@ impl StaleManager {
                 continue;
             }
 
-            let is_marked_stale = item.labels.iter().any(|l| l.name == self.config.stale_label);
-            let item_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, item.number);
+            let is_marked_stale = item
+                .labels
+                .iter()
+                .any(|l| l.name == self.config.stale_label);
+            let item_url = format!(
+                "https://github.com/{}/{}/issues/{}",
+                owner, repo, item.number
+            );
             let days_inactive = (now - item.updated_at).num_days().to_string();
             let warn_days_str = self.config.warn_days.to_string();
             let close_days_str = self.config.close_days.to_string();
@@ -92,10 +100,14 @@ impl StaleManager {
 
                 if now - warned_at >= close_threshold_duration {
                     let close_body = interpolate(&self.config.close_message, &vars);
-                    client.create_comment(owner, repo, item.number, &close_body).await?;
+                    client
+                        .create_comment(owner, repo, item.number, &close_body)
+                        .await?;
 
                     if let Some(ref cl_lbl) = self.config.closed_label {
-                        let _ = client.add_labels(owner, repo, item.number, &[cl_lbl.clone()]).await;
+                        let _ = client
+                            .add_labels(owner, repo, item.number, &[cl_lbl.clone()])
+                            .await;
                     }
 
                     client
@@ -131,13 +143,20 @@ impl StaleManager {
                     .create_comment(owner, repo, item.number, &warn_body)
                     .await?;
 
-                self.storage.record_stale_warned(&repo_full_name, item.number)?;
+                self.storage
+                    .record_stale_warned(&repo_full_name, item.number)?;
 
                 report.warned_count += 1;
-                info!("Marked issue/PR {}#{} as stale", repo_full_name, item.number);
+                info!(
+                    "Marked issue/PR {}#{} as stale",
+                    repo_full_name, item.number
+                );
 
                 let title = format!("⚠️ Marked as Stale: {}#{}", repo_full_name, item.number);
-                let desc = format!("Marked as stale due to {} days without updates:\n\n**{}**", days_inactive, item.title);
+                let desc = format!(
+                    "Marked as stale due to {} days without updates:\n\n**{}**",
+                    days_inactive, item.title
+                );
                 self.notifier
                     .dispatch_event(
                         SugieEventType::StaleWarned,
@@ -167,14 +186,24 @@ impl StaleManager {
             let closed_items = client.list_repo_issues(owner, repo, "closed", 50).await?;
 
             for item in closed_items {
-                let is_marked_stale = item.labels.iter().any(|l| l.name == self.config.stale_label);
+                let is_marked_stale = item
+                    .labels
+                    .iter()
+                    .any(|l| l.name == self.config.stale_label);
                 if is_marked_stale {
                     if let Some(closed_at) = item.closed_at {
                         if closed_at < lock_threshold {
-                            let _ = client.lock_issue(owner, repo, item.number, Some("resolved")).await;
-                            let _ = self.storage.clear_stale_warned(&repo_full_name, item.number);
+                            let _ = client
+                                .lock_issue(owner, repo, item.number, Some("resolved"))
+                                .await;
+                            let _ = self
+                                .storage
+                                .clear_stale_warned(&repo_full_name, item.number);
                             report.locked_count += 1;
-                            info!("Locked closed stale issue/PR {}#{}", repo_full_name, item.number);
+                            info!(
+                                "Locked closed stale issue/PR {}#{}",
+                                repo_full_name, item.number
+                            );
                         }
                     }
                 }

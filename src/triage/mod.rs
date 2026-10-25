@@ -13,7 +13,9 @@ use crate::config::{RepoConfig, SugieConfig};
 use crate::github::auth::GitHubAuthManager;
 use crate::github::client::GitHubClient;
 use crate::github::models::*;
-use crate::notifications::{DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType};
+use crate::notifications::{
+    DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType,
+};
 use crate::storage::Storage;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -76,15 +78,24 @@ impl TriageService {
             Ok(Some(content)) => match toml::from_str::<RepoConfig>(&content) {
                 Ok(repo_cfg) => {
                     info!("Loaded custom .github/sugie.toml for {}/{}", owner, repo);
-                    return self.config.default_rules.merge_with_override(Some(repo_cfg));
+                    return self
+                        .config
+                        .default_rules
+                        .merge_with_override(Some(repo_cfg));
                 }
                 Err(e) => {
-                    warn!("Failed to parse .github/sugie.toml in {}/{}: {:?}", owner, repo, e);
+                    warn!(
+                        "Failed to parse .github/sugie.toml in {}/{}: {:?}",
+                        owner, repo, e
+                    );
                 }
             },
             Ok(None) => {}
             Err(e) => {
-                warn!("Error fetching .github/sugie.toml from {}/{}: {:?}", owner, repo, e);
+                warn!(
+                    "Error fetching .github/sugie.toml from {}/{}: {:?}",
+                    owner, repo, e
+                );
             }
         }
         self.config.default_rules.clone()
@@ -135,11 +146,15 @@ impl TriageService {
         let owner = &event.repository.owner.login;
         let repo = &event.repository.name;
         let full_name = &event.repository.full_name;
-        let issue_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, event.issue.number);
+        let issue_url = format!(
+            "https://github.com/{}/{}/issues/{}",
+            owner, repo, event.issue.number
+        );
 
         let inst_id = match event.installation.as_ref().map(|i| i.id) {
             Some(id) => {
-                self.storage.upsert_repository(event.repository.id, full_name, id)?;
+                self.storage
+                    .upsert_repository(event.repository.id, full_name, id)?;
                 id
             }
             None => self
@@ -155,7 +170,10 @@ impl TriageService {
             let mut labels_to_add = Vec::new();
 
             // 1. Notify Discord/Zulip of new issue opened
-            let issue_title_msg = format!("🆕 New Issue: {}#{} by @{}", full_name, event.issue.number, event.sender.login);
+            let issue_title_msg = format!(
+                "🆕 New Issue: {}#{} by @{}",
+                full_name, event.issue.number, event.sender.login
+            );
             self.notifier
                 .dispatch_event(
                     SugieEventType::IssueOpened,
@@ -180,12 +198,18 @@ impl TriageService {
 
             // 2. First-time contributor handling
             let first_time = first_time::FirstTimeHandler::new(repo_config.first_time.clone());
-            let stats = self.storage.get_contributor_stats(&event.sender.login, full_name)?;
-            let has_prior = stats.map(|s| s.opened_issues + s.merged_prs > 0).unwrap_or(false);
+            let stats = self
+                .storage
+                .get_contributor_stats(&event.sender.login, full_name)?;
+            let has_prior = stats
+                .map(|s| s.opened_issues + s.merged_prs > 0)
+                .unwrap_or(false);
 
             if first_time.is_first_time(event.issue.author_association.as_deref(), has_prior) {
                 let welcome = first_time.build_welcome_comment(&event.sender.login, false);
-                let _ = client.create_comment(owner, repo, event.issue.number, &welcome).await;
+                let _ = client
+                    .create_comment(owner, repo, event.issue.number, &welcome)
+                    .await;
                 for l in first_time.labels_to_add(false) {
                     labels_to_add.push(l.clone());
                 }
@@ -204,20 +228,38 @@ impl TriageService {
 
                 if !matches.is_empty() {
                     let should_close = detector.should_auto_close(&matches);
-                    let dup_comment = detector.build_comment_body(&event.sender.login, event.issue.number, &matches, should_close);
-                    let _ = client.create_comment(owner, repo, event.issue.number, &dup_comment).await;
+                    let dup_comment = detector.build_comment_body(
+                        &event.sender.login,
+                        event.issue.number,
+                        &matches,
+                        should_close,
+                    );
+                    let _ = client
+                        .create_comment(owner, repo, event.issue.number, &dup_comment)
+                        .await;
 
                     if let Some(ref dup_lbl) = repo_config.duplicates.add_label {
                         labels_to_add.push(dup_lbl.clone());
                     }
 
                     if should_close {
-                        let _ = client.update_issue_state(owner, repo, event.issue.number, "closed", Some("not_planned")).await;
+                        let _ = client
+                            .update_issue_state(
+                                owner,
+                                repo,
+                                event.issue.number,
+                                "closed",
+                                Some("not_planned"),
+                            )
+                            .await;
                     }
 
                     // Notify Discord & Zulip of duplicate
                     let top_match = &matches[0];
-                    let title = format!("🔍 Duplicate Detected: {}#{}", full_name, event.issue.number);
+                    let title = format!(
+                        "🔍 Duplicate Detected: {}#{}",
+                        full_name, event.issue.number
+                    );
                     let desc = format!(
                         "Issue #{} matches existing **#{}** with {:.1}% similarity.\n\nTitle: **{}**",
                         event.issue.number, top_match.issue_number, top_match.similarity * 100.0, event.issue.title
@@ -256,19 +298,30 @@ impl TriageService {
             }
 
             if !labels_to_add.is_empty() {
-                let _ = client.add_labels(owner, repo, event.issue.number, &labels_to_add).await;
+                let _ = client
+                    .add_labels(owner, repo, event.issue.number, &labels_to_add)
+                    .await;
             }
 
             // 5. CODEOWNERS / Maintainer routing
             if repo_config.codeowners.enabled {
-                let codeowners = codeowners::CodeownersEngine::new(repo_config.codeowners.clone(), None);
-                let maintainers = codeowners.find_maintainers_for_issue(&event.issue.title, event.issue.body.as_deref());
+                let codeowners =
+                    codeowners::CodeownersEngine::new(repo_config.codeowners.clone(), None);
+                let maintainers = codeowners
+                    .find_maintainers_for_issue(&event.issue.title, event.issue.body.as_deref());
                 if !maintainers.is_empty() {
                     let maintainers_vec: Vec<String> = maintainers.into_iter().collect();
                     if repo_config.codeowners.auto_assign {
-                        let _ = client.add_assignees(owner, repo, event.issue.number, &maintainers_vec).await;
+                        let _ = client
+                            .add_assignees(owner, repo, event.issue.number, &maintainers_vec)
+                            .await;
 
-                        let assign_title = format!("👤 Auto-assigned: {}#{} to {}", full_name, event.issue.number, maintainers_vec.join(", "));
+                        let assign_title = format!(
+                            "👤 Auto-assigned: {}#{} to {}",
+                            full_name,
+                            event.issue.number,
+                            maintainers_vec.join(", ")
+                        );
                         self.notifier
                             .dispatch_event(
                                 SugieEventType::Assigned,
@@ -289,7 +342,10 @@ impl TriageService {
 
             // 6. GitHub Projects v2
             if repo_config.projects.enabled {
-                let target_proj = repo_config.projects.issue_project_number.or(repo_config.projects.project_number);
+                let target_proj = repo_config
+                    .projects
+                    .issue_project_number
+                    .or(repo_config.projects.project_number);
                 let projects = projects::ProjectsService::new(repo_config.projects.clone());
                 let _ = projects
                     .add_item_to_project(
@@ -310,11 +366,15 @@ impl TriageService {
         let owner = &event.repository.owner.login;
         let repo = &event.repository.name;
         let full_name = &event.repository.full_name;
-        let pr_url = format!("https://github.com/{}/{}/pull/{}", owner, repo, event.pull_request.number);
+        let pr_url = format!(
+            "https://github.com/{}/{}/pull/{}",
+            owner, repo, event.pull_request.number
+        );
 
         let inst_id = match event.installation.as_ref().map(|i| i.id) {
             Some(id) => {
-                self.storage.upsert_repository(event.repository.id, full_name, id)?;
+                self.storage
+                    .upsert_repository(event.repository.id, full_name, id)?;
                 id
             }
             None => self
@@ -331,7 +391,10 @@ impl TriageService {
 
             // Notify Discord & Zulip on PR opened
             if event.action == "opened" {
-                let pr_title_msg = format!("🔀 New PR: {}#{} by @{}", full_name, event.pull_request.number, event.sender.login);
+                let pr_title_msg = format!(
+                    "🔀 New PR: {}#{} by @{}",
+                    full_name, event.pull_request.number, event.sender.login
+                );
                 self.notifier
                     .dispatch_event(
                         SugieEventType::PrOpened,
@@ -358,7 +421,9 @@ impl TriageService {
             // 1. DCO Sign-off validation
             if repo_config.dco.enabled {
                 let validator = dco::DcoValidator::new(repo_config.dco.clone());
-                let commits = client.list_pr_commits(owner, repo, event.pull_request.number).await?;
+                let commits = client
+                    .list_pr_commits(owner, repo, event.pull_request.number)
+                    .await?;
                 let dco_res = validator.validate_commits(&commits, &event.pull_request.user.login);
 
                 if !dco_res.is_valid {
@@ -367,10 +432,18 @@ impl TriageService {
                     }
                     if event.action == "opened" {
                         let comment = validator.build_failure_comment(&dco_res.unsigned_commits);
-                        let _ = client.create_comment(owner, repo, event.pull_request.number, &comment).await;
+                        let _ = client
+                            .create_comment(owner, repo, event.pull_request.number, &comment)
+                            .await;
 
-                        let title = format!("⚠️ DCO Check Failed: {}#{}", full_name, event.pull_request.number);
-                        let desc = format!("Commits missing `Signed-off-by` in PR #{}: **{}**", event.pull_request.number, event.pull_request.title);
+                        let title = format!(
+                            "⚠️ DCO Check Failed: {}#{}",
+                            full_name, event.pull_request.number
+                        );
+                        let desc = format!(
+                            "Commits missing `Signed-off-by` in PR #{}: **{}**",
+                            event.pull_request.number, event.pull_request.title
+                        );
                         self.notifier
                             .dispatch_event(
                                 SugieEventType::DcoFailed,
@@ -401,7 +474,9 @@ impl TriageService {
                     }
                 } else {
                     if let Some(ref missing_lbl) = repo_config.dco.missing_label {
-                        let _ = client.remove_label(owner, repo, event.pull_request.number, missing_lbl).await;
+                        let _ = client
+                            .remove_label(owner, repo, event.pull_request.number, missing_lbl)
+                            .await;
                     }
                     if repo_config.dco.set_commit_status {
                         let _ = client
@@ -420,7 +495,9 @@ impl TriageService {
             }
 
             // 2. Path-based labeling, Size-based labeling & Draft status
-            let pr_files = client.list_pr_files(owner, repo, event.pull_request.number).await?;
+            let pr_files = client
+                .list_pr_files(owner, repo, event.pull_request.number)
+                .await?;
             let file_paths: Vec<String> = pr_files.into_iter().map(|f| f.filename).collect();
 
             if repo_config.labels.enabled {
@@ -433,7 +510,10 @@ impl TriageService {
                 }
 
                 // Text / conventional commits rules
-                let text_labels = engine.match_text(&event.pull_request.title, event.pull_request.body.as_deref());
+                let text_labels = engine.match_text(
+                    &event.pull_request.title,
+                    event.pull_request.body.as_deref(),
+                );
                 for l in text_labels {
                     labels_to_add.push(l);
                 }
@@ -451,7 +531,9 @@ impl TriageService {
                     labels_to_add.push(d_add);
                 }
                 if let Some(d_rem) = draft_remove {
-                    let _ = client.remove_label(owner, repo, event.pull_request.number, &d_rem).await;
+                    let _ = client
+                        .remove_label(owner, repo, event.pull_request.number, &d_rem)
+                        .await;
                 }
             }
 
@@ -478,12 +560,20 @@ impl TriageService {
                 );
                 let exclude = vec![event.pull_request.user.login.clone()];
 
-                if let Ok(chosen_reviewers) =
-                    balancer.select_reviewers_for_pr(full_name, &file_paths, &codeowner_candidates, &exclude)
-                {
+                if let Ok(chosen_reviewers) = balancer.select_reviewers_for_pr(
+                    full_name,
+                    &file_paths,
+                    &codeowner_candidates,
+                    &exclude,
+                ) {
                     if !chosen_reviewers.is_empty() {
                         let _ = client
-                            .request_reviewers(owner, repo, event.pull_request.number, &chosen_reviewers)
+                            .request_reviewers(
+                                owner,
+                                repo,
+                                event.pull_request.number,
+                                &chosen_reviewers,
+                            )
                             .await;
                         for cr in &chosen_reviewers {
                             let _ = balancer.on_review_requested(full_name, cr);
@@ -493,7 +583,12 @@ impl TriageService {
                             chosen_reviewers, full_name, event.pull_request.number
                         );
 
-                        let assign_title = format!("👥 Reviewers Assigned: {}#{} to {}", full_name, event.pull_request.number, chosen_reviewers.join(", "));
+                        let assign_title = format!(
+                            "👥 Reviewers Assigned: {}#{} to {}",
+                            full_name,
+                            event.pull_request.number,
+                            chosen_reviewers.join(", ")
+                        );
                         self.notifier
                             .dispatch_event(
                                 SugieEventType::Assigned,
@@ -515,12 +610,20 @@ impl TriageService {
             // 4. First-time contributor
             if event.action == "opened" {
                 let first_time = first_time::FirstTimeHandler::new(repo_config.first_time.clone());
-                let stats = self.storage.get_contributor_stats(&event.sender.login, full_name)?;
-                let has_prior = stats.map(|s| s.opened_issues + s.merged_prs > 0).unwrap_or(false);
+                let stats = self
+                    .storage
+                    .get_contributor_stats(&event.sender.login, full_name)?;
+                let has_prior = stats
+                    .map(|s| s.opened_issues + s.merged_prs > 0)
+                    .unwrap_or(false);
 
-                if first_time.is_first_time(event.pull_request.author_association.as_deref(), has_prior) {
+                if first_time
+                    .is_first_time(event.pull_request.author_association.as_deref(), has_prior)
+                {
                     let welcome = first_time.build_welcome_comment(&event.sender.login, true);
-                    let _ = client.create_comment(owner, repo, event.pull_request.number, &welcome).await;
+                    let _ = client
+                        .create_comment(owner, repo, event.pull_request.number, &welcome)
+                        .await;
                     for l in first_time.labels_to_add(true) {
                         labels_to_add.push(l.clone());
                     }
@@ -528,12 +631,17 @@ impl TriageService {
             }
 
             if !labels_to_add.is_empty() {
-                let _ = client.add_labels(owner, repo, event.pull_request.number, &labels_to_add).await;
+                let _ = client
+                    .add_labels(owner, repo, event.pull_request.number, &labels_to_add)
+                    .await;
             }
 
             // 5. GitHub Projects v2
             if repo_config.projects.enabled && event.action == "opened" {
-                let target_proj = repo_config.projects.pr_project_number.or(repo_config.projects.project_number);
+                let target_proj = repo_config
+                    .projects
+                    .pr_project_number
+                    .or(repo_config.projects.project_number);
                 let projects = projects::ProjectsService::new(repo_config.projects.clone());
                 let _ = projects
                     .add_item_to_project(
@@ -555,7 +663,10 @@ impl TriageService {
             }
 
             if event.pull_request.merged {
-                let title = format!("🎉 PR Merged: {}#{} by @{}", full_name, event.pull_request.number, event.pull_request.user.login);
+                let title = format!(
+                    "🎉 PR Merged: {}#{} by @{}",
+                    full_name, event.pull_request.number, event.pull_request.user.login
+                );
                 self.notifier
                     .dispatch_event(
                         SugieEventType::PrMerged,
@@ -584,11 +695,18 @@ impl TriageService {
                     self.notifier.clone(),
                 );
                 if let Ok(Some(alert)) = growth
-                    .on_pr_merged(&event.pull_request.user.login, full_name, event.pull_request.number, Some(&pr_url))
+                    .on_pr_merged(
+                        &event.pull_request.user.login,
+                        full_name,
+                        event.pull_request.number,
+                        Some(&pr_url),
+                    )
                     .await
                 {
                     let celebration = growth.build_pr_comment(&alert);
-                    let _ = client.create_comment(owner, repo, event.pull_request.number, &celebration).await;
+                    let _ = client
+                        .create_comment(owner, repo, event.pull_request.number, &celebration)
+                        .await;
                 }
             }
         }
@@ -611,7 +729,8 @@ impl TriageService {
 
         let inst_id = match event.installation.as_ref().map(|i| i.id) {
             Some(id) => {
-                self.storage.upsert_repository(event.repository.id, full_name, id)?;
+                self.storage
+                    .upsert_repository(event.repository.id, full_name, id)?;
                 id
             }
             None => self
@@ -623,7 +742,8 @@ impl TriageService {
         let client = self.get_client_for_installation(inst_id).await?;
         let repo_config = self.load_repo_config(&client, owner, repo).await;
 
-        let commands = commands::CommandParser::parse_comment(&event.comment.body, &repo_config.commands);
+        let commands =
+            commands::CommandParser::parse_comment(&event.comment.body, &repo_config.commands);
         if commands.is_empty() {
             return Ok(());
         }
@@ -632,14 +752,19 @@ impl TriageService {
         let executor = commands::CommandExecutor::new(&client, &projects, &self.notifier);
 
         for cmd in &commands {
-            if let Err(e) = executor.execute(cmd, owner, repo, &event.issue, &event.sender).await {
+            if let Err(e) = executor
+                .execute(cmd, owner, repo, &event.issue, &event.sender)
+                .await
+            {
                 error!("Error executing slash command {:?}: {:?}", cmd, e);
-                let _ = client.create_comment(
-                    owner,
-                    repo,
-                    event.issue.number,
-                    &format!("⚠️ Error executing command: `{}`", e),
-                ).await;
+                let _ = client
+                    .create_comment(
+                        owner,
+                        repo,
+                        event.issue.number,
+                        &format!("⚠️ Error executing command: `{}`", e),
+                    )
+                    .await;
             }
         }
 
@@ -657,7 +782,8 @@ impl TriageService {
 
         let inst_id = match event.installation.as_ref().map(|i| i.id) {
             Some(id) => {
-                self.storage.upsert_repository(event.repository.id, full_name, id)?;
+                self.storage
+                    .upsert_repository(event.repository.id, full_name, id)?;
                 id
             }
             None => match self.storage.get_installation_id_for_repo(full_name)? {
@@ -673,7 +799,9 @@ impl TriageService {
             return Ok(());
         }
 
-        let check_runs = client.list_check_runs_for_ref(owner, repo, &event.check_suite.head_sha).await?;
+        let check_runs = client
+            .list_check_runs_for_ref(owner, repo, &event.check_suite.head_sha)
+            .await?;
         let summarizer = ci_summary::CiSummarizer::new(repo_config.ci_summary.clone());
 
         for pr_min in &event.check_suite.pull_requests {
@@ -681,7 +809,10 @@ impl TriageService {
                 .update_or_create_summary(&client, owner, repo, pr_min.number, &check_runs)
                 .await
             {
-                warn!("Failed to update CI summary on PR #{}: {:?}", pr_min.number, e);
+                warn!(
+                    "Failed to update CI summary on PR #{}: {:?}",
+                    pr_min.number, e
+                );
             }
 
             // If CI failed, notify Discord & Zulip if configured
@@ -693,15 +824,24 @@ impl TriageService {
             });
 
             if has_failure && repo_config.ci_summary.notify_on_failure {
-                let pr_url = format!("https://github.com/{}/{}/pull/{}", owner, repo, pr_min.number);
+                let pr_url = format!(
+                    "https://github.com/{}/{}/pull/{}",
+                    owner, repo, pr_min.number
+                );
                 let title = format!("❌ CI Failure: {}#{}", full_name, pr_min.number);
                 let failed_names: Vec<String> = check_runs
                     .iter()
-                    .filter(|r| matches!(r.conclusion.as_deref(), Some("failure") | Some("timed_out")))
+                    .filter(|r| {
+                        matches!(r.conclusion.as_deref(), Some("failure") | Some("timed_out"))
+                    })
                     .map(|r| r.name.clone())
                     .collect();
 
-                let desc = format!("CI checks failed on PR #{}:\n- {}", pr_min.number, failed_names.join("\n- "));
+                let desc = format!(
+                    "CI checks failed on PR #{}:\n- {}",
+                    pr_min.number,
+                    failed_names.join("\n- ")
+                );
                 self.notifier
                     .dispatch_event(
                         SugieEventType::CiFailure,

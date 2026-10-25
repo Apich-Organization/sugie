@@ -1,6 +1,8 @@
 use crate::config::ReportsConfig;
 use crate::github::client::GitHubClient;
-use crate::notifications::{DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType};
+use crate::notifications::{
+    DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType,
+};
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -67,11 +69,14 @@ impl MetricsReporter {
 
             if issue.created_at >= start_time {
                 new_issues_count += 1;
-                *contributor_actions.entry(issue.user.login.clone()).or_insert(0) += 1;
+                *contributor_actions
+                    .entry(issue.user.login.clone())
+                    .or_insert(0) += 1;
 
                 if let Some(c) = issue.comments {
                     if c > 0 {
-                        let elapsed = (issue.updated_at - issue.created_at).num_minutes() as f64 / 60.0;
+                        let elapsed =
+                            (issue.updated_at - issue.created_at).num_minutes() as f64 / 60.0;
                         if elapsed > 0.0 && elapsed < 720.0 {
                             response_times_hours.push(elapsed);
                         }
@@ -95,7 +100,9 @@ impl MetricsReporter {
         for pr in &all_pulls {
             if pr.created_at >= start_time {
                 new_prs_count += 1;
-                *contributor_actions.entry(pr.user.login.clone()).or_insert(0) += 1;
+                *contributor_actions
+                    .entry(pr.user.login.clone())
+                    .or_insert(0) += 1;
             }
 
             if let Some(merged_at) = pr.merged_at {
@@ -103,7 +110,9 @@ impl MetricsReporter {
                     merged_prs_count += 1;
                     lines_added += pr.additions.unwrap_or(0);
                     lines_deleted += pr.deletions.unwrap_or(0);
-                    *contributor_actions.entry(pr.user.login.clone()).or_insert(0) += 2;
+                    *contributor_actions
+                        .entry(pr.user.login.clone())
+                        .or_insert(0) += 2;
                 }
             } else if pr.state == "closed" {
                 if pr.updated_at >= start_time {
@@ -181,7 +190,11 @@ impl MetricsReporter {
         md.push_str(&format!(
             "| **Issue Close Rate** | `{:.1}%` | {} |\n",
             metrics.issue_close_rate,
-            if metrics.issue_close_rate >= 80.0 { "🟢 Healthy" } else { "🟡 Moderate" }
+            if metrics.issue_close_rate >= 80.0 {
+                "🟢 Healthy"
+            } else {
+                "🟡 Moderate"
+            }
         ));
         md.push_str(&format!(
             "| **New PRs Opened** | `{}` | 🔀 Created |\n",
@@ -265,13 +278,19 @@ impl MetricsReporter {
                 )
                 .await?;
             info!("Published report as GitHub issue in {}/{}", owner, repo);
-            issue_url = Some(format!("https://github.com/{}/{}/issues/{}", owner, repo, created.number));
+            issue_url = Some(format!(
+                "https://github.com/{}/{}/issues/{}",
+                owner, repo, created.number
+            ));
         }
 
         let fields = vec![
             DiscordEmbedField {
                 name: "Issues (New / Closed)".to_string(),
-                value: format!("{}/{}", metrics.new_issues_count, metrics.closed_issues_count),
+                value: format!(
+                    "{}/{}",
+                    metrics.new_issues_count, metrics.closed_issues_count
+                ),
                 inline: true,
             },
             DiscordEmbedField {

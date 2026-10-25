@@ -52,11 +52,15 @@ impl DuplicateDetector {
                 }
                 "jaccard" => {
                     let tokens_a = tokenize(title, body.unwrap_or_default());
-                    let tokens_b = tokenize(&candidate.title, candidate.body.as_deref().unwrap_or_default());
+                    let tokens_b = tokenize(
+                        &candidate.title,
+                        candidate.body.as_deref().unwrap_or_default(),
+                    );
                     if tokens_a.is_empty() || tokens_b.is_empty() {
                         0.0
                     } else {
-                        tokens_a.intersection(&tokens_b).count() as f64 / tokens_a.union(&tokens_b).count() as f64
+                        tokens_a.intersection(&tokens_b).count() as f64
+                            / tokens_a.union(&tokens_b).count() as f64
                     }
                 }
                 _ => calculate_issue_similarity(
@@ -133,12 +137,7 @@ impl DuplicateDetector {
     }
 }
 
-pub fn calculate_issue_similarity(
-    title_a: &str,
-    body_a: &str,
-    title_b: &str,
-    body_b: &str,
-) -> f64 {
+pub fn calculate_issue_similarity(title_a: &str, body_a: &str, title_b: &str, body_b: &str) -> f64 {
     let title_sim = strsim::jaro_winkler(&title_a.to_lowercase(), &title_b.to_lowercase());
 
     let tokens_a = tokenize(title_a, body_a);
@@ -162,10 +161,10 @@ pub fn calculate_issue_similarity(
 fn tokenize(title: &str, body: &str) -> HashSet<String> {
     let combined = format!("{} {}", title, strip_code_blocks(body));
     let stop_words: HashSet<&'static str> = [
-        "the", "a", "an", "is", "in", "it", "to", "for", "and", "or", "of", "with",
-        "on", "at", "by", "from", "up", "about", "into", "over", "after", "this",
-        "that", "these", "those", "how", "what", "when", "where", "why", "who", "i",
-        "you", "we", "they", "me", "my", "not", "no", "can", "could", "should",
+        "the", "a", "an", "is", "in", "it", "to", "for", "and", "or", "of", "with", "on", "at",
+        "by", "from", "up", "about", "into", "over", "after", "this", "that", "these", "those",
+        "how", "what", "when", "where", "why", "who", "i", "you", "we", "they", "me", "my", "not",
+        "no", "can", "could", "should",
     ]
     .iter()
     .cloned()

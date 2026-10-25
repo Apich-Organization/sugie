@@ -77,8 +77,12 @@ impl SugieEventType {
 
     pub fn zulip_category(&self) -> ZulipTopicCategory {
         match self {
-            SugieEventType::WeeklyReport | SugieEventType::MonthlyReport => ZulipTopicCategory::Reports,
-            SugieEventType::Assigned | SugieEventType::Unassigned => ZulipTopicCategory::Assignments,
+            SugieEventType::WeeklyReport | SugieEventType::MonthlyReport => {
+                ZulipTopicCategory::Reports
+            }
+            SugieEventType::Assigned | SugieEventType::Unassigned => {
+                ZulipTopicCategory::Assignments
+            }
             SugieEventType::StaleWarned
             | SugieEventType::StaleClosed
             | SugieEventType::CiFailure
@@ -88,13 +92,19 @@ impl SugieEventType {
     }
 
     pub fn is_report(&self) -> bool {
-        matches!(self, SugieEventType::WeeklyReport | SugieEventType::MonthlyReport)
+        matches!(
+            self,
+            SugieEventType::WeeklyReport | SugieEventType::MonthlyReport
+        )
     }
 }
 
 impl NotificationDispatcher {
     pub fn new(config: &NotificationsConfig) -> Self {
-        let discord = config.discord.as_ref().map(|c| DiscordNotifier::new(c.clone()));
+        let discord = config
+            .discord
+            .as_ref()
+            .map(|c| DiscordNotifier::new(c.clone()));
         let zulip = config.zulip.as_ref().map(|c| ZulipNotifier::new(c.clone()));
         Self {
             discord,
@@ -118,7 +128,14 @@ impl NotificationDispatcher {
 
         if let Some(ref discord) = self.discord {
             if let Err(e) = discord
-                .send_embed(title, message, url, level.discord_color(), fields, event_type.is_report())
+                .send_embed(
+                    title,
+                    message,
+                    url,
+                    level.discord_color(),
+                    fields,
+                    event_type.is_report(),
+                )
                 .await
             {
                 error!("Failed to dispatch Discord notification: {:?}", e);

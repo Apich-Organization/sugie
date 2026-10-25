@@ -34,7 +34,10 @@ impl ZulipNotifier {
             ZulipTopicCategory::Custom(c) => c,
         };
 
-        let endpoint = format!("{}/api/v1/messages", self.config.site_url.trim_end_matches('/'));
+        let endpoint = format!(
+            "{}/api/v1/messages",
+            self.config.site_url.trim_end_matches('/')
+        );
 
         let params = [
             ("type", "stream"),

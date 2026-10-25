@@ -89,12 +89,7 @@ impl Storage {
 
     // --- Repositories ---
 
-    pub fn upsert_repository(
-        &self,
-        id: u64,
-        full_name: &str,
-        installation_id: u64,
-    ) -> Result<()> {
+    pub fn upsert_repository(&self, id: u64, full_name: &str, installation_id: u64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -139,7 +134,8 @@ impl Storage {
 
     pub fn get_installation_id_for_repo(&self, full_name: &str) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT installation_id FROM repositories WHERE full_name = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT installation_id FROM repositories WHERE full_name = ?1")?;
         let mut rows = stmt.query(params![full_name])?;
         if let Some(row) = rows.next()? {
             let inst_id: i64 = row.get(0)?;
@@ -163,12 +159,18 @@ impl Storage {
             params![username, repo],
         )?;
 
-        let mut stmt = conn.prepare("SELECT merged_prs FROM contributor_stats WHERE username = ?1 AND repo = ?2")?;
+        let mut stmt = conn.prepare(
+            "SELECT merged_prs FROM contributor_stats WHERE username = ?1 AND repo = ?2",
+        )?;
         let count: u32 = stmt.query_row(params![username, repo], |r| r.get(0))?;
         Ok(count)
     }
 
-    pub fn get_contributor_stats(&self, username: &str, repo: &str) -> Result<Option<ContributorStats>> {
+    pub fn get_contributor_stats(
+        &self,
+        username: &str,
+        repo: &str,
+    ) -> Result<Option<ContributorStats>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT username, repo, merged_prs, opened_issues, reviews_done, last_milestone_notified FROM contributor_stats WHERE username = ?1 AND repo = ?2"
@@ -188,7 +190,12 @@ impl Storage {
         }
     }
 
-    pub fn update_last_milestone_notified(&self, username: &str, repo: &str, milestone: u32) -> Result<()> {
+    pub fn update_last_milestone_notified(
+        &self,
+        username: &str,
+        repo: &str,
+        milestone: u32,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE contributor_stats SET last_milestone_notified = ?3 WHERE username = ?1 AND repo = ?2",
@@ -201,7 +208,9 @@ impl Storage {
 
     pub fn get_reviewer_workload(&self, username: &str, repo: &str) -> Result<u32> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT active_reviews FROM reviewer_workloads WHERE username = ?1 AND repo = ?2")?;
+        let mut stmt = conn.prepare(
+            "SELECT active_reviews FROM reviewer_workloads WHERE username = ?1 AND repo = ?2",
+        )?;
         let mut rows = stmt.query(params![username, repo])?;
         if let Some(row) = rows.next()? {
             let active: u32 = row.get(0)?;
@@ -258,7 +267,9 @@ impl Storage {
 
     pub fn get_stale_warned(&self, repo: &str, issue_number: u64) -> Result<Option<DateTime<Utc>>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT warned_at FROM stale_tracking WHERE repo = ?1 AND issue_number = ?2")?;
+        let mut stmt = conn.prepare(
+            "SELECT warned_at FROM stale_tracking WHERE repo = ?1 AND issue_number = ?2",
+        )?;
         let mut rows = stmt.query(params![repo, issue_number as i64])?;
         if let Some(row) = rows.next()? {
             let warned_str: Option<String> = row.get(0)?;
@@ -291,25 +302,53 @@ mod tests {
         let storage = Storage::new_in_memory().unwrap();
 
         // Repositories
-        storage.upsert_repository(101, "rust-lang/rust", 999).unwrap();
+        storage
+            .upsert_repository(101, "rust-lang/rust", 999)
+            .unwrap();
         let repos = storage.list_repositories().unwrap();
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].1, "rust-lang/rust");
-        assert_eq!(storage.get_installation_id_for_repo("rust-lang/rust").unwrap(), Some(999));
+        assert_eq!(
+            storage
+                .get_installation_id_for_repo("rust-lang/rust")
+                .unwrap(),
+            Some(999)
+        );
 
         // Contributor stats
-        let count1 = storage.record_merged_pr("developer1", "rust-lang/rust").unwrap();
+        let count1 = storage
+            .record_merged_pr("developer1", "rust-lang/rust")
+            .unwrap();
         assert_eq!(count1, 1);
-        let count2 = storage.record_merged_pr("developer1", "rust-lang/rust").unwrap();
+        let count2 = storage
+            .record_merged_pr("developer1", "rust-lang/rust")
+            .unwrap();
         assert_eq!(count2, 2);
 
-        let stats = storage.get_contributor_stats("developer1", "rust-lang/rust").unwrap().unwrap();
+        let stats = storage
+            .get_contributor_stats("developer1", "rust-lang/rust")
+            .unwrap()
+            .unwrap();
         assert_eq!(stats.merged_prs, 2);
 
         // Reviewer workload
-        storage.increment_reviewer_workload("reviewer1", "rust-lang/rust").unwrap();
-        assert_eq!(storage.get_reviewer_workload("reviewer1", "rust-lang/rust").unwrap(), 1);
-        storage.decrement_reviewer_workload("reviewer1", "rust-lang/rust").unwrap();
-        assert_eq!(storage.get_reviewer_workload("reviewer1", "rust-lang/rust").unwrap(), 0);
+        storage
+            .increment_reviewer_workload("reviewer1", "rust-lang/rust")
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_reviewer_workload("reviewer1", "rust-lang/rust")
+                .unwrap(),
+            1
+        );
+        storage
+            .decrement_reviewer_workload("reviewer1", "rust-lang/rust")
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_reviewer_workload("reviewer1", "rust-lang/rust")
+                .unwrap(),
+            0
+        );
     }
 }

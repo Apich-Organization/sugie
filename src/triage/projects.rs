@@ -120,7 +120,10 @@ impl ProjectsService {
             None => anyhow::bail!("No item ID returned after adding to project"),
         };
 
-        info!("Added item {} to project {} (item ID: {})", content_node_id, project_id, item_id);
+        info!(
+            "Added item {} to project {} (item ID: {})",
+            content_node_id, project_id, item_id
+        );
 
         // Update status field if option_id is available
         if let (Some(field_id), Some(opt_id)) = (status_field_id, option_id) {
@@ -151,7 +154,10 @@ impl ProjectsService {
                 .await
                 .context("Failed to update project item status field")?;
 
-            info!("Updated status for item {} in project {}", item_id, project_id);
+            info!(
+                "Updated status for item {} in project {}",
+                item_id, project_id
+            );
         }
 
         Ok(())

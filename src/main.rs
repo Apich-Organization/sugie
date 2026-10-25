@@ -95,7 +95,8 @@ async fn main() -> anyhow::Result<()> {
             let stale_interval_secs = (stale_rules.check_interval_hours.max(1) as u64) * 3600;
 
             tokio::spawn(async move {
-                let stale_mgr = StaleManager::new(stale_rules, stale_storage.clone(), stale_notifier);
+                let stale_mgr =
+                    StaleManager::new(stale_rules, stale_storage.clone(), stale_notifier);
                 let mut interval = tokio::time::interval(Duration::from_secs(stale_interval_secs));
 
                 loop {
@@ -103,11 +104,19 @@ async fn main() -> anyhow::Result<()> {
                     info!("Running periodic stale issue & PR sweep...");
                     if let Ok(repos) = stale_storage.list_repositories() {
                         for (_, full_name, inst_id) in repos {
-                            if let Ok(client) = stale_triage.get_client_for_installation(inst_id).await {
+                            if let Ok(client) =
+                                stale_triage.get_client_for_installation(inst_id).await
+                            {
                                 let parts: Vec<&str> = full_name.split('/').collect();
                                 if parts.len() == 2 {
-                                    if let Err(e) = stale_mgr.process_repository(&client, parts[0], parts[1]).await {
-                                        error!("Error in stale processor for {}: {:?}", full_name, e);
+                                    if let Err(e) = stale_mgr
+                                        .process_repository(&client, parts[0], parts[1])
+                                        .await
+                                    {
+                                        error!(
+                                            "Error in stale processor for {}: {:?}",
+                                            full_name, e
+                                        );
                                     }
                                 }
                             }
@@ -124,7 +133,8 @@ async fn main() -> anyhow::Result<()> {
 
             tokio::spawn(async move {
                 let weekly_interval_secs = (report_cfg.weekly_interval_days.max(1) as u64) * 86400;
-                let mut weekly_timer = tokio::time::interval(Duration::from_secs(weekly_interval_secs));
+                let mut weekly_timer =
+                    tokio::time::interval(Duration::from_secs(weekly_interval_secs));
                 let reporter = MetricsReporter::new(report_cfg.clone(), report_notifier.clone());
 
                 loop {
@@ -135,19 +145,41 @@ async fn main() -> anyhow::Result<()> {
                     info!("Running scheduled weekly triage report generator...");
                     if let Ok(repos) = report_storage.list_repositories() {
                         for (_, full_name, inst_id) in repos {
-                            if let Ok(client) = report_triage.get_client_for_installation(inst_id).await {
+                            if let Ok(client) =
+                                report_triage.get_client_for_installation(inst_id).await
+                            {
                                 let parts: Vec<&str> = full_name.split('/').collect();
                                 if parts.len() == 2 {
                                     match reporter
-                                        .generate_report(&client, parts[0], parts[1], report_cfg.weekly_interval_days as i64, "Weekly")
+                                        .generate_report(
+                                            &client,
+                                            parts[0],
+                                            parts[1],
+                                            report_cfg.weekly_interval_days as i64,
+                                            "Weekly",
+                                        )
                                         .await
                                     {
                                         Ok(metrics_data) => {
-                                            if let Err(e) = reporter.publish_report(&client, parts[0], parts[1], &metrics_data).await {
-                                                error!("Failed to publish weekly report for {}: {:?}", full_name, e);
+                                            if let Err(e) = reporter
+                                                .publish_report(
+                                                    &client,
+                                                    parts[0],
+                                                    parts[1],
+                                                    &metrics_data,
+                                                )
+                                                .await
+                                            {
+                                                error!(
+                                                    "Failed to publish weekly report for {}: {:?}",
+                                                    full_name, e
+                                                );
                                             }
                                         }
-                                        Err(e) => error!("Failed to generate weekly report for {}: {:?}", full_name, e),
+                                        Err(e) => error!(
+                                            "Failed to generate weekly report for {}: {:?}",
+                                            full_name, e
+                                        ),
                                     }
                                 }
                             }
@@ -182,7 +214,11 @@ async fn main() -> anyhow::Result<()> {
             let auth = Arc::new(GitHubAuthManager::new(config.github.app_id, private_key));
             let storage = Storage::new(&config.db_path)?;
             let notifier = NotificationDispatcher::new(&config.notifications);
-            let stale_mgr = StaleManager::new(config.default_rules.stale.clone(), storage.clone(), notifier);
+            let stale_mgr = StaleManager::new(
+                config.default_rules.stale.clone(),
+                storage.clone(),
+                notifier,
+            );
 
             let triage = TriageService::new(
                 Arc::new(config),
@@ -193,8 +229,7 @@ async fn main() -> anyhow::Result<()> {
 
             let repos = match repo {
                 Some(r) => {
-                    let inst_id = storage.get_installation_id_for_repo(&r)?
-                        .unwrap_or(1);
+                    let inst_id = storage.get_installation_id_for_repo(&r)?.unwrap_or(1);
                     vec![(0, r, inst_id)]
                 }
                 None => storage.list_repositories()?,
@@ -205,7 +240,9 @@ async fn main() -> anyhow::Result<()> {
                 let parts: Vec<&str> = full_name.split('/').collect();
                 if parts.len() == 2 {
                     info!("Running stale check on {}", full_name);
-                    let report = stale_mgr.process_repository(&client, parts[0], parts[1]).await?;
+                    let report = stale_mgr
+                        .process_repository(&client, parts[0], parts[1])
+                        .await?;
                     println!(
                         "Repository {}: Warned {}, Closed {}, Locked {}",
                         full_name, report.warned_count, report.closed_count, report.locked_count
@@ -245,13 +282,17 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let reporter = MetricsReporter::new(report_cfg, notifier);
-            let metrics_data = reporter.generate_report(&client, parts[0], parts[1], days, label).await?;
+            let metrics_data = reporter
+                .generate_report(&client, parts[0], parts[1], days, label)
+                .await?;
             let md = reporter.format_markdown_report(&metrics_data);
 
             println!("{}", md);
 
             if publish {
-                reporter.publish_report(&client, parts[0], parts[1], &metrics_data).await?;
+                reporter
+                    .publish_report(&client, parts[0], parts[1], &metrics_data)
+                    .await?;
                 println!("\n✅ Successfully published report to GitHub and notified channels.");
             }
         }

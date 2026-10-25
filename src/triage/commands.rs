@@ -1,7 +1,9 @@
 use crate::config::CommandsConfig;
 use crate::github::client::GitHubClient;
 use crate::github::models::{Issue, User};
-use crate::notifications::{DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType};
+use crate::notifications::{
+    DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType,
+};
 use crate::triage::projects::ProjectsService;
 use anyhow::Result;
 use serde::Deserialize;
@@ -11,13 +13,21 @@ use tracing::info;
 pub enum SlashCommand {
     Assign(Vec<String>),
     Unassign(Vec<String>),
-    Label { add: Vec<String>, remove: Vec<String> },
+    Label {
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
     Unlabel(Vec<String>),
     Close(Option<String>),
     Reopen,
     Retest,
-    Project { target: String, status: Option<String> },
-    Move { target_repo: String },
+    Project {
+        target: String,
+        status: Option<String>,
+    },
+    Move {
+        target_repo: String,
+    },
     Duplicate(u64),
     Help,
 }
@@ -41,7 +51,11 @@ impl CommandParser {
             }
 
             let raw_cmd = parts[0].strip_prefix(prefix).unwrap_or("").to_lowercase();
-            let effective_cmd = config.aliases.get(&raw_cmd).map(|s| s.as_str()).unwrap_or(&raw_cmd);
+            let effective_cmd = config
+                .aliases
+                .get(&raw_cmd)
+                .map(|s| s.as_str())
+                .unwrap_or(&raw_cmd);
             let args = &parts[1..];
 
             match effective_cmd {
@@ -144,7 +158,11 @@ impl<'a> CommandExecutor<'a> {
         projects: &'a ProjectsService,
         notifier: &'a NotificationDispatcher,
     ) -> Self {
-        Self { client, projects, notifier }
+        Self {
+            client,
+            projects,
+            notifier,
+        }
     }
 
     pub async fn execute(
@@ -156,7 +174,10 @@ impl<'a> CommandExecutor<'a> {
         sender: &User,
     ) -> Result<()> {
         let repo_full_name = format!("{}/{}", owner, repo);
-        let issue_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, issue.number);
+        let issue_url = format!(
+            "https://github.com/{}/{}/issues/{}",
+            owner, repo, issue.number
+        );
 
         match command {
             SlashCommand::Assign(users) => {
@@ -165,11 +186,27 @@ impl<'a> CommandExecutor<'a> {
                 } else {
                     users.clone()
                 };
-                self.client.add_assignees(owner, repo, issue.number, &to_assign).await?;
-                info!("Assigned {:?} to {}#{}", to_assign, repo_full_name, issue.number);
+                self.client
+                    .add_assignees(owner, repo, issue.number, &to_assign)
+                    .await?;
+                info!(
+                    "Assigned {:?} to {}#{}",
+                    to_assign, repo_full_name, issue.number
+                );
 
-                let title = format!("👤 Assign: {}#{} to {}", repo_full_name, issue.number, to_assign.join(", "));
-                let msg = format!("**@{}** assigned **{}** to: {}\n\n**Issue**: {}", sender.login, to_assign.join(", "), issue.title, issue_url);
+                let title = format!(
+                    "👤 Assign: {}#{} to {}",
+                    repo_full_name,
+                    issue.number,
+                    to_assign.join(", ")
+                );
+                let msg = format!(
+                    "**@{}** assigned **{}** to: {}\n\n**Issue**: {}",
+                    sender.login,
+                    to_assign.join(", "),
+                    issue.title,
+                    issue_url
+                );
                 self.notifier
                     .dispatch_event(
                         SugieEventType::Assigned,
@@ -198,11 +235,26 @@ impl<'a> CommandExecutor<'a> {
                 } else {
                     users.clone()
                 };
-                self.client.remove_assignees(owner, repo, issue.number, &to_unassign).await?;
-                info!("Unassigned {:?} from {}#{}", to_unassign, repo_full_name, issue.number);
+                self.client
+                    .remove_assignees(owner, repo, issue.number, &to_unassign)
+                    .await?;
+                info!(
+                    "Unassigned {:?} from {}#{}",
+                    to_unassign, repo_full_name, issue.number
+                );
 
-                let title = format!("👤 Unassign: {}#{} removed {}", repo_full_name, issue.number, to_unassign.join(", "));
-                let msg = format!("**@{}** removed **{}** from: {}", sender.login, to_unassign.join(", "), issue.title);
+                let title = format!(
+                    "👤 Unassign: {}#{} removed {}",
+                    repo_full_name,
+                    issue.number,
+                    to_unassign.join(", ")
+                );
+                let msg = format!(
+                    "**@{}** removed **{}** from: {}",
+                    sender.login,
+                    to_unassign.join(", "),
+                    issue.title
+                );
                 self.notifier
                     .dispatch_event(
                         SugieEventType::Unassigned,
@@ -216,15 +268,23 @@ impl<'a> CommandExecutor<'a> {
             }
             SlashCommand::Label { add, remove } => {
                 if !add.is_empty() {
-                    self.client.add_labels(owner, repo, issue.number, add).await?;
+                    self.client
+                        .add_labels(owner, repo, issue.number, add)
+                        .await?;
                 }
                 for lbl in remove {
-                    let _ = self.client.remove_label(owner, repo, issue.number, lbl).await;
+                    let _ = self
+                        .client
+                        .remove_label(owner, repo, issue.number, lbl)
+                        .await;
                 }
                 info!("Updated labels on {}#{}", repo_full_name, issue.number);
 
                 let title = format!("🏷️ Label Update: {}#{}", repo_full_name, issue.number);
-                let desc = format!("**@{}** updated labels on **#{}**: +{:?} -{:?}", sender.login, issue.number, add, remove);
+                let desc = format!(
+                    "**@{}** updated labels on **#{}**: +{:?} -{:?}",
+                    sender.login, issue.number, add, remove
+                );
                 self.notifier
                     .dispatch_event(
                         SugieEventType::LabelChanged,
@@ -238,26 +298,41 @@ impl<'a> CommandExecutor<'a> {
             }
             SlashCommand::Unlabel(labels) => {
                 for lbl in labels {
-                    let _ = self.client.remove_label(owner, repo, issue.number, lbl).await;
+                    let _ = self
+                        .client
+                        .remove_label(owner, repo, issue.number, lbl)
+                        .await;
                 }
-                info!("Removed labels {:?} from {}#{}", labels, repo_full_name, issue.number);
+                info!(
+                    "Removed labels {:?} from {}#{}",
+                    labels, repo_full_name, issue.number
+                );
             }
             SlashCommand::Close(reason) => {
                 let state_reason = match reason.as_deref() {
                     Some(r) if r.contains("not planned") => Some("not_planned"),
                     _ => Some("completed"),
                 };
-                self.client.update_issue_state(owner, repo, issue.number, "closed", state_reason).await?;
+                self.client
+                    .update_issue_state(owner, repo, issue.number, "closed", state_reason)
+                    .await?;
                 let comment_body = if let Some(r) = reason {
                     format!("Closed by @{}: {}", sender.login, r)
                 } else {
                     format!("Closed by @{}.", sender.login)
                 };
-                self.client.create_comment(owner, repo, issue.number, &comment_body).await?;
+                self.client
+                    .create_comment(owner, repo, issue.number, &comment_body)
+                    .await?;
                 info!("Closed {}#{}", repo_full_name, issue.number);
 
                 let title = format!("🔒 Closed: {}#{}", repo_full_name, issue.number);
-                let desc = format!("Item closed by **@{}**: {}\n\n**Reason**: {}", sender.login, issue.title, reason.as_deref().unwrap_or("completed"));
+                let desc = format!(
+                    "Item closed by **@{}**: {}\n\n**Reason**: {}",
+                    sender.login,
+                    issue.title,
+                    reason.as_deref().unwrap_or("completed")
+                );
                 self.notifier
                     .dispatch_event(
                         SugieEventType::IssueClosed,
@@ -270,19 +345,29 @@ impl<'a> CommandExecutor<'a> {
                     .await;
             }
             SlashCommand::Reopen => {
-                self.client.update_issue_state(owner, repo, issue.number, "open", Some("reopened")).await?;
-                self.client.create_comment(
-                    owner,
-                    repo,
-                    issue.number,
-                    &format!("Reopened by @{}.", sender.login),
-                ).await?;
+                self.client
+                    .update_issue_state(owner, repo, issue.number, "open", Some("reopened"))
+                    .await?;
+                self.client
+                    .create_comment(
+                        owner,
+                        repo,
+                        issue.number,
+                        &format!("Reopened by @{}.", sender.login),
+                    )
+                    .await?;
                 info!("Reopened {}#{}", repo_full_name, issue.number);
             }
             SlashCommand::Retest => {
                 if issue.is_pr() {
-                    let pr = self.client.get_pull_request(owner, repo, issue.number).await?;
-                    let check_runs = self.client.list_check_runs_for_ref(owner, repo, &pr.head.sha).await?;
+                    let pr = self
+                        .client
+                        .get_pull_request(owner, repo, issue.number)
+                        .await?;
+                    let check_runs = self
+                        .client
+                        .list_check_runs_for_ref(owner, repo, &pr.head.sha)
+                        .await?;
                     let mut retested_count = 0;
                     for cr in &check_runs {
                         if cr.conclusion.as_deref() == Some("failure") {
@@ -290,24 +375,33 @@ impl<'a> CommandExecutor<'a> {
                             retested_count += 1;
                         }
                     }
-                    self.client.create_comment(
-                        owner,
-                        repo,
-                        issue.number,
-                        &format!("🔄 Retest triggered for {} failed check(s) by @{}.", retested_count, sender.login),
-                    ).await?;
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            &format!(
+                                "🔄 Retest triggered for {} failed check(s) by @{}.",
+                                retested_count, sender.login
+                            ),
+                        )
+                        .await?;
                 } else {
-                    self.client.create_comment(
-                        owner,
-                        repo,
-                        issue.number,
-                        "⚠️ `/retest` is only applicable to pull requests.",
-                    ).await?;
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            "⚠️ `/retest` is only applicable to pull requests.",
+                        )
+                        .await?;
                 }
             }
             SlashCommand::Project { target, status } => {
                 if let Ok(project_num) = target.parse::<i64>() {
-                    let node_id = self.get_node_id_for_issue(owner, repo, issue.number).await?;
+                    let node_id = self
+                        .get_node_id_for_issue(owner, repo, issue.number)
+                        .await?;
                     if let Some(nid) = node_id {
                         self.projects
                             .add_item_to_project(
@@ -318,20 +412,27 @@ impl<'a> CommandExecutor<'a> {
                                 status.as_deref(),
                             )
                             .await?;
-                        self.client.create_comment(
+                        self.client
+                            .create_comment(
+                                owner,
+                                repo,
+                                issue.number,
+                                &format!(
+                                    "📋 Successfully added to Project #{} (status: {:?}).",
+                                    project_num, status
+                                ),
+                            )
+                            .await?;
+                    }
+                } else {
+                    self.client
+                        .create_comment(
                             owner,
                             repo,
                             issue.number,
-                            &format!("📋 Successfully added to Project #{} (status: {:?}).", project_num, status),
-                        ).await?;
-                    }
-                } else {
-                    self.client.create_comment(
-                        owner,
-                        repo,
-                        issue.number,
-                        &format!("⚠️ Could not parse project number: `{}`", target),
-                    ).await?;
+                            &format!("⚠️ Could not parse project number: `{}`", target),
+                        )
+                        .await?;
                 }
             }
             SlashCommand::Move { target_repo } => {
@@ -343,12 +444,14 @@ impl<'a> CommandExecutor<'a> {
                 };
 
                 if target_owner == owner && target_name == repo {
-                    self.client.create_comment(
-                        owner,
-                        repo,
-                        issue.number,
-                        "⚠️ Cannot move issue to the same repository.",
-                    ).await?;
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            "⚠️ Cannot move issue to the same repository.",
+                        )
+                        .await?;
                     return Ok(());
                 }
 
@@ -361,25 +464,36 @@ impl<'a> CommandExecutor<'a> {
                     issue.body.as_deref().unwrap_or("*No description provided*")
                 );
 
-                let label_names: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
+                let label_names: Vec<String> =
+                    issue.labels.iter().map(|l| l.name.clone()).collect();
 
-                let new_issue = self.client.create_issue(
-                    target_owner,
-                    target_name,
-                    &issue.title,
-                    Some(&migrated_body),
-                    &label_names,
-                    &[],
-                ).await?;
+                let new_issue = self
+                    .client
+                    .create_issue(
+                        target_owner,
+                        target_name,
+                        &issue.title,
+                        Some(&migrated_body),
+                        &label_names,
+                        &[],
+                    )
+                    .await?;
 
-                let new_issue_url = format!("https://github.com/{}/{}/issues/{}", target_owner, target_name, new_issue.number);
+                let new_issue_url = format!(
+                    "https://github.com/{}/{}/issues/{}",
+                    target_owner, target_name, new_issue.number
+                );
 
                 let close_comment = format!(
                     "📦 This issue has been migrated to {}/{}#{} by @{}.",
                     target_owner, target_name, new_issue.number, sender.login
                 );
-                self.client.create_comment(owner, repo, issue.number, &close_comment).await?;
-                self.client.update_issue_state(owner, repo, issue.number, "closed", Some("completed")).await?;
+                self.client
+                    .create_comment(owner, repo, issue.number, &close_comment)
+                    .await?;
+                self.client
+                    .update_issue_state(owner, repo, issue.number, "closed", Some("completed"))
+                    .await?;
 
                 info!(
                     "Migrated {}/{}#{} to {}/{}#{}",
@@ -387,8 +501,14 @@ impl<'a> CommandExecutor<'a> {
                 );
 
                 // Notify Discord & Zulip of cross-repo move
-                let title = format!("📦 Issue Migrated: {}#{} ➔ {}/{}#{}", repo_full_name, issue.number, target_owner, target_name, new_issue.number);
-                let msg = format!("**@{}** migrated **{}**\nFrom: `{}`\nTo: `{}/{}`", sender.login, issue.title, repo_full_name, target_owner, target_name);
+                let title = format!(
+                    "📦 Issue Migrated: {}#{} ➔ {}/{}#{}",
+                    repo_full_name, issue.number, target_owner, target_name, new_issue.number
+                );
+                let msg = format!(
+                    "**@{}** migrated **{}**\nFrom: `{}`\nTo: `{}/{}`",
+                    sender.login, issue.title, repo_full_name, target_owner, target_name
+                );
                 self.notifier
                     .dispatch_event(
                         SugieEventType::CrossRepoMove,
@@ -404,7 +524,10 @@ impl<'a> CommandExecutor<'a> {
                             },
                             DiscordEmbedField {
                                 name: "Destination".to_string(),
-                                value: format!("{}/{}#{}", target_owner, target_name, new_issue.number),
+                                value: format!(
+                                    "{}/{}#{}",
+                                    target_owner, target_name, new_issue.number
+                                ),
                                 inline: true,
                             },
                         ],
@@ -412,14 +535,23 @@ impl<'a> CommandExecutor<'a> {
                     .await;
             }
             SlashCommand::Duplicate(target_issue_num) => {
-                self.client.add_labels(owner, repo, issue.number, &["duplicate".to_string()]).await?;
+                self.client
+                    .add_labels(owner, repo, issue.number, &["duplicate".to_string()])
+                    .await?;
                 let close_comment = format!(
                     "🔒 Marked as duplicate of #{} by @{}.\n\nClosing this issue.",
                     target_issue_num, sender.login
                 );
-                self.client.create_comment(owner, repo, issue.number, &close_comment).await?;
-                self.client.update_issue_state(owner, repo, issue.number, "closed", Some("not_planned")).await?;
-                info!("Marked {}#{} as duplicate of #{}", repo_full_name, issue.number, target_issue_num);
+                self.client
+                    .create_comment(owner, repo, issue.number, &close_comment)
+                    .await?;
+                self.client
+                    .update_issue_state(owner, repo, issue.number, "closed", Some("not_planned"))
+                    .await?;
+                info!(
+                    "Marked {}#{} as duplicate of #{}",
+                    repo_full_name, issue.number, target_issue_num
+                );
             }
             SlashCommand::Help => {
                 let help_text = r#"
@@ -439,14 +571,21 @@ impl<'a> CommandExecutor<'a> {
 | `/duplicate <#num>` | `/duplicate #123` | Closes issue as duplicate of #123 |
 | `/help` | `/help` | Displays this help manual |
 "#;
-                self.client.create_comment(owner, repo, issue.number, help_text.trim()).await?;
+                self.client
+                    .create_comment(owner, repo, issue.number, help_text.trim())
+                    .await?;
             }
         }
 
         Ok(())
     }
 
-    async fn get_node_id_for_issue(&self, owner: &str, repo: &str, issue_number: u64) -> Result<Option<String>> {
+    async fn get_node_id_for_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<Option<String>> {
         #[derive(Deserialize)]
         struct IssueNodeData {
             repository: Option<RepoNode>,
@@ -478,9 +617,11 @@ impl<'a> CommandExecutor<'a> {
         });
 
         let data: IssueNodeData = self.client.graphql(query, vars).await?;
-        let node_id = data
-            .repository
-            .and_then(|r| r.issue.map(|i| i.id).or_else(|| r.pull_request.map(|p| p.id)));
+        let node_id = data.repository.and_then(|r| {
+            r.issue
+                .map(|i| i.id)
+                .or_else(|| r.pull_request.map(|p| p.id))
+        });
         Ok(node_id)
     }
 }
@@ -501,10 +642,16 @@ mod tests {
         let cmds = CommandParser::parse_comment(comment, &config);
         assert_eq!(cmds.len(), 3);
         assert_eq!(cmds[0], SlashCommand::Assign(vec!["alice".to_string()]));
-        assert_eq!(cmds[1], SlashCommand::Label {
-            add: vec!["bug".to_string()],
-            remove: vec!["wip".to_string()],
-        });
-        assert_eq!(cmds[2], SlashCommand::Close(Some("not planned".to_string())));
+        assert_eq!(
+            cmds[1],
+            SlashCommand::Label {
+                add: vec!["bug".to_string()],
+                remove: vec!["wip".to_string()],
+            }
+        );
+        assert_eq!(
+            cmds[2],
+            SlashCommand::Close(Some("not planned".to_string()))
+        );
     }
 }
