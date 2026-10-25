@@ -9,26 +9,26 @@ description = "A powerful, full-featured GitHub triage bot for the Rust ecosyste
 tokio = { version = "1.40", features = ["full"] }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2", "json", "matched-path"] }
 tower = { version = "0.5" }
-tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "timeout"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-jsonwebtoken = "9.3"
-hmac = "0.12"
-sha2 = "0.10"
+toml = "1.1"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+jsonwebtoken = "11.1"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", eatures = ["bundled"] }
 regex = "1.11"
 globset = "0.4"
 anyhow = "1.0"
 thiserror = "2.0"
 strsim = "0.11"
-base64 = "0.23.1"
+base64 = "0.23"
 
 [dev-dependencies]
 tempfile = "3.13"
