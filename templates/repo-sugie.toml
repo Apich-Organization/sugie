@@ -1,0 +1,37 @@
+# Repository-level override for Sugie Bot (.github/sugie.toml)
+
+[labels]
+enabled = true
+
+[[labels.path_rules]]
+pattern = "crates/compiler/**"
+labels = ["area-compiler"]
+
+[[labels.path_rules]]
+pattern = "crates/runtime/**"
+labels = ["area-runtime"]
+
+[[labels.keyword_rules]]
+keywords = ["bug", "crash", "segmentation fault"]
+target = "both"
+labels = ["bug"]
+
+[duplicates]
+enabled = true
+threshold = 0.70
+
+[codeowners]
+enabled = true
+file_path = ".github/CODEOWNERS"
+auto_assign = true
+
+[reviewers]
+enabled = true
+pool = ["alice", "bob"]
+max_active_reviews = 5
+load_balancing = "least_busy"
+out_of_office = []
+
+[dco]
+enabled = true
+require_signoff = true

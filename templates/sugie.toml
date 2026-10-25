@@ -1,0 +1,135 @@
+# Sugie Bot Configuration File
+
+host = "0.0.0.0"
+port = 8080
+db_path = "sugie.db"
+
+[github]
+app_id = 123456
+webhook_secret = "your-github-webhook-secret"
+private_key_path = "sugie.private-key.pem"
+# Or provide PEM string directly:
+# private_key_pem = """-----BEGIN RSA PRIVATE KEY-----..."""
+
+[notifications.discord]
+webhook_url = "https://discord.com/api/webhooks/your/webhook/url"
+username = "sugie-bot"
+notify_on_stale = true
+notify_on_growth = true
+notify_on_report = true
+notify_on_ci_failure = true
+
+[notifications.zulip]
+site_url = "https://your-zulip.example.com"
+bot_email = "sugie-bot@your-zulip.example.com"
+bot_api_key = "your-zulip-bot-api-key"
+stream = "github-triage"
+topic = "sugie-alerts"
+notify_on_stale = true
+notify_on_growth = true
+notify_on_report = true
+notify_on_ci_failure = true
+
+[default_rules.labels]
+enabled = true
+
+[[default_rules.labels.path_rules]]
+pattern = "crates/core/**"
+labels = ["area-core", "component-core"]
+
+[[default_rules.labels.path_rules]]
+pattern = "docs/**"
+labels = ["area-documentation"]
+
+[[default_rules.labels.path_rules]]
+pattern = "**/*.rs"
+labels = ["lang-rust"]
+
+[[default_rules.labels.keyword_rules]]
+keywords = ["panic", "segfault", "crash", "assertion failed"]
+target = "both"
+labels = ["bug", "severity-high"]
+
+[[default_rules.labels.keyword_rules]]
+keywords = ["feature request", "proposal", "rfc"]
+target = "title"
+labels = ["enhancement"]
+
+[[default_rules.labels.template_rules]]
+pattern = "### Steps to Reproduce"
+labels = ["has-repro"]
+
+[default_rules.duplicates]
+enabled = true
+threshold = 0.65
+add_label = "possible-duplicate"
+
+[default_rules.codeowners]
+enabled = true
+file_path = ".github/CODEOWNERS"
+auto_assign = true
+mention_in_comment = false
+
+[[default_rules.codeowners.rules]]
+path_pattern = "benches/**"
+maintainers = ["@performance-team"]
+
+[default_rules.stale]
+enabled = true
+warn_days = 30
+close_days = 7
+lock_days = 14
+stale_label = "stale"
+exempt_labels = ["pinned", "security", "never-stale", "tracking-issue"]
+warn_message = "This issue or pull request has been automatically marked as stale because it has not had recent activity. It will be closed in 7 days if no further activity occurs. Thank you for your contributions!"
+close_message = "This item was closed because it has been inactive for 7 days since being marked as stale. Feel free to reopen if you are still working on it."
+
+[default_rules.first_time]
+enabled = true
+welcome_comment = "Thank you for creating your first contribution! A maintainer will review your issue or pull request soon."
+labels = ["first-time-contributor"]
+
+[default_rules.projects]
+enabled = false
+project_number = 1
+project_owner = "your-org"
+initial_status = "Triage"
+
+[default_rules.dco]
+enabled = true
+require_signoff = true
+set_commit_status = true
+missing_label = "dco-missing"
+
+[default_rules.ci_summary]
+enabled = true
+comment_on_failure = true
+sticky = true
+
+[default_rules.reviewers]
+enabled = true
+pool = ["alice", "bob", "charlie"]
+max_active_reviews = 4
+load_balancing = "least_busy"
+out_of_office = []
+
+[default_rules.growth]
+enabled = true
+
+[[default_rules.growth.thresholds]]
+merged_prs = 3
+message = "🎉 Contributor has reached 3 merged PRs! Consider inviting them to the Triage team."
+notify_channels = true
+recommend_role = "triage"
+
+[[default_rules.growth.thresholds]]
+merged_prs = 10
+message = "🚀 Outstanding contributor with 10 merged PRs! Consider nominating them for Committer/Reviewer status."
+notify_channels = true
+recommend_role = "committer"
+
+[default_rules.reports]
+weekly_enabled = true
+monthly_enabled = true
+publish_as_issue = false
+issue_labels = ["report", "metrics"]

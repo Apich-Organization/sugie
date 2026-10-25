@@ -1,0 +1,8 @@
+# Global fallback owners
+* @core-team
+
+# Specific file patterns and directory owners
+*.rs @rust-maintainers
+/crates/core/ @alice @bob
+/crates/net/ @charlie
+/docs/ @documentation-team

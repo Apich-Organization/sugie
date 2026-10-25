@@ -1,0 +1,35 @@
+[package]
+name = "sugie"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sugie Bot Team"]
+description = "A powerful, full-featured GitHub triage bot for the Rust ecosystem"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2", "json", "matched-path"] }
+tower = { version = "0.5" }
+tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+jsonwebtoken = "9.3"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+regex = "1.11"
+globset = "0.4"
+anyhow = "1.0"
+thiserror = "2.0"
+strsim = "0.11"
+base64 = "0.23.1"
+
+[dev-dependencies]
+tempfile = "3.13"
+wiremock = "0.6"
