@@ -59,6 +59,8 @@ impl GitHubAuthConfig {
 pub struct NotificationsConfig {
     pub discord: Option<DiscordConfig>,
     pub zulip: Option<ZulipConfig>,
+    pub lark: Option<LarkConfig>,
+    pub allowed_repositories: Option<Vec<String>>,
     #[serde(default)]
     pub events: NotificationEventsConfig,
 }
@@ -70,6 +72,7 @@ pub struct DiscordConfig {
     #[serde(default = "default_discord_username")]
     pub username: String,
     pub avatar_url: Option<String>,
+    pub allowed_repositories: Option<Vec<String>>,
 }
 
 fn default_discord_username() -> String {
@@ -91,6 +94,7 @@ pub struct ZulipConfig {
     pub topic_alerts: String,
     #[serde(default = "default_zulip_topic_assigns")]
     pub topic_assigns: String,
+    pub allowed_repositories: Option<Vec<String>>,
 }
 
 fn default_zulip_stream() -> String {
@@ -111,6 +115,13 @@ fn default_zulip_topic_alerts() -> String {
 
 fn default_zulip_topic_assigns() -> String {
     "assignments".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LarkConfig {
+    pub webhook_url: String,
+    pub secret: Option<String>,
+    pub allowed_repositories: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +158,8 @@ pub struct NotificationEventsConfig {
     pub growth_milestone: bool,
     #[serde(default = "default_true")]
     pub cross_repo_move: bool,
+    #[serde(default = "default_true")]
+    pub issue_comment: bool,
 }
 
 impl Default for NotificationEventsConfig {
@@ -158,6 +171,7 @@ impl Default for NotificationEventsConfig {
             unassigned: true,
             issue_opened: true,
             issue_closed: true,
+            issue_comment: true,
             pr_opened: true,
             pr_merged: true,
             label_changed: true,
@@ -800,6 +814,10 @@ pub struct CommandsConfig {
     pub allowed_roles: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub aliases: HashMap<String, String>,
+    #[serde(default)]
+    pub super_users: Vec<String>,
+    #[serde(default)]
+    pub restricted_commands: Vec<String>,
 }
 
 impl Default for CommandsConfig {
@@ -813,12 +831,31 @@ impl Default for CommandsConfig {
             prefix: "/".to_string(),
             allowed_roles: HashMap::new(),
             aliases,
+            super_users: Vec::new(),
+            restricted_commands: Vec::new(),
         }
     }
 }
 
 fn default_command_prefix() -> String {
     "/".to_string()
+}
+
+pub fn parse_repo_list(val: &str) -> Option<Vec<String>> {
+    let trimmed = val.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return None;
+    }
+    let repos: Vec<String> = trimmed
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if repos.is_empty() {
+        None
+    } else {
+        Some(repos)
+    }
 }
 
 pub fn load_dotenv() {
@@ -931,6 +968,121 @@ impl SugieConfig {
             }
         }
 
+        // Global notification repository filter
+        if let Ok(repos) = std::env::var("SUGIE_NOTIFICATION_REPOSITORIES")
+            .or_else(|_| std::env::var("SUGIE_NOTIFICATION_REPOS"))
+        {
+            config.notifications.allowed_repositories = parse_repo_list(&repos);
+        }
+
+        // Notification environment variables overrides
+        if let Ok(discord_url) = std::env::var("SUGIE_DISCORD_WEBHOOK_URL") {
+            if !discord_url.trim().is_empty() {
+                let reports_url = std::env::var("SUGIE_DISCORD_REPORTS_WEBHOOK_URL").ok();
+                let username = std::env::var("SUGIE_DISCORD_USERNAME")
+                    .unwrap_or_else(|_| default_discord_username());
+                let allowed_repositories = std::env::var("SUGIE_DISCORD_REPOSITORIES")
+                    .or_else(|_| std::env::var("SUGIE_DISCORD_REPOS"))
+                    .ok()
+                    .and_then(|r| parse_repo_list(&r));
+                config.notifications.discord = Some(DiscordConfig {
+                    webhook_url: discord_url,
+                    reports_webhook_url: reports_url,
+                    username,
+                    avatar_url: std::env::var("SUGIE_DISCORD_AVATAR_URL").ok(),
+                    allowed_repositories,
+                });
+            }
+        } else if let Some(ref mut discord) = config.notifications.discord {
+            if let Ok(repos) = std::env::var("SUGIE_DISCORD_REPOSITORIES")
+                .or_else(|_| std::env::var("SUGIE_DISCORD_REPOS"))
+            {
+                discord.allowed_repositories = parse_repo_list(&repos);
+            }
+        }
+
+        if let (Ok(site), Ok(email), Ok(key)) = (
+            std::env::var("SUGIE_ZULIP_SITE_URL"),
+            std::env::var("SUGIE_ZULIP_BOT_EMAIL"),
+            std::env::var("SUGIE_ZULIP_BOT_API_KEY"),
+        ) {
+            if !site.trim().is_empty() && !email.trim().is_empty() && !key.trim().is_empty() {
+                let stream = std::env::var("SUGIE_ZULIP_STREAM")
+                    .unwrap_or_else(|_| default_zulip_stream());
+                let allowed_repositories = std::env::var("SUGIE_ZULIP_REPOSITORIES")
+                    .or_else(|_| std::env::var("SUGIE_ZULIP_REPOS"))
+                    .ok()
+                    .and_then(|r| parse_repo_list(&r));
+                config.notifications.zulip = Some(ZulipConfig {
+                    site_url: site,
+                    bot_email: email,
+                    bot_api_key: key,
+                    stream,
+                    topic_triage: std::env::var("SUGIE_ZULIP_TOPIC_TRIAGE")
+                        .unwrap_or_else(|_| default_zulip_topic_triage()),
+                    topic_reports: std::env::var("SUGIE_ZULIP_TOPIC_REPORTS")
+                        .unwrap_or_else(|_| default_zulip_topic_reports()),
+                    topic_alerts: std::env::var("SUGIE_ZULIP_TOPIC_ALERTS")
+                        .unwrap_or_else(|_| default_zulip_topic_alerts()),
+                    topic_assigns: std::env::var("SUGIE_ZULIP_TOPIC_ASSIGNS")
+                        .unwrap_or_else(|_| default_zulip_topic_assigns()),
+                    allowed_repositories,
+                });
+            }
+        } else if let Some(ref mut zulip) = config.notifications.zulip {
+            if let Ok(repos) = std::env::var("SUGIE_ZULIP_REPOSITORIES")
+                .or_else(|_| std::env::var("SUGIE_ZULIP_REPOS"))
+            {
+                zulip.allowed_repositories = parse_repo_list(&repos);
+            }
+        }
+
+        if let Ok(lark_url) = std::env::var("SUGIE_LARK_WEBHOOK_URL") {
+            if !lark_url.trim().is_empty() {
+                let secret = std::env::var("SUGIE_LARK_SignatureVerification")
+                    .or_else(|_| std::env::var("SUGIE_LARK_SIGNATURE_VERIFICATION"))
+                    .or_else(|_| std::env::var("SUGIE_LARK_SECRET"))
+                    .ok()
+                    .filter(|s| !s.trim().is_empty());
+                let allowed_repositories = std::env::var("SUGIE_LARK_REPOSITORIES")
+                    .or_else(|_| std::env::var("SUGIE_LARK_REPOS"))
+                    .ok()
+                    .and_then(|r| parse_repo_list(&r));
+                config.notifications.lark = Some(LarkConfig {
+                    webhook_url: lark_url,
+                    secret,
+                    allowed_repositories,
+                });
+            }
+        } else if let Some(ref mut lark) = config.notifications.lark {
+            if let Ok(repos) = std::env::var("SUGIE_LARK_REPOSITORIES")
+                .or_else(|_| std::env::var("SUGIE_LARK_REPOS"))
+            {
+                lark.allowed_repositories = parse_repo_list(&repos);
+            }
+        }
+
+        // Super users & restricted commands env overrides
+        if let Ok(users) = std::env::var("SUGIE_SUPER_USERS")
+            .or_else(|_| std::env::var("SUGIE_SUPERUSERS"))
+        {
+            let list: Vec<String> = users
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('@').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            config.default_rules.commands.super_users = list;
+        }
+
+        if let Ok(cmds) = std::env::var("SUGIE_RESTRICTED_COMMANDS") {
+            let list: Vec<String> = cmds
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('/').to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            config.default_rules.commands.restricted_commands = list;
+        }
+
         Ok(config)
     }
 }
@@ -948,6 +1100,12 @@ impl RepoConfig {
                 }
                 if overridden.reviewers.pool.is_empty() {
                     overridden.reviewers.pool = self.reviewers.pool.clone();
+                }
+                if overridden.commands.super_users.is_empty() {
+                    overridden.commands.super_users = self.commands.super_users.clone();
+                }
+                if overridden.commands.restricted_commands.is_empty() {
+                    overridden.commands.restricted_commands = self.commands.restricted_commands.clone();
                 }
                 overridden
             }

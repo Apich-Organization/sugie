@@ -42,6 +42,10 @@ impl DiscordNotifier {
         }
     }
 
+    pub fn config(&self) -> &DiscordConfig {
+        &self.config
+    }
+
     pub async fn send_embed(
         &self,
         title: &str,

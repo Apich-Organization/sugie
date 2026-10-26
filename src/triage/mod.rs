@@ -742,6 +742,49 @@ impl TriageService {
         let client = self.get_client_for_installation(inst_id).await?;
         let repo_config = self.load_repo_config(&client, owner, repo).await;
 
+        // 1. Dispatch comment notification to configured channels (Discord, Zulip, Lark)
+        let comment_title = format!(
+            "💬 Comment on {}#{}: by @{}",
+            full_name, event.issue.number, event.sender.login
+        );
+        let comment_url = event.comment.html_url.clone().unwrap_or_else(|| {
+            format!(
+                "https://github.com/{}/{}/issues/{}#issuecomment-{}",
+                owner, repo, event.issue.number, event.comment.id
+            )
+        });
+        let body_preview = if event.comment.body.chars().count() > 300 {
+            let truncated: String = event.comment.body.chars().take(300).collect();
+            format!("{}...", truncated)
+        } else {
+            event.comment.body.clone()
+        };
+
+        let fields = vec![
+            DiscordEmbedField {
+                name: "Author".to_string(),
+                value: format!("@{}", event.sender.login),
+                inline: true,
+            },
+            DiscordEmbedField {
+                name: "Issue".to_string(),
+                value: format!("#{} {}", event.issue.number, event.issue.title),
+                inline: true,
+            },
+        ];
+
+        self.notifier
+            .dispatch_event(
+                SugieEventType::IssueComment,
+                &comment_title,
+                &body_preview,
+                Some(&comment_url),
+                NotificationLevel::Info,
+                fields,
+            )
+            .await;
+
+        // 2. Parse and execute any slash commands or @bot commands in the comment
         let commands =
             commands::CommandParser::parse_comment(&event.comment.body, &repo_config.commands);
         if commands.is_empty() {
@@ -749,14 +792,24 @@ impl TriageService {
         }
 
         let projects = projects::ProjectsService::new(repo_config.projects.clone());
-        let executor = commands::CommandExecutor::new(&client, &projects, &self.notifier);
+        let balancer = reviewers::ReviewerLoadBalancer::new(
+            repo_config.reviewers.clone(),
+            self.storage.clone(),
+        );
+        let executor = commands::CommandExecutor::new(
+            &client,
+            &projects,
+            &self.notifier,
+            &repo_config.commands,
+            Some(balancer),
+        );
 
         for cmd in &commands {
             if let Err(e) = executor
                 .execute(cmd, owner, repo, &event.issue, &event.sender)
                 .await
             {
-                error!("Error executing slash command {:?}: {:?}", cmd, e);
+                error!("Error executing command {:?}: {:?}", cmd, e);
                 let _ = client
                     .create_comment(
                         owner,

@@ -5,6 +5,7 @@ use crate::notifications::{
     DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType,
 };
 use crate::triage::projects::ProjectsService;
+use crate::triage::reviewers::ReviewerLoadBalancer;
 use anyhow::Result;
 use serde::Deserialize;
 use tracing::info;
@@ -29,7 +30,30 @@ pub enum SlashCommand {
         target_repo: String,
     },
     Duplicate(u64),
+    Reviewer {
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
     Help,
+}
+
+impl SlashCommand {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SlashCommand::Assign(_) => "assign",
+            SlashCommand::Unassign(_) => "unassign",
+            SlashCommand::Label { .. } => "label",
+            SlashCommand::Unlabel(_) => "unlabel",
+            SlashCommand::Close(_) => "close",
+            SlashCommand::Reopen => "reopen",
+            SlashCommand::Retest => "retest",
+            SlashCommand::Project { .. } => "project",
+            SlashCommand::Move { .. } => "move",
+            SlashCommand::Duplicate(_) => "duplicate",
+            SlashCommand::Reviewer { .. } => "reviewer",
+            SlashCommand::Help => "help",
+        }
+    }
 }
 
 pub struct CommandParser;
@@ -40,9 +64,29 @@ impl CommandParser {
         let prefix = &config.prefix;
 
         for line in comment_body.lines() {
-            let trimmed = line.trim();
-            if !trimmed.starts_with(prefix) {
-                continue;
+            let mut trimmed = line.trim();
+            let mut is_bot_mention = false;
+
+            if trimmed.starts_with('@') {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if !parts.is_empty() {
+                    let mention_token = parts[0].trim_matches(|c: char| c == ':' || c == ',' || c == ';');
+                    let lower_mention = mention_token.to_lowercase();
+                    // Match bot mentions like @starlabssisugie, @sugie, @...-bot, @...[bot]
+                    if lower_mention.contains("sugie")
+                        || lower_mention.contains("starlabs")
+                        || lower_mention.contains("bot")
+                        || parts.len() == 1
+                    {
+                        is_bot_mention = true;
+                        if parts.len() == 1 {
+                            // User simply mentioned the bot on a line: e.g. "@starlabssisugie" -> trigger Help
+                            commands.push(SlashCommand::Help);
+                            continue;
+                        }
+                        trimmed = trimmed[parts[0].len()..].trim_start();
+                    }
+                }
             }
 
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
@@ -50,13 +94,22 @@ impl CommandParser {
                 continue;
             }
 
-            let raw_cmd = parts[0].strip_prefix(prefix).unwrap_or("").to_lowercase();
+            let (raw_cmd, args) = if trimmed.starts_with(prefix) {
+                let cmd = parts[0].strip_prefix(prefix).unwrap_or("").to_lowercase();
+                (cmd, &parts[1..])
+            } else if is_bot_mention {
+                // If preceded by @bot, allow command without slash prefix (e.g. "@bot label +bug" or "@bot /label +bug")
+                let cmd = parts[0].strip_prefix(prefix).unwrap_or(parts[0]).to_lowercase();
+                (cmd, &parts[1..])
+            } else {
+                continue;
+            };
+
             let effective_cmd = config
                 .aliases
                 .get(&raw_cmd)
                 .map(|s| s.as_str())
                 .unwrap_or(&raw_cmd);
-            let args = &parts[1..];
 
             match effective_cmd {
                 "assign" => {
@@ -135,6 +188,35 @@ impl CommandParser {
                         }
                     }
                 }
+                "reviewer" | "reviewers" | "review" => {
+                    let mut add = Vec::new();
+                    let mut remove = Vec::new();
+                    for arg in args {
+                        let clean = arg.trim_start_matches('@');
+                        if let Some(user) = clean.strip_prefix('+') {
+                            add.push(user.trim_start_matches('@').to_string());
+                        } else if let Some(user) = clean.strip_prefix('-') {
+                            remove.push(user.trim_start_matches('@').to_string());
+                        } else if let Some(user) = arg.strip_prefix('+') {
+                            add.push(user.trim_start_matches('@').to_string());
+                        } else if let Some(user) = arg.strip_prefix('-') {
+                            remove.push(user.trim_start_matches('@').to_string());
+                        } else {
+                            add.push(clean.to_string());
+                        }
+                    }
+                    commands.push(SlashCommand::Reviewer { add, remove });
+                }
+                "unreviewer" | "unreviewers" => {
+                    let remove: Vec<String> = args
+                        .iter()
+                        .map(|s| s.trim_start_matches('@').to_string())
+                        .collect();
+                    commands.push(SlashCommand::Reviewer {
+                        add: Vec::new(),
+                        remove,
+                    });
+                }
                 "help" => {
                     commands.push(SlashCommand::Help);
                 }
@@ -150,6 +232,8 @@ pub struct CommandExecutor<'a> {
     client: &'a GitHubClient,
     projects: &'a ProjectsService,
     notifier: &'a NotificationDispatcher,
+    config: &'a CommandsConfig,
+    balancer: Option<ReviewerLoadBalancer>,
 }
 
 impl<'a> CommandExecutor<'a> {
@@ -157,12 +241,33 @@ impl<'a> CommandExecutor<'a> {
         client: &'a GitHubClient,
         projects: &'a ProjectsService,
         notifier: &'a NotificationDispatcher,
+        config: &'a CommandsConfig,
+        balancer: Option<ReviewerLoadBalancer>,
     ) -> Self {
         Self {
             client,
             projects,
             notifier,
+            config,
+            balancer,
         }
+    }
+
+    pub fn is_authorized(&self, command: &SlashCommand, sender: &User) -> bool {
+        let cmd_name = command.name();
+
+        let is_restricted = self.config.restricted_commands.iter().any(|r| {
+            r.trim_start_matches('/').eq_ignore_ascii_case(cmd_name)
+        });
+
+        if !is_restricted {
+            return true;
+        }
+
+        // If restricted, sender MUST be in super_users list
+        self.config.super_users.iter().any(|su| {
+            su.trim_start_matches('@').eq_ignore_ascii_case(&sender.login)
+        })
     }
 
     pub async fn execute(
@@ -178,6 +283,25 @@ impl<'a> CommandExecutor<'a> {
             "https://github.com/{}/{}/issues/{}",
             owner, repo, issue.number
         );
+
+        if !self.is_authorized(command, sender) {
+            info!(
+                "Blocked restricted command '/{}' by @{} on {}#{}",
+                command.name(),
+                sender.login,
+                repo_full_name,
+                issue.number
+            );
+            let comment_text = format!(
+                "⛔ @{}, the command `/{}` is restricted to authorized super users.",
+                sender.login,
+                command.name()
+            );
+            self.client
+                .create_comment(owner, repo, issue.number, &comment_text)
+                .await?;
+            return Ok(());
+        }
 
         match command {
             SlashCommand::Assign(users) => {
@@ -553,23 +677,152 @@ impl<'a> CommandExecutor<'a> {
                     repo_full_name, issue.number, target_issue_num
                 );
             }
+            SlashCommand::Reviewer { add, remove } => {
+                if !issue.is_pr() {
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            "⚠️ Reviewers can only be assigned or updated on Pull Requests, not issues.",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+
+                let mut to_add = add.clone();
+                let to_remove = remove.clone();
+
+                // If no reviewers specified (e.g. `/reviewer`), attempt auto-selection using load balancer
+                if to_add.is_empty() && to_remove.is_empty() {
+                    if let Some(balancer) = &self.balancer {
+                        let pr_files = match self.client.list_pr_files(owner, repo, issue.number).await {
+                            Ok(files) => files.into_iter().map(|f| f.filename).collect(),
+                            Err(_) => Vec::new(),
+                        };
+                        let exclude = vec![sender.login.clone(), issue.user.login.clone()];
+                        if let Ok(chosen) = balancer.select_reviewers_for_pr(
+                            &repo_full_name,
+                            &pr_files,
+                            &[],
+                            &exclude,
+                        ) {
+                            to_add = chosen;
+                        }
+                    }
+                }
+
+                if to_add.is_empty() && to_remove.is_empty() {
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            "⚠️ No reviewers specified or available to assign.",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+
+                let mut comment_parts = Vec::new();
+
+                if !to_add.is_empty() {
+                    self.client
+                        .request_reviewers(owner, repo, issue.number, &to_add)
+                        .await?;
+                    if let Some(balancer) = &self.balancer {
+                        for r in &to_add {
+                            let _ = balancer.on_review_requested(&repo_full_name, r);
+                        }
+                    }
+                    let mentions: Vec<String> = to_add.iter().map(|u| format!("@{}", u)).collect();
+                    comment_parts.push(format!("Requested review from: {}", mentions.join(", ")));
+                }
+
+                if !to_remove.is_empty() {
+                    self.client
+                        .remove_reviewers(owner, repo, issue.number, &to_remove)
+                        .await?;
+                    if let Some(balancer) = &self.balancer {
+                        for r in &to_remove {
+                            let _ = balancer.on_review_completed_or_closed(&repo_full_name, r);
+                        }
+                    }
+                    let mentions: Vec<String> = to_remove.iter().map(|u| format!("@{}", u)).collect();
+                    comment_parts.push(format!("Removed review request for: {}", mentions.join(", ")));
+                }
+
+                let comment_body = format!(
+                    "👥 **Reviewer update by @{}**:\n- {}",
+                    sender.login,
+                    comment_parts.join("\n- ")
+                );
+                self.client
+                    .create_comment(owner, repo, issue.number, &comment_body)
+                    .await?;
+
+                info!(
+                    "Updated reviewers on {}#{} (add: {:?}, remove: {:?})",
+                    repo_full_name, issue.number, to_add, to_remove
+                );
+
+                let title = format!(
+                    "👥 Reviewers Updated: {}#{}",
+                    repo_full_name, issue.number
+                );
+                let mut embed_fields = Vec::new();
+                if !to_add.is_empty() {
+                    embed_fields.push(DiscordEmbedField {
+                        name: "Added Reviewers".to_string(),
+                        value: to_add.join(", "),
+                        inline: true,
+                    });
+                }
+                if !to_remove.is_empty() {
+                    embed_fields.push(DiscordEmbedField {
+                        name: "Removed Reviewers".to_string(),
+                        value: to_remove.join(", "),
+                        inline: true,
+                    });
+                }
+                embed_fields.push(DiscordEmbedField {
+                    name: "Updated By".to_string(),
+                    value: sender.login.clone(),
+                    inline: true,
+                });
+
+                self.notifier
+                    .dispatch_event(
+                        SugieEventType::Assigned,
+                        &title,
+                        &comment_body,
+                        Some(&issue_url),
+                        NotificationLevel::Info,
+                        embed_fields,
+                    )
+                    .await;
+            }
             SlashCommand::Help => {
                 let help_text = r#"
 ### 🤖 Sugie Bot Commands Reference
 
+You can trigger commands either with a slash (`/command`) or by mentioning the bot (e.g. `@starlabssisugie label +bug`):
+
 | Command | Usage | Description |
 | :--- | :--- | :--- |
-| `/assign [@user...]` | `/assign @alice` or `/assign` | Assigns specified user(s) or self |
-| `/unassign [@user...]` | `/unassign @bob` or `/unassign` | Removes assignment |
-| `/label [+name] [-name]` | `/label +bug -wip` | Adds/removes labels |
+| `/assign [@user...]` | `/assign @alice` or `@bot assign` | Assigns specified user(s) or self |
+| `/unassign [@user...]` | `/unassign @bob` or `@bot unassign` | Removes assignment |
+| `/label [+name] [-name]` | `/label +bug -wip` or `@bot label +bug` | Adds/removes labels |
 | `/unlabel <name>` | `/unlabel bug` | Removes a label |
+| `/reviewer [+@user] [-@user]` | `/reviewer @alice` or `/reviewer +@alice -@bob` | Requests or removes reviewers (PRs only) |
+| `/unreviewer <@user...>` | `/unreviewer @bob` | Removes requested reviewer (PRs only) |
 | `/close [reason]` | `/close completed` | Closes issue or PR |
 | `/reopen` | `/reopen` | Reopens issue or PR |
 | `/retest` | `/retest` | Retests failed CI checks (PRs only) |
 | `/project <num> [status]` | `/project 1 Triage` | Adds to GitHub Project v2 board |
 | `/move <target_repo>` | `/move org/new-repo` | Migrates issue across repositories |
 | `/duplicate <#num>` | `/duplicate #123` | Closes issue as duplicate of #123 |
-| `/help` | `/help` | Displays this help manual |
+| `/help` | `/help` or `@bot` or `@bot help` | Displays this help manual |
 "#;
                 self.client
                     .create_comment(owner, repo, issue.number, help_text.trim())
@@ -652,6 +905,64 @@ mod tests {
         assert_eq!(
             cmds[2],
             SlashCommand::Close(Some("not planned".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_reviewer_command_parsing() {
+        let comment = r#"
+        /reviewer @alice @bob
+        /reviewer +@charlie -@david
+        /unreviewer @eve
+        @bot review @frank
+        @bot unreviewers @grace
+        /reviewer
+        "#;
+
+        let config = CommandsConfig::default();
+        let cmds = CommandParser::parse_comment(comment, &config);
+        assert_eq!(cmds.len(), 6);
+        assert_eq!(
+            cmds[0],
+            SlashCommand::Reviewer {
+                add: vec!["alice".to_string(), "bob".to_string()],
+                remove: vec![],
+            }
+        );
+        assert_eq!(
+            cmds[1],
+            SlashCommand::Reviewer {
+                add: vec!["charlie".to_string()],
+                remove: vec!["david".to_string()],
+            }
+        );
+        assert_eq!(
+            cmds[2],
+            SlashCommand::Reviewer {
+                add: vec![],
+                remove: vec!["eve".to_string()],
+            }
+        );
+        assert_eq!(
+            cmds[3],
+            SlashCommand::Reviewer {
+                add: vec!["frank".to_string()],
+                remove: vec![],
+            }
+        );
+        assert_eq!(
+            cmds[4],
+            SlashCommand::Reviewer {
+                add: vec![],
+                remove: vec!["grace".to_string()],
+            }
+        );
+        assert_eq!(
+            cmds[5],
+            SlashCommand::Reviewer {
+                add: vec![],
+                remove: vec![],
+            }
         );
     }
 }

@@ -25,6 +25,10 @@ impl ZulipNotifier {
         }
     }
 
+    pub fn config(&self) -> &ZulipConfig {
+        &self.config
+    }
+
     pub async fn send_message(&self, category: ZulipTopicCategory, content: &str) -> Result<()> {
         let topic = match category {
             ZulipTopicCategory::Triage => &self.config.topic_triage,

@@ -383,6 +383,30 @@ impl GitHubClient {
         Ok(())
     }
 
+    pub async fn remove_reviewers(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        reviewers: &[String],
+    ) -> Result<()> {
+        if reviewers.is_empty() {
+            return Ok(());
+        }
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/requested_reviewers",
+            self.base_url, owner, repo, pr_number
+        );
+        let payload = json!({ "reviewers": reviewers });
+        self.http
+            .delete(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     pub async fn list_repo_pulls(
         &self,
         owner: &str,

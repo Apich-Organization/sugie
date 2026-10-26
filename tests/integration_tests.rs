@@ -211,6 +211,68 @@ fn test_slash_commands_parser() {
 }
 
 #[test]
+fn test_bot_mention_commands_parser() {
+    let body = r#"
+    @starlabssisugie label +bug
+    @starlabssisugie /assign @alice
+    @sugie-bot help
+    @starlabssisugie
+    "#;
+    let cmds = CommandParser::parse_comment(body, &CommandsConfig::default());
+    assert_eq!(cmds.len(), 4);
+    assert!(cmds.contains(&SlashCommand::Label {
+        add: vec!["bug".to_string()],
+        remove: vec![]
+    }));
+    assert!(cmds.contains(&SlashCommand::Assign(vec!["alice".to_string()])));
+    assert!(cmds.contains(&SlashCommand::Help));
+}
+
+#[test]
+fn test_restricted_commands_authorization() {
+    let mut config = CommandsConfig::default();
+    config.super_users = vec!["alice".to_string(), "bob".to_string()];
+    config.restricted_commands = vec!["close".to_string(), "move".to_string()];
+
+    let super_user = User {
+        login: "alice".to_string(),
+        id: 1,
+        r#type: None,
+    };
+
+    let regular_user = User {
+        login: "charlie".to_string(),
+        id: 2,
+        r#type: None,
+    };
+
+    let close_cmd = SlashCommand::Close(None);
+    let label_cmd = SlashCommand::Label {
+        add: vec!["bug".to_string()],
+        remove: vec![],
+    };
+
+    let is_auth = |cmd: &SlashCommand, user: &User| -> bool {
+        let is_restricted = config
+            .restricted_commands
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(cmd.name()));
+        if !is_restricted {
+            return true;
+        }
+        config
+            .super_users
+            .iter()
+            .any(|su| su.eq_ignore_ascii_case(&user.login))
+    };
+
+    assert!(is_auth(&close_cmd, &super_user));
+    assert!(is_auth(&label_cmd, &super_user));
+    assert!(is_auth(&label_cmd, &regular_user));
+    assert!(!is_auth(&close_cmd, &regular_user));
+}
+
+#[test]
 fn test_duplicate_detector() {
     let config = DuplicateConfig {
         enabled: true,

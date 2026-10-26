@@ -59,6 +59,12 @@ enum Commands {
     },
     /// Validate configuration and credentials
     Validate,
+    /// Send test notifications to configured channels (Discord, Zulip, Lark)
+    TestNotifications {
+        /// Target channel: "discord", "zulip", "lark", or all
+        #[arg(long)]
+        channel: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -368,6 +374,166 @@ async fn main() -> anyhow::Result<()> {
                     println!("❌ Failed to authenticate with GitHub API: {}", e);
                     println!("💡 Verify that SUGIE_GITHUB_APP_ID matches your GitHub App and that the private key is active.");
                 }
+            }
+
+            let format_repos = |channel_repos: Option<&Vec<String>>| -> String {
+                if let Some(r) = channel_repos {
+                    format!("(Repos: {})", r.join(", "))
+                } else if let Some(ref g) = config.notifications.allowed_repositories {
+                    format!("(Global filter: {})", g.join(", "))
+                } else {
+                    "(All repositories allowed)".to_string()
+                }
+            };
+
+            println!("🔔 Notification Channels configured:");
+            if let Some(ref d) = config.notifications.discord {
+                println!("   • Discord: ✅ Configured {}", format_repos(d.allowed_repositories.as_ref()));
+            } else {
+                println!("   • Discord: ⚪ Not configured");
+            }
+
+            if let Some(ref z) = config.notifications.zulip {
+                println!("   • Zulip:   ✅ Configured {}", format_repos(z.allowed_repositories.as_ref()));
+            } else {
+                println!("   • Zulip:   ⚪ Not configured");
+            }
+
+            if let Some(ref l) = config.notifications.lark {
+                println!("   • Lark:    ✅ Configured {}", format_repos(l.allowed_repositories.as_ref()));
+            } else {
+                println!("   • Lark:    ⚪ Not configured");
+            }
+
+            println!("👑 Command Permissions:");
+            if !config.default_rules.commands.super_users.is_empty() {
+                println!(
+                    "   • Super Users:         @{}",
+                    config.default_rules.commands.super_users.join(", @")
+                );
+            } else {
+                println!("   • Super Users:         (None configured - anyone can run permitted commands)");
+            }
+
+            if !config.default_rules.commands.restricted_commands.is_empty() {
+                println!(
+                    "   • Restricted Commands: /{}",
+                    config.default_rules.commands.restricted_commands.join(", /")
+                );
+            } else {
+                println!("   • Restricted Commands: (None - all commands are open)");
+            }
+
+            println!("💡 Run `cargo run -- test-notifications` to verify delivery to all configured channels.");
+        }
+        Commands::TestNotifications { channel } => {
+            let config = SugieConfig::load_from_env_or_file(&cli.config)?;
+            println!("🔔 Testing notification channels...");
+
+            let target = channel.as_deref().unwrap_or("all").to_lowercase();
+            let mut any_tested = false;
+
+            // 1. Discord
+            if target == "all" || target == "discord" {
+                if let Some(ref discord_cfg) = config.notifications.discord {
+                    any_tested = true;
+                    println!("📡 Testing Discord webhook...");
+                    let notifier = sugie::notifications::DiscordNotifier::new(discord_cfg.clone());
+                    let fields = vec![
+                        sugie::notifications::DiscordEmbedField {
+                            name: "Channel".to_string(),
+                            value: "Discord Webhook".to_string(),
+                            inline: true,
+                        },
+                        sugie::notifications::DiscordEmbedField {
+                            name: "Bot Version".to_string(),
+                            value: env!("CARGO_PKG_VERSION").to_string(),
+                            inline: true,
+                        },
+                    ];
+                    match notifier
+                        .send_embed(
+                            "🦀 Sugie Bot: Notification Test",
+                            "This is a test notification from Sugie Triage Bot verifying connectivity.",
+                            Some("https://github.com/cn-starlabs"),
+                            0x2ecc71,
+                            fields,
+                            false,
+                        )
+                        .await
+                    {
+                        Ok(_) => println!("   ✅ Discord notification sent successfully!"),
+                        Err(e) => println!("   ❌ Discord notification failed: {:?}", e),
+                    }
+                } else if target == "discord" {
+                    println!("   ⚠️ Discord is not configured (missing SUGIE_DISCORD_WEBHOOK_URL).");
+                }
+            }
+
+            // 2. Zulip
+            if target == "all" || target == "zulip" {
+                if let Some(ref zulip_cfg) = config.notifications.zulip {
+                    any_tested = true;
+                    println!(
+                        "📡 Testing Zulip stream '{}' on {}...",
+                        zulip_cfg.stream, zulip_cfg.site_url
+                    );
+                    let notifier = sugie::notifications::ZulipNotifier::new(zulip_cfg.clone());
+                    let mut test_msg = "### 🦀 Sugie Bot: Notification Test\n\nThis is a test notification from Sugie Triage Bot verifying connectivity.".to_string();
+                    test_msg.push_str("\n\n* **Channel**: Zulip Stream\n* **Bot Version**: ");
+                    test_msg.push_str(env!("CARGO_PKG_VERSION"));
+                    match notifier
+                        .send_message(
+                            sugie::notifications::ZulipTopicCategory::Alerts,
+                            &test_msg,
+                        )
+                        .await
+                    {
+                        Ok(_) => println!("   ✅ Zulip notification sent successfully!"),
+                        Err(e) => println!("   ❌ Zulip notification failed: {:?}", e),
+                    }
+                } else if target == "zulip" {
+                    println!("   ⚠️ Zulip is not configured (missing SUGIE_ZULIP_SITE_URL, SUGIE_ZULIP_BOT_EMAIL, or SUGIE_ZULIP_BOT_API_KEY).");
+                }
+            }
+
+            // 3. Lark
+            if target == "all" || target == "lark" {
+                if let Some(ref lark_cfg) = config.notifications.lark {
+                    any_tested = true;
+                    println!(
+                        "📡 Testing Lark bot webhook (signing: {})...",
+                        if lark_cfg.secret.is_some() {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    let notifier = sugie::notifications::LarkNotifier::new(lark_cfg.clone());
+                    let fields = [
+                        ("Channel", "Lark Custom Bot"),
+                        ("Bot Version", env!("CARGO_PKG_VERSION")),
+                    ];
+                    match notifier
+                        .send_notification(
+                            "🦀 Sugie Bot: Notification Test",
+                            "This is a test notification from Sugie Triage Bot verifying Lark webhook connectivity and signature verification.",
+                            Some("https://github.com/cn-starlabs"),
+                            "green",
+                            &fields,
+                        )
+                        .await
+                    {
+                        Ok(_) => println!("   ✅ Lark notification sent successfully!"),
+                        Err(e) => println!("   ❌ Lark notification failed: {:?}", e),
+                    }
+                } else if target == "lark" {
+                    println!("   ⚠️ Lark is not configured (missing SUGIE_LARK_WEBHOOK_URL).");
+                }
+            }
+
+            if !any_tested {
+                println!("   ⚠️ No notification channels were configured to test.");
             }
         }
     }
