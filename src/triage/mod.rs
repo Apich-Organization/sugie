@@ -52,6 +52,10 @@ impl TriageService {
         &self.notifier
     }
 
+    pub fn auth(&self) -> &Arc<GitHubAuthManager> {
+        &self.auth
+    }
+
     pub async fn get_client_for_installation(&self, installation_id: u64) -> Result<GitHubClient> {
         let token = self.auth.get_installation_token(installation_id).await?;
         Ok(GitHubClient::new(token, None))

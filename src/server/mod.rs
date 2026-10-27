@@ -15,6 +15,8 @@ use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
+pub mod chat;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<SugieConfig>,
@@ -27,6 +29,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/status", get(status_check))
         .route("/webhook", post(github_webhook_handler))
         .route("/api/github/webhook", post(github_webhook_handler))
+        .route("/api/chat/zulip", post(chat::zulip_chat_handler))
+        .route("/api/chat/lark", post(chat::lark_chat_handler))
+        .route("/api/chat/discord", post(chat::discord_chat_handler))
+        .route("/api/chat/command", post(chat::generic_chat_command_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

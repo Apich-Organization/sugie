@@ -25,12 +25,14 @@
 | ⚖️ **Reviewer Load Balancing** | Distributes PR reviews using workload tracking (`least_busy` or `round_robin`), path-based component pools, configurable `reviewers_per_pr`, out-of-office exclusions, and capacity limits. |
 | 🚀 **Contributor Growth Tracking** | Tracks contributor milestone thresholds in persistent SQLite storage. Celebrates milestones and alerts maintainers to consider granting triage or committer rights. |
 | 📊 **Weekly & Monthly Triage Reports** | Aggregates metrics: new vs closed issues, close rate, time-to-first-response (TTFR), active contributors, net code lines added/deleted, and commit counts. Formats markdown digests and posts to GitHub issues, Discord, and Zulip on a configurable schedule. |
-| 💬 **Discord & Zulip Deep Sync** | Full two-way notifications for: weekly/monthly reports, assignments/unassignments, new issues/PRs, closes/merges, label updates, cross-repo moves, CI failures, duplicate alerts, DCO failures, and growth celebrations. |
+| 💬 **Lark, Discord & Zulip Two-Way Chat Sync** | Full bidirectional chat integration: rich notifications for reports and triage events, plus interactive in-chat bot commands (`/status`, `/workload`, `/assign`, etc.). See [Chat Bots Configuration Guide](file:///home/pana/dev2/sugie/docs/CHAT_BOTS_CONFIGURATION_GUIDE.md). |
 | ⚡ **Interactive Slash Commands** | Commands in comments: `/assign`, `/unassign`, `/label`, `/unlabel`, `/close`, `/reopen`, `/retest`, `/project`, `/move` (cross-repo issue transfer), `/duplicate`, and `/help`. Supports custom command prefix and aliases (`/l` for `/label`, `/a` for `/assign`). |
 
 ---
 
-## 💬 Discord & Zulip Notification Events
+## 💬 Lark, Discord & Zulip Notification Events
+
+Detailed setup instructions for all three platforms are documented in [`docs/CHAT_BOTS_CONFIGURATION_GUIDE.md`](file:///home/pana/dev2/sugie/docs/CHAT_BOTS_CONFIGURATION_GUIDE.md).
 
 Every event can be toggled individually in `sugie.toml`:
 

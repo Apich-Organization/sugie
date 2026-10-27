@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SugieConfig {
     #[serde(default = "default_host")]
     pub host: String,
@@ -11,13 +11,25 @@ pub struct SugieConfig {
     #[serde(default = "default_db_path")]
     pub db_path: String,
 
+    #[serde(default)]
     pub github: GitHubAuthConfig,
 
     #[serde(default)]
     pub notifications: NotificationsConfig,
 
     #[serde(default)]
+    pub chat: ChatConfig,
+
+    #[serde(default)]
     pub default_rules: RepoConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatConfig {
+    pub zulip_token: Option<String>,
+    pub lark_verification_token: Option<String>,
+    pub lark_encrypt_key: Option<String>,
+    pub discord_public_key: Option<String>,
 }
 
 fn default_host() -> String {
@@ -32,11 +44,13 @@ fn default_db_path() -> String {
     "sugie.db".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GitHubAuthConfig {
+    #[serde(default)]
     pub app_id: u64,
     pub private_key_pem: Option<String>,
     pub private_key_path: Option<String>,
+    #[serde(default)]
     pub webhook_secret: String,
 }
 
@@ -65,8 +79,9 @@ pub struct NotificationsConfig {
     pub events: NotificationEventsConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiscordConfig {
+    #[serde(default)]
     pub webhook_url: String,
     pub reports_webhook_url: Option<String>,
     #[serde(default = "default_discord_username")]
@@ -79,10 +94,13 @@ fn default_discord_username() -> String {
     "sugie-bot".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZulipConfig {
+    #[serde(default)]
     pub site_url: String,
+    #[serde(default)]
     pub bot_email: String,
+    #[serde(default)]
     pub bot_api_key: String,
     #[serde(default = "default_zulip_stream")]
     pub stream: String,
@@ -117,8 +135,9 @@ fn default_zulip_topic_assigns() -> String {
     "assignments".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LarkConfig {
+    #[serde(default)]
     pub webhook_url: String,
     pub secret: Option<String>,
     pub allowed_repositories: Option<Vec<String>>,
@@ -905,28 +924,13 @@ impl SugieConfig {
         let mut config = if path.as_ref().exists() {
             Self::load_from_file(path)?
         } else {
-            let app_id: u64 = std::env::var("SUGIE_GITHUB_APP_ID")
-                .map_err(|_| anyhow::anyhow!("SUGIE_GITHUB_APP_ID not set. Please provide sugie.toml or set SUGIE_GITHUB_APP_ID in .env or environment."))?
-                .parse()?;
-            let private_key_pem = std::env::var("SUGIE_GITHUB_PRIVATE_KEY_PEM").ok();
-            let private_key_path = std::env::var("SUGIE_GITHUB_PRIVATE_KEY_PATH").ok();
-            let webhook_secret = std::env::var("SUGIE_GITHUB_WEBHOOK_SECRET")
-                .unwrap_or_else(|_| "secret".to_string());
-
             SugieConfig {
-                host: std::env::var("SUGIE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
-                port: std::env::var("SUGIE_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(8080),
-                db_path: std::env::var("SUGIE_DB_PATH").unwrap_or_else(|_| "data/sugie.db".to_string()),
-                github: GitHubAuthConfig {
-                    app_id,
-                    private_key_pem,
-                    private_key_path,
-                    webhook_secret,
-                },
+                host: default_host(),
+                port: default_port(),
+                db_path: default_db_path(),
+                github: GitHubAuthConfig::default(),
                 notifications: NotificationsConfig::default(),
+                chat: ChatConfig::default(),
                 default_rules: RepoConfig::default(),
             }
         };
@@ -972,11 +976,39 @@ impl SugieConfig {
         if let Ok(repos) = std::env::var("SUGIE_NOTIFICATION_REPOSITORIES")
             .or_else(|_| std::env::var("SUGIE_NOTIFICATION_REPOS"))
         {
-            config.notifications.allowed_repositories = parse_repo_list(&repos);
+            if !repos.trim().is_empty() {
+                config.notifications.allowed_repositories = parse_repo_list(&repos);
+            }
         }
 
-        // Notification environment variables overrides
-        if let Ok(discord_url) = std::env::var("SUGIE_DISCORD_WEBHOOK_URL") {
+        // Discord notification settings (merge env secrets/overrides into TOML config)
+        if let Some(ref mut discord) = config.notifications.discord {
+            if let Ok(url) = std::env::var("SUGIE_DISCORD_WEBHOOK_URL") {
+                if !url.trim().is_empty() {
+                    discord.webhook_url = url;
+                }
+            }
+            if let Ok(reports_url) = std::env::var("SUGIE_DISCORD_REPORTS_WEBHOOK_URL") {
+                if !reports_url.trim().is_empty() {
+                    discord.reports_webhook_url = Some(reports_url);
+                }
+            }
+            if let Ok(username) = std::env::var("SUGIE_DISCORD_USERNAME") {
+                if !username.trim().is_empty() {
+                    discord.username = username;
+                }
+            }
+            if let Ok(avatar) = std::env::var("SUGIE_DISCORD_AVATAR_URL") {
+                if !avatar.trim().is_empty() {
+                    discord.avatar_url = Some(avatar);
+                }
+            }
+            if let Ok(repos) = std::env::var("SUGIE_DISCORD_REPOSITORIES")
+                .or_else(|_| std::env::var("SUGIE_DISCORD_REPOS"))
+            {
+                discord.allowed_repositories = parse_repo_list(&repos);
+            }
+        } else if let Ok(discord_url) = std::env::var("SUGIE_DISCORD_WEBHOOK_URL") {
             if !discord_url.trim().is_empty() {
                 let reports_url = std::env::var("SUGIE_DISCORD_REPORTS_WEBHOOK_URL").ok();
                 let username = std::env::var("SUGIE_DISCORD_USERNAME")
@@ -993,15 +1025,56 @@ impl SugieConfig {
                     allowed_repositories,
                 });
             }
-        } else if let Some(ref mut discord) = config.notifications.discord {
-            if let Ok(repos) = std::env::var("SUGIE_DISCORD_REPOSITORIES")
-                .or_else(|_| std::env::var("SUGIE_DISCORD_REPOS"))
-            {
-                discord.allowed_repositories = parse_repo_list(&repos);
-            }
         }
 
-        if let (Ok(site), Ok(email), Ok(key)) = (
+        // Zulip notification settings (merge env secrets/overrides into TOML config)
+        if let Some(ref mut zulip) = config.notifications.zulip {
+            if let Ok(site) = std::env::var("SUGIE_ZULIP_SITE_URL") {
+                if !site.trim().is_empty() {
+                    zulip.site_url = site;
+                }
+            }
+            if let Ok(email) = std::env::var("SUGIE_ZULIP_BOT_EMAIL") {
+                if !email.trim().is_empty() {
+                    zulip.bot_email = email;
+                }
+            }
+            if let Ok(key) = std::env::var("SUGIE_ZULIP_BOT_API_KEY") {
+                if !key.trim().is_empty() {
+                    zulip.bot_api_key = key;
+                }
+            }
+            if let Ok(stream) = std::env::var("SUGIE_ZULIP_STREAM") {
+                if !stream.trim().is_empty() {
+                    zulip.stream = stream;
+                }
+            }
+            if let Ok(topic) = std::env::var("SUGIE_ZULIP_TOPIC_TRIAGE") {
+                if !topic.trim().is_empty() {
+                    zulip.topic_triage = topic;
+                }
+            }
+            if let Ok(topic) = std::env::var("SUGIE_ZULIP_TOPIC_REPORTS") {
+                if !topic.trim().is_empty() {
+                    zulip.topic_reports = topic;
+                }
+            }
+            if let Ok(topic) = std::env::var("SUGIE_ZULIP_TOPIC_ALERTS") {
+                if !topic.trim().is_empty() {
+                    zulip.topic_alerts = topic;
+                }
+            }
+            if let Ok(topic) = std::env::var("SUGIE_ZULIP_TOPIC_ASSIGNS") {
+                if !topic.trim().is_empty() {
+                    zulip.topic_assigns = topic;
+                }
+            }
+            if let Ok(repos) = std::env::var("SUGIE_ZULIP_REPOSITORIES")
+                .or_else(|_| std::env::var("SUGIE_ZULIP_REPOS"))
+            {
+                zulip.allowed_repositories = parse_repo_list(&repos);
+            }
+        } else if let (Ok(site), Ok(email), Ok(key)) = (
             std::env::var("SUGIE_ZULIP_SITE_URL"),
             std::env::var("SUGIE_ZULIP_BOT_EMAIL"),
             std::env::var("SUGIE_ZULIP_BOT_API_KEY"),
@@ -1029,15 +1102,29 @@ impl SugieConfig {
                     allowed_repositories,
                 });
             }
-        } else if let Some(ref mut zulip) = config.notifications.zulip {
-            if let Ok(repos) = std::env::var("SUGIE_ZULIP_REPOSITORIES")
-                .or_else(|_| std::env::var("SUGIE_ZULIP_REPOS"))
-            {
-                zulip.allowed_repositories = parse_repo_list(&repos);
-            }
         }
 
-        if let Ok(lark_url) = std::env::var("SUGIE_LARK_WEBHOOK_URL") {
+        // Lark notification settings (merge env secrets/overrides into TOML config)
+        if let Some(ref mut lark) = config.notifications.lark {
+            if let Ok(url) = std::env::var("SUGIE_LARK_WEBHOOK_URL") {
+                if !url.trim().is_empty() {
+                    lark.webhook_url = url;
+                }
+            }
+            if let Ok(secret) = std::env::var("SUGIE_LARK_SignatureVerification")
+                .or_else(|_| std::env::var("SUGIE_LARK_SIGNATURE_VERIFICATION"))
+                .or_else(|_| std::env::var("SUGIE_LARK_SECRET"))
+            {
+                if !secret.trim().is_empty() {
+                    lark.secret = Some(secret);
+                }
+            }
+            if let Ok(repos) = std::env::var("SUGIE_LARK_REPOSITORIES")
+                .or_else(|_| std::env::var("SUGIE_LARK_REPOS"))
+            {
+                lark.allowed_repositories = parse_repo_list(&repos);
+            }
+        } else if let Ok(lark_url) = std::env::var("SUGIE_LARK_WEBHOOK_URL") {
             if !lark_url.trim().is_empty() {
                 let secret = std::env::var("SUGIE_LARK_SignatureVerification")
                     .or_else(|_| std::env::var("SUGIE_LARK_SIGNATURE_VERIFICATION"))
@@ -1054,12 +1141,6 @@ impl SugieConfig {
                     allowed_repositories,
                 });
             }
-        } else if let Some(ref mut lark) = config.notifications.lark {
-            if let Ok(repos) = std::env::var("SUGIE_LARK_REPOSITORIES")
-                .or_else(|_| std::env::var("SUGIE_LARK_REPOS"))
-            {
-                lark.allowed_repositories = parse_repo_list(&repos);
-            }
         }
 
         // Super users & restricted commands env overrides
@@ -1071,7 +1152,9 @@ impl SugieConfig {
                 .map(|s| s.trim().trim_start_matches('@').to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            config.default_rules.commands.super_users = list;
+            if !list.is_empty() {
+                config.default_rules.commands.super_users = list;
+            }
         }
 
         if let Ok(cmds) = std::env::var("SUGIE_RESTRICTED_COMMANDS") {
@@ -1080,7 +1163,38 @@ impl SugieConfig {
                 .map(|s| s.trim().trim_start_matches('/').to_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect();
-            config.default_rules.commands.restricted_commands = list;
+            if !list.is_empty() {
+                config.default_rules.commands.restricted_commands = list;
+            }
+        }
+
+        // Inbound chat webhook verification tokens
+        if let Ok(token) = std::env::var("SUGIE_ZULIP_OUTGOING_TOKEN") {
+            if !token.trim().is_empty() {
+                config.chat.zulip_token = Some(token);
+            }
+        }
+        if let Ok(token) = std::env::var("SUGIE_LARK_VERIFICATION_TOKEN") {
+            if !token.trim().is_empty() {
+                config.chat.lark_verification_token = Some(token);
+            }
+        }
+        if let Ok(key) = std::env::var("SUGIE_LARK_ENCRYPT_KEY")
+            .or_else(|_| std::env::var("SUGIE_LARK_Encrypt_Key"))
+            .or_else(|_| std::env::var("SUGIE_LARK_ENCRYPTKEY"))
+        {
+            if !key.trim().is_empty() {
+                config.chat.lark_encrypt_key = Some(key);
+            }
+        }
+        if let Ok(key) = std::env::var("SUGIE_DISCORD_PUBLIC_KEY") {
+            if !key.trim().is_empty() {
+                config.chat.discord_public_key = Some(key);
+            }
+        }
+
+        if config.github.app_id == 0 {
+            anyhow::bail!("SUGIE_GITHUB_APP_ID not set. Please provide sugie.toml or set SUGIE_GITHUB_APP_ID in .env or environment.");
         }
 
         Ok(config)
@@ -1120,4 +1234,56 @@ pub fn interpolate(template: &str, vars: &[(&str, &str)]) -> String {
         result = result.replace(&placeholder, val);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_toml_and_env_merge() {
+        let toml_str = r#"
+        host = "127.0.0.1"
+        port = 9000
+        db_path = "custom.db"
+
+        [notifications]
+        allowed_repositories = ["MyOrg/RepoA", "MyOrg/RepoB"]
+
+        [notifications.zulip]
+        site_url = "https://zulip.example.com"
+        bot_email = "bot@zulip.example.com"
+        stream = "engineering"
+
+        [default_rules.commands]
+        super_users = ["alice"]
+        restricted_commands = ["close", "reopen"]
+        "#;
+
+        let mut config: SugieConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 9000);
+        assert_eq!(config.db_path, "custom.db");
+        assert_eq!(
+            config.notifications.allowed_repositories,
+            Some(vec!["MyOrg/RepoA".to_string(), "MyOrg/RepoB".to_string()])
+        );
+        assert_eq!(
+            config.notifications.zulip.as_ref().unwrap().stream,
+            "engineering"
+        );
+        assert_eq!(config.default_rules.commands.super_users, vec!["alice"]);
+
+        // Simulate injecting secrets from .env
+        config.github.app_id = 99999;
+        config.github.webhook_secret = "my-secret-key".to_string();
+        config.notifications.zulip.as_mut().unwrap().bot_api_key = "secret-zulip-token".to_string();
+
+        assert_eq!(config.github.app_id, 99999);
+        assert_eq!(config.github.webhook_secret, "my-secret-key");
+        assert_eq!(
+            config.notifications.zulip.unwrap().bot_api_key,
+            "secret-zulip-token"
+        );
+    }
 }

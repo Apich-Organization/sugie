@@ -43,6 +43,12 @@ fn create_test_state() -> (AppState, Storage) {
             webhook_secret: "webhook-secret-123".to_string(),
         },
         notifications: sugie::config::NotificationsConfig::default(),
+        chat: sugie::config::ChatConfig {
+            zulip_token: Some("test-zulip-token".to_string()),
+            lark_verification_token: Some("test-lark-token".to_string()),
+            lark_encrypt_key: Some("test-lark-encrypt-key-123456789".to_string()),
+            discord_public_key: None,
+        },
         default_rules: RepoConfig::default(),
     };
 
@@ -411,4 +417,192 @@ async fn test_notification_event_routing() {
             Vec::new(),
         )
         .await;
+}
+
+#[tokio::test]
+async fn test_inbound_zulip_chat_webhook() {
+    let (state, storage) = create_test_state();
+    storage.upsert_repository(100, "StarLabsSI/ensia", 12345).unwrap();
+
+    let app = create_router(state);
+
+    let zulip_payload = serde_json::json!({
+        "token": "test-zulip-token",
+        "data": "@**sugie-bot** status",
+        "message": {
+            "sender_email": "developer@starlabs.si",
+            "sender_full_name": "Developer",
+            "content": "@**sugie-bot** status"
+        }
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/chat/zulip")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&zulip_payload).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    let content = body_json.get("content").and_then(|v| v.as_str()).unwrap();
+    assert!(content.contains("Sugie Bot Status"));
+    assert!(content.contains("Running"));
+}
+
+#[tokio::test]
+async fn test_inbound_lark_url_verification_and_event() {
+    let (state, _) = create_test_state();
+    let app = create_router(state);
+
+    // 1. URL Verification Challenge
+    let challenge_payload = serde_json::json!({
+        "type": "url_verification",
+        "challenge": "my_unique_challenge_token_123",
+        "token": "test-lark-token"
+    });
+
+    let req1 = Request::builder()
+        .method("POST")
+        .uri("/api/chat/lark")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&challenge_payload).unwrap()))
+        .unwrap();
+
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+
+    let bytes1 = axum::body::to_bytes(resp1.into_body(), usize::MAX).await.unwrap();
+    let json1: serde_json::Value = serde_json::from_slice(&bytes1).unwrap();
+    assert_eq!(json1.get("challenge").and_then(|v| v.as_str()), Some("my_unique_challenge_token_123"));
+
+    // 2. Lark Message Event
+    let event_payload = serde_json::json!({
+        "schema": "2.0",
+        "header": {
+            "event_type": "im.message.receive_v1",
+            "token": "test-lark-token"
+        },
+        "event": {
+            "sender": {
+                "sender_id": {
+                    "open_id": "ou_test_user"
+                }
+            },
+            "message": {
+                "chat_id": "oc_test_chat",
+                "content": "{\"text\":\"@_user_1 help\"}",
+                "message_type": "text"
+            }
+        }
+    });
+
+    let req2 = Request::builder()
+        .method("POST")
+        .uri("/api/chat/lark")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&event_payload).unwrap()))
+        .unwrap();
+
+    let resp2 = app.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+
+    let bytes2 = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+    let json2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+    assert_eq!(json2.get("code").and_then(|v| v.as_i64()), Some(0));
+}
+
+#[tokio::test]
+async fn test_inbound_lark_encrypted_callback() {
+    let (state, _) = create_test_state();
+    let app = create_router(state);
+
+    let encrypt_key = "test-lark-encrypt-key-123456789";
+
+    // 1. Encrypted URL Verification
+    let plaintext = serde_json::json!({
+        "type": "url_verification",
+        "challenge": "challenge_abc_123",
+        "token": "test-lark-token"
+    })
+    .to_string();
+    let encrypted_challenge = sugie::server::chat::encrypt_lark_payload(encrypt_key, &plaintext).unwrap();
+    let encrypted_wrapper = serde_json::json!({
+        "encrypt": encrypted_challenge
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/chat/lark")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&encrypted_wrapper).unwrap()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json.get("challenge").and_then(|v| v.as_str()), Some("challenge_abc_123"));
+}
+
+#[tokio::test]
+async fn test_inbound_discord_ping_interaction() {
+    let (state, _) = create_test_state();
+    let app = create_router(state);
+
+    let ping_payload = serde_json::json!({
+        "type": 1
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/chat/discord")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&ping_payload).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body_json.get("type").and_then(|v| v.as_i64()), Some(1));
+}
+
+#[tokio::test]
+async fn test_generic_chat_command_endpoint() {
+    let (state, storage) = create_test_state();
+    storage.upsert_repository(100, "StarLabsSI/ensia", 12345).unwrap();
+    let app = create_router(state);
+
+    let payload = serde_json::json!({
+        "command": "repos",
+        "sender": "cn-starlabs"
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/chat/command")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let resp_str = body_json.get("response").and_then(|v| v.as_str()).unwrap();
+    assert!(resp_str.contains("StarLabsSI/ensia"));
 }
