@@ -7,12 +7,14 @@ pub mod server;
 pub mod stale;
 pub mod storage;
 pub mod triage;
+pub mod web;
 
 pub use config::SugieConfig;
 pub use github::auth::GitHubAuthManager;
 pub use github::client::GitHubClient;
 pub use notifications::NotificationDispatcher;
-pub use server::{create_router, AppState};
+pub use server::{create_router, create_router_with_web, AppState};
 pub use stale::StaleManager;
 pub use storage::Storage;
 pub use triage::TriageService;
+pub use web::WebState;

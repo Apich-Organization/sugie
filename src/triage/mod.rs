@@ -69,6 +69,31 @@ impl TriageService {
         self.get_client_for_installation(inst_id).await
     }
 
+    /// Sync all repositories from active GitHub App installations into local storage.
+    pub async fn sync_all_repositories(&self) -> Result<Vec<(u64, String, u64)>> {
+        let installs = self.auth.get_installations().await?;
+        for inst in installs {
+            if let Some(inst_id) = inst.get("id").and_then(|v| v.as_u64()) {
+                match self.auth.get_installation_repositories(inst_id).await {
+                    Ok(repos) => {
+                        for r in repos {
+                            if let (Some(full_name), Some(repo_id)) = (
+                                r.get("full_name").and_then(|v| v.as_str()),
+                                r.get("id").and_then(|v| v.as_u64()),
+                            ) {
+                                let _ = self.storage.upsert_repository(repo_id, full_name, inst_id);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch repositories for installation {}: {:?}", inst_id, e);
+                    }
+                }
+            }
+        }
+        self.storage.list_repositories()
+    }
+
     pub async fn load_repo_config(
         &self,
         client: &GitHubClient,

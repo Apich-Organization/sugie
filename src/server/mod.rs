@@ -24,7 +24,12 @@ pub struct AppState {
 }
 
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
+    create_router_with_web(state, None)
+}
+
+/// Build the bot router and optionally mount the admin console at `/admin`.
+pub fn create_router_with_web(state: AppState, web: Option<crate::web::WebState>) -> Router {
+    let router = Router::new()
         .route("/health", get(health_check))
         .route("/status", get(status_check))
         .route("/webhook", post(github_webhook_handler))
@@ -34,7 +39,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/chat/discord", post(chat::discord_chat_handler))
         .route("/api/chat/command", post(chat::generic_chat_command_handler))
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(state);
+
+    match web {
+        Some(web_state) => router.merge(crate::web::router(web_state)),
+        None => router,
+    }
 }
 
 async fn health_check() -> impl IntoResponse {

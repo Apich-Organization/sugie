@@ -487,6 +487,54 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Check suites attached to a commit ref — used by the console `/retest`.
+    pub async fn list_check_suites_for_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let url = format!(
+            "{}/repos/{}/{}/commits/{}/check-suites?per_page=50",
+            self.base_url, owner, repo, git_ref
+        );
+        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let data: serde_json::Value = resp.json().await?;
+        Ok(data
+            .get("check_suites")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    // --- Repository Metadata & Commits (admin console) ---
+
+    /// Raw repository payload: stars, forks, open issue counters, default branch.
+    pub async fn get_repo(&self, owner: &str, repo: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/repos/{}/{}", self.base_url, owner, repo);
+        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
+
+    /// Commits on the default branch, optionally since an RFC3339 timestamp.
+    pub async fn list_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        since: Option<&str>,
+        per_page: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut url = format!(
+            "{}/repos/{}/{}/commits?per_page={}",
+            self.base_url, owner, repo, per_page
+        );
+        if let Some(since) = since {
+            url.push_str(&format!("&since={}", since));
+        }
+        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        Ok(resp.json::<Vec<serde_json::Value>>().await?)
+    }
+
     // --- Repository Content API ---
 
     pub async fn get_repo_file_content(

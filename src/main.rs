@@ -3,7 +3,7 @@ use sugie::config::{self, SugieConfig};
 use sugie::github::auth::GitHubAuthManager;
 use sugie::metrics::MetricsReporter;
 use sugie::notifications::NotificationDispatcher;
-use sugie::server::{create_router, AppState};
+use sugie::server::AppState;
 use sugie::stale::StaleManager;
 use sugie::storage::Storage;
 use sugie::triage::TriageService;
@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
@@ -97,6 +97,16 @@ async fn main() -> anyhow::Result<()> {
                 notifier.clone(),
                 auth.clone(),
             );
+
+            // Auto-sync repositories from GitHub App installations in background
+            let sync_triage = triage.clone();
+            tokio::spawn(async move {
+                info!("Syncing repositories from active GitHub App installations...");
+                match sync_triage.sync_all_repositories().await {
+                    Ok(repos) => info!("Successfully synced {} repositories into database.", repos.len()),
+                    Err(e) => warn!("Auto-syncing repositories from installations skipped/failed: {:?}", e),
+                }
+            });
 
             // 1. Configurable background task for stale issues maintenance
             let stale_triage = triage.clone();
@@ -204,17 +214,31 @@ async fn main() -> anyhow::Result<()> {
             let listen_port = port.unwrap_or(config.port);
             let addr: SocketAddr = format!("{}:{}", listen_host, listen_port).parse()?;
 
+            let config = Arc::new(config);
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+
+            let web_state = sugie::web::WebState::new(
+                config.clone(),
+                triage.clone(),
+                sugie::web::config_store::ConfigFiles::new(cli.config.clone(), ".env"),
+                shutdown.clone(),
+            )?;
+            info!(
+                "Admin console available at http://{}:{}/admin",
+                listen_host, listen_port
+            );
+
             let state = AppState {
-                config: Arc::new(config),
+                config: config.clone(),
                 triage,
             };
 
-            let app = create_router(state);
+            let app = sugie::server::create_router_with_web(state, Some(web_state));
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             info!("Sugie Webhook Server listening on http://{}", addr);
 
             axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
+                .with_graceful_shutdown(shutdown_signal(shutdown))
                 .await?;
 
             info!("Sugie Bot shut down gracefully.");
@@ -545,8 +569,13 @@ fn notifications_config_default() -> config::NotificationsConfig {
     config::NotificationsConfig::default()
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+async fn shutdown_signal(notify: Arc<tokio::sync::Notify>) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = notify.notified() => {
+            info!("Restart requested from the admin console, shutting down...");
+        }
+    }
     info!("Termination signal received, shutting down server...");
 }
 

@@ -125,33 +125,54 @@ impl GitHubAuthManager {
         installation_id: u64,
     ) -> Result<Vec<serde_json::Value>> {
         let token = self.get_installation_token(installation_id).await?;
-        let url = format!("{}/installation/repositories", self.base_url);
-        let res = self
-            .http_client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
+        let mut all_repos = Vec::new();
+        let mut page = 1;
 
-        if !res.status().is_success() {
-            let status = res.status();
-            let body = res.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "GitHub API /installation/repositories returned HTTP {}: {}",
-                status,
-                body
+        loop {
+            let url = format!(
+                "{}/installation/repositories?per_page=100&page={}",
+                self.base_url, page
             );
+            let res = self
+                .http_client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .send()
+                .await?;
+
+            if !res.status().is_success() {
+                let status = res.status();
+                let body = res.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "GitHub API /installation/repositories returned HTTP {}: {}",
+                    status,
+                    body
+                );
+            }
+
+            let json: serde_json::Value = res.json().await?;
+            let repos = json
+                .get("repositories")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if repos.is_empty() {
+                break;
+            }
+
+            let count = repos.len();
+            all_repos.extend(repos);
+
+            if count < 100 {
+                break;
+            }
+            page += 1;
         }
 
-        let json: serde_json::Value = res.json().await?;
-        let repos = json
-            .get("repositories")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        Ok(repos)
+        Ok(all_repos)
     }
 
     pub async fn get_installation_token(&self, installation_id: u64) -> Result<String> {
