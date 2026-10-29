@@ -260,12 +260,58 @@ dialog.modal-dialog::backdrop{
 .pill-check{display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--text-2); padding:4px 9px; border:1px solid var(--border); border-radius:999px; cursor:pointer}
 .pill-check input{accent-color:var(--primary)}
 footer.foot{max-width:1240px; margin:0 auto; padding:0 28px 40px; color:var(--text-3); font-size:11.5px}
+
+/* ---------------- responsive layout fixes ---------------- */
+html{overflow-x:hidden}
+.page,.page>*,.grid>*,.stack>*,.card,.stat{min-width:0}
+.card.tight{overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch}
+.card.tight table{min-width:640px}
+.card.tight::-webkit-scrollbar{height:8px}
+.card.tight::-webkit-scrollbar-thumb{background:var(--border-mid); border-radius:8px}
+tbody td{overflow-wrap:break-word}
+tbody td.hint,tbody td.mono{overflow-wrap:anywhere}
+tbody td.nowrap,.nowrap{white-space:nowrap; overflow-wrap:normal}
+td.hint,td .hint{max-width:340px}
+td .row{flex-wrap:nowrap}
+td:last-child .row{justify-content:flex-end}
+.split-19{grid-template-columns:minmax(0,1.9fr) minmax(0,1fr); align-items:start}
+.split-22{grid-template-columns:minmax(0,2.2fr) minmax(0,1fr); align-items:start}
+.kv dd{overflow-wrap:anywhere; min-width:0}
+.alert{overflow-wrap:anywhere}
+.card-title{font-size:14px; font-weight:620; letter-spacing:-.2px}
+.card-sub{color:var(--text-3); font-size:12px; margin-top:2px; max-width:720px}
+.form-grid{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0 16px}
+.form-grid .span-2{grid-column:1/-1}
+@media(max-width:700px){.form-grid{grid-template-columns:minmax(0,1fr)}}
+.toolbar{display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:14px 20px 4px}
+.toolbar input[type=search]{flex:1; min-width:200px; max-width:360px; padding:8px 12px; border-radius:12px; border:1px solid var(--border-mid); background:var(--surface-hi); color:var(--text-1); font-size:13px; font-family:inherit}
+.toolbar input[type=search]:focus{outline:none; border-color:var(--primary); box-shadow:0 0 0 3px var(--accent-soft)}
+.toolbar select{width:auto; min-width:130px; padding:8px 12px}
+.toolbar .count{margin-left:auto; color:var(--text-3); font-size:12px}
+.filter-empty td{padding:28px; text-align:center; color:var(--text-3)}
+.check-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:10px}
+.check{display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-alt); font-size:12.5px; color:var(--text-2); cursor:pointer}
+.check:hover{border-color:var(--border-hi); color:var(--text-1)}
+.check input{accent-color:var(--primary); width:16px; height:16px; flex-shrink:0}
+.page-head>div{min-width:0}
+.badge{white-space:nowrap}
+.topbar{overflow:hidden}
+.user-chip{white-space:nowrap}
+@media(max-width:1360px){
+  .split-19,.split-22{grid-template-columns:minmax(0,1fr)}
+}
 @media(max-width:980px){
   .grid.cols-4{grid-template-columns:repeat(2,minmax(0,1fr))}
   .grid.cols-3,.grid.cols-2{grid-template-columns:1fr}
   .console{grid-template-columns:1fr}
   .repo-picker{max-height:none}
-  .nav{display:none}
+  .page{padding:24px 16px 56px}
+  .topbar{padding:0 16px; gap:10px}
+  .brand small,.user-chip span.name{display:none}
+}
+@media(max-width:560px){
+  .grid.cols-4{grid-template-columns:minmax(0,1fr)}
+  .page-head h1{font-size:22px}
 }
 "#;
 
@@ -390,6 +436,244 @@ pub const JS: &str = r#"
     f.addEventListener('submit', function (ev) {
       if (!window.confirm(f.getAttribute('data-confirm'))) ev.preventDefault();
     });
+  });
+
+  // ---- WebAuthn / Passkey helpers ---------------------------------------
+  function b64urlToBytes(b64url) {
+    var padding = '='.repeat((4 - (b64url.length % 4)) % 4);
+    var base64 = (b64url + padding).replace(/-/g, '+').replace(/_/g, '/');
+    var raw = window.atob(base64);
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) {
+      out[i] = raw.charCodeAt(i);
+    }
+    return out;
+  }
+
+  function bytesToB64url(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var binary = '';
+    for (var i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  var pkLoginBtn = document.getElementById('btn-passkey-login');
+  if (pkLoginBtn) {
+    pkLoginBtn.addEventListener('click', function () {
+      var errBox = document.getElementById('passkey-err');
+      function showErr(msg) {
+        if (errBox) {
+          errBox.textContent = msg;
+          errBox.style.display = 'block';
+        } else {
+          window.alert(msg);
+        }
+      }
+      if (!window.PublicKeyCredential || !navigator.credentials) {
+        showErr('WebAuthn / Passkeys are not supported in this browser or context (HTTPS or localhost required).');
+        return;
+      }
+      if (errBox) errBox.style.display = 'none';
+      var origText = pkLoginBtn.textContent;
+      pkLoginBtn.disabled = true;
+      pkLoginBtn.textContent = 'Waiting for Passkey / Security Key…';
+      var pendingToken = pkLoginBtn.getAttribute('data-pending-token') || null;
+      var nextUrl = pkLoginBtn.getAttribute('data-next') || '/admin';
+
+      fetch('/admin/api/passkey/auth/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pending_token: pendingToken })
+      })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+        .then(function (res) {
+          if (!res.ok) throw new Error(res.body.error || 'Failed to start Passkey authentication');
+          var pk = res.body.options.publicKey;
+          pk.challenge = b64urlToBytes(pk.challenge);
+          if (pk.allowCredentials) {
+            pk.allowCredentials = pk.allowCredentials.map(function (c) {
+              return Object.assign({}, c, { id: b64urlToBytes(c.id) });
+            });
+          }
+          return navigator.credentials.get({ publicKey: pk }).then(function (cred) {
+            return { challenge_id: res.body.challenge_id, cred: cred };
+          });
+        })
+        .then(function (step) {
+          var cred = step.cred;
+          var credential = {
+            id: cred.id,
+            rawId: bytesToB64url(cred.rawId),
+            type: cred.type,
+            extensions: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+            response: {
+              authenticatorData: bytesToB64url(cred.response.authenticatorData),
+              clientDataJSON: bytesToB64url(cred.response.clientDataJSON),
+              signature: bytesToB64url(cred.response.signature),
+              userHandle: cred.response.userHandle ? bytesToB64url(cred.response.userHandle) : null
+            }
+          };
+          return fetch('/admin/api/passkey/auth/finish', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              challenge_id: step.challenge_id,
+              pending_token: pendingToken,
+              next: nextUrl,
+              credential: credential
+            })
+          });
+        })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+        .then(function (fin) {
+          if (!fin.ok) throw new Error(fin.body.error || 'Passkey verification failed');
+          window.location.href = fin.body.redirect || nextUrl || '/admin';
+        })
+        .catch(function (err) {
+          pkLoginBtn.disabled = false;
+          pkLoginBtn.textContent = origText;
+          showErr(err && err.message ? err.message : String(err));
+        });
+    });
+  }
+
+  var pkRegBtn = document.getElementById('btn-passkey-register');
+  if (pkRegBtn) {
+    pkRegBtn.addEventListener('click', function () {
+      var msgBox = document.getElementById('passkey-reg-msg');
+      var nameInput = document.getElementById('passkey-device-name');
+      function showMsg(ok, msg) {
+        if (msgBox) {
+          msgBox.className = ok ? 'alert ok' : 'alert err';
+          msgBox.textContent = msg;
+          msgBox.style.display = 'block';
+        } else {
+          window.alert(msg);
+        }
+      }
+      if (!window.PublicKeyCredential || !navigator.credentials) {
+        showMsg(false, 'WebAuthn / Passkeys are not supported in this browser or context (HTTPS or localhost required).');
+        return;
+      }
+      if (msgBox) msgBox.style.display = 'none';
+      var deviceName = (nameInput && nameInput.value ? nameInput.value.trim() : '') || 'Passkey';
+      var origText = pkRegBtn.textContent;
+      pkRegBtn.disabled = true;
+      pkRegBtn.textContent = 'Prompting authenticator…';
+
+      fetch('/admin/api/passkey/register/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_name: deviceName })
+      })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+        .then(function (res) {
+          if (!res.ok) throw new Error(res.body.error || 'Failed to start Passkey registration');
+          var pk = res.body.options.publicKey;
+          pk.challenge = b64urlToBytes(pk.challenge);
+          pk.user.id = b64urlToBytes(pk.user.id);
+          pk.authenticatorSelection = Object.assign({}, pk.authenticatorSelection || {}, {
+            residentKey: 'required',
+            requireResidentKey: true,
+            userVerification: 'required'
+          });
+          if (pk.excludeCredentials) {
+            pk.excludeCredentials = pk.excludeCredentials.map(function (c) {
+              return Object.assign({}, c, { id: b64urlToBytes(c.id) });
+            });
+          }
+          return navigator.credentials.create({ publicKey: pk }).then(function (cred) {
+            return { challenge_id: res.body.challenge_id, cred: cred };
+          });
+        })
+        .then(function (step) {
+          var cred = step.cred;
+          var credential = {
+            id: cred.id,
+            rawId: bytesToB64url(cred.rawId),
+            type: cred.type,
+            extensions: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+            response: {
+              attestationObject: bytesToB64url(cred.response.attestationObject),
+              clientDataJSON: bytesToB64url(cred.response.clientDataJSON),
+              transports: cred.response.getTransports ? cred.response.getTransports() : undefined
+            }
+          };
+          return fetch('/admin/api/passkey/register/finish', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              challenge_id: step.challenge_id,
+              device_name: deviceName,
+              credential: credential
+            })
+          });
+        })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+        .then(function (fin) {
+          if (!fin.ok) throw new Error(fin.body.error || 'Failed to save Passkey');
+          window.location.href = '/admin/security?ok=1&msg=' + encodeURIComponent('Passkey "' + deviceName + '" registered successfully');
+        })
+        .catch(function (err) {
+          pkRegBtn.disabled = false;
+          pkRegBtn.textContent = origText;
+          showMsg(false, err && err.message ? err.message : String(err));
+        });
+    });
+  }
+})();
+
+// ---- table search / filter controls (data-filter-table) ----
+(function () {
+  function apply(tableId) {
+    var table = document.getElementById(tableId);
+    if (!table) return;
+    var controls = document.querySelectorAll('[data-filter-table="' + tableId + '"]');
+    var q = '', onlyErrors = false, attrs = {};
+    controls.forEach(function (c) {
+      var kind = c.getAttribute('data-filter-kind');
+      if (kind === 'text') q = c.value.trim().toLowerCase();
+      else if (kind === 'errors') onlyErrors = c.checked;
+      else if (c.value) attrs[kind] = c.value;
+    });
+    var shown = 0, rows = table.querySelectorAll('tbody tr:not(.filter-empty)');
+    rows.forEach(function (tr) {
+      var ok = true;
+      if (q && tr.textContent.toLowerCase().indexOf(q) === -1) ok = false;
+      if (ok && onlyErrors) {
+        var st = tr.getAttribute('data-status');
+        ok = st === 'error' || st === 'suspended';
+      }
+      if (ok) {
+        Object.keys(attrs).forEach(function (k) {
+          if (tr.getAttribute('data-' + k) !== attrs[k]) ok = false;
+        });
+      }
+      tr.style.display = ok ? '' : 'none';
+      if (ok) shown++;
+    });
+    var tbody = table.querySelector('tbody');
+    var empty = tbody.querySelector('tr.filter-empty');
+    if (rows.length && shown === 0) {
+      if (!empty) {
+        empty = document.createElement('tr');
+        empty.className = 'filter-empty';
+        var td = document.createElement('td');
+        td.colSpan = 20;
+        td.textContent = 'No rows match the current filters';
+        empty.appendChild(td);
+        tbody.appendChild(empty);
+      }
+      empty.style.display = '';
+    } else if (empty) {
+      empty.style.display = 'none';
+    }
+  }
+  document.querySelectorAll('[data-filter-table]').forEach(function (c) {
+    var id = c.getAttribute('data-filter-table');
+    c.addEventListener(c.tagName === 'INPUT' && c.type === 'search' ? 'input' : 'change', function () { apply(id); });
   });
 })();
 "#;

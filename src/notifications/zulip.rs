@@ -50,20 +50,53 @@ impl ZulipNotifier {
             ("content", content),
         ];
 
-        let resp = self
+        let started = std::time::Instant::now();
+        let send_res = self
             .http
             .post(&endpoint)
             .basic_auth(&self.config.bot_email, Some(&self.config.bot_api_key))
             .form(&params)
             .send()
-            .await
-            .context("Failed to send message to Zulip API")?;
+            .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let resp = match send_res {
+            Ok(r) => r,
+            Err(e) => {
+                crate::security_log::log_notification_request(
+                    "zulip",
+                    "POST",
+                    &endpoint,
+                    0,
+                    duration_ms,
+                    &format!("stream={} topic={topic} error={e}", self.config.stream),
+                );
+                return Err(e).context("Failed to send message to Zulip API");
+            }
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            crate::security_log::log_notification_request(
+                "zulip",
+                "POST",
+                &endpoint,
+                status.as_u16(),
+                duration_ms,
+                &format!("stream={} topic={topic} error={body}", self.config.stream),
+            );
             anyhow::bail!("Zulip API request failed with HTTP {}: {}", status, body);
         }
+
+        crate::security_log::log_notification_request(
+            "zulip",
+            "POST",
+            &endpoint,
+            status.as_u16(),
+            duration_ms,
+            &format!("stream={} topic={topic}", self.config.stream),
+        );
 
         Ok(())
     }

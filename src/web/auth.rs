@@ -1,6 +1,6 @@
 //! Password hashing, opaque session cookies and principal resolution.
 
-use crate::web::db::WebDb;
+use crate::web::db::{UserRow, WebDb};
 use crate::web::perms::{CurrentUser, Role};
 use anyhow::{anyhow, Result};
 use argon2::password_hash::rand_core::{OsRng, RngCore};
@@ -85,41 +85,77 @@ pub fn current_user(db: &WebDb, headers: &HeaderMap) -> Option<CurrentUser> {
     let row = db.session_user(&token_hash(&token)).ok().flatten()?;
     let repos = db.repo_perms(row.id).unwrap_or_default();
     let commands = db.command_perms(row.id).unwrap_or_default();
-    Some(CurrentUser::from_row(row, repos, commands))
+    let global_2fa = db.is_global_2fa_enabled();
+    Some(CurrentUser::from_row(row, repos, commands, global_2fa))
 }
 
-/// Verify credentials and mint a session. Returns the raw token on success.
+pub enum LoginOutcome {
+    Session(String),
+    Require2fa {
+        pending_token: String,
+        user: UserRow,
+    },
+    Invalid,
+}
+
+/// Mint a full session for a user after authentication (password, passkey, or 2FA).
+pub fn mint_session_for_user(
+    db: &WebDb,
+    user_id: i64,
+    ip: &str,
+    user_agent: &str,
+) -> Result<String> {
+    let token = random_token();
+    db.create_session(
+        &token_hash(&token),
+        user_id,
+        SESSION_TTL_HOURS,
+        ip,
+        user_agent,
+    )?;
+    db.touch_login(user_id)?;
+    let _ = db.purge_sessions();
+    Ok(token)
+}
+
+/// Verify credentials and either mint a session or return a pending 2FA challenge.
+///
+/// - If the user has `two_fa_policy != "disabled"` and already has 2FA enrolled
+///   (TOTP or Passkey), password login requires the second factor.
+/// - If 2FA is required for the user (either globally or per-user `"required"`),
+///   and they have NOT enrolled 2FA yet (first login), we issue a session and
+///   `gate()` redirects them to `/admin/security?setup=1` until they enroll OTP or Passkey.
 pub fn login(
     db: &WebDb,
     username: &str,
     password: &str,
     ip: &str,
     user_agent: &str,
-) -> Result<Option<String>> {
+) -> Result<LoginOutcome> {
     let Some(row) = db.find_user(username)? else {
-        return Ok(None);
+        return Ok(LoginOutcome::Invalid);
     };
     if !row.active {
-        return Ok(None);
+        return Ok(LoginOutcome::Invalid);
     }
     let Some(hash) = db.password_hash(row.id)? else {
-        return Ok(None);
+        return Ok(LoginOutcome::Invalid);
     };
     if !verify_password(password, &hash) {
-        return Ok(None);
+        return Ok(LoginOutcome::Invalid);
     }
 
-    let token = random_token();
-    db.create_session(
-        &token_hash(&token),
-        row.id,
-        SESSION_TTL_HOURS,
-        ip,
-        user_agent,
-    )?;
-    db.touch_login(row.id)?;
-    let _ = db.purge_sessions();
-    Ok(Some(token))
+    if !row.is_2fa_disabled() && row.has_2fa_enrolled() {
+        let pending_token = random_token();
+        db.create_pending_2fa(&token_hash(&pending_token), row.id, "", ip, user_agent)?;
+        return Ok(LoginOutcome::Require2fa {
+            pending_token,
+            user: row,
+        });
+    }
+
+    let token = mint_session_for_user(db, row.id, ip, user_agent)?;
+    Ok(LoginOutcome::Session(token))
 }
 
 /// Create the bootstrap `owner` account the first time the console starts.

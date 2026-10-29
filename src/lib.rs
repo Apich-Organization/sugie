@@ -3,6 +3,7 @@ pub mod config;
 pub mod github;
 pub mod metrics;
 pub mod notifications;
+pub mod security_log;
 pub mod server;
 pub mod stale;
 pub mod storage;

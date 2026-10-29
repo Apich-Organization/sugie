@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Serve { host, port } => {
             info!("Starting Sugie Triage Bot...");
             let config = SugieConfig::load_from_env_or_file(&cli.config)?;
+            sugie::security_log::init(&config.db_path);
             let private_key = config.github.get_private_key()?;
 
             let auth = Arc::new(GitHubAuthManager::new(config.github.app_id, private_key));
@@ -119,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
                 let stale_mgr =
                     StaleManager::new(stale_rules, stale_storage.clone(), stale_notifier);
                 let mut interval = tokio::time::interval(Duration::from_secs(stale_interval_secs));
+                // Skip the immediate first tick on server startup
+                interval.tick().await;
 
                 loop {
                     interval.tick().await;
@@ -138,69 +141,6 @@ async fn main() -> anyhow::Result<()> {
                                             "Error in stale processor for {}: {:?}",
                                             full_name, e
                                         );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-
-            // 2. Configurable background scheduler for Weekly & Monthly Reports
-            let report_triage = triage.clone();
-            let report_storage = storage.clone();
-            let report_cfg = config.default_rules.reports.clone();
-            let report_notifier = notifier.clone();
-
-            tokio::spawn(async move {
-                let weekly_interval_secs = (report_cfg.weekly_interval_days.max(1) as u64) * 86400;
-                let mut weekly_timer =
-                    tokio::time::interval(Duration::from_secs(weekly_interval_secs));
-                let reporter = MetricsReporter::new(report_cfg.clone(), report_notifier.clone());
-
-                loop {
-                    weekly_timer.tick().await;
-                    if !report_cfg.weekly_enabled {
-                        continue;
-                    }
-                    info!("Running scheduled weekly triage report generator...");
-                    if let Ok(repos) = report_storage.list_repositories() {
-                        for (_, full_name, inst_id) in repos {
-                            if let Ok(client) =
-                                report_triage.get_client_for_installation(inst_id).await
-                            {
-                                let parts: Vec<&str> = full_name.split('/').collect();
-                                if parts.len() == 2 {
-                                    match reporter
-                                        .generate_report(
-                                            &client,
-                                            parts[0],
-                                            parts[1],
-                                            report_cfg.weekly_interval_days as i64,
-                                            "Weekly",
-                                        )
-                                        .await
-                                    {
-                                        Ok(metrics_data) => {
-                                            if let Err(e) = reporter
-                                                .publish_report(
-                                                    &client,
-                                                    parts[0],
-                                                    parts[1],
-                                                    &metrics_data,
-                                                )
-                                                .await
-                                            {
-                                                error!(
-                                                    "Failed to publish weekly report for {}: {:?}",
-                                                    full_name, e
-                                                );
-                                            }
-                                        }
-                                        Err(e) => error!(
-                                            "Failed to generate weekly report for {}: {:?}",
-                                            full_name, e
-                                        ),
                                     }
                                 }
                             }

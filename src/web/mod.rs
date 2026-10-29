@@ -6,8 +6,10 @@ pub mod auth;
 pub mod config_store;
 pub mod db;
 pub mod exec;
+pub mod passkey;
 pub mod perms;
 pub mod stats;
+pub mod totp;
 pub mod ui;
 
 use crate::config::SugieConfig;
@@ -45,6 +47,7 @@ pub struct WebState {
     pub files: ConfigFiles,
     pub jobs: Arc<JobRegistry>,
     pub stats: Arc<StatsCache>,
+    pub passkey: passkey::PasskeyManager,
     pub shutdown: Arc<tokio::sync::Notify>,
     pub started_at: DateTime<Utc>,
 }
@@ -57,12 +60,14 @@ impl WebState {
         shutdown: Arc<tokio::sync::Notify>,
     ) -> anyhow::Result<Self> {
         let db = WebDb::open(&config.db_path)?;
+        crate::security_log::init(&config.db_path);
         if let Some(generated) = auth::bootstrap_admin(&db)? {
             tracing::warn!(
                 "Admin console bootstrapped an `admin` account. Generated password: {} (also written to data/admin-initial-password.txt)",
                 generated
             );
         }
+        let passkey = passkey::PasskeyManager::from_env(config.port);
         Ok(Self {
             config,
             triage,
@@ -70,6 +75,7 @@ impl WebState {
             files,
             jobs: Arc::new(JobRegistry::default()),
             stats: Arc::new(StatsCache::default()),
+            passkey,
             shutdown,
             started_at: Utc::now(),
         })
@@ -81,6 +87,7 @@ pub fn router(state: WebState) -> Router {
         .route("/admin", get(dashboard))
         .route("/admin/", get(dashboard))
         .route("/admin/login", get(login_page).post(login_submit))
+        .route("/admin/login/2fa", post(login_2fa_submit))
         .route("/admin/logout", post(logout))
         .route("/admin/repos", get(repos_page))
         .route("/admin/api/repos/sync", post(sync_repos))
@@ -88,6 +95,17 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/config", get(config_page))
         .route("/admin/users", get(users_page))
         .route("/admin/audit", get(audit_page))
+        .route("/admin/audit/settings", post(save_audit_settings))
+        .route("/admin/audit/purge", post(purge_audit_logs))
+        .route("/admin/audit/export", get(export_audit_csv))
+        .route("/admin/security", get(security_page))
+        .route("/admin/security/totp/activate", post(totp_activate))
+        .route("/admin/security/totp/disable", post(totp_disable))
+        .route("/admin/security/passkey/delete", post(passkey_delete))
+        .route("/admin/api/passkey/register/start", post(api_passkey_register_start))
+        .route("/admin/api/passkey/register/finish", post(api_passkey_register_finish))
+        .route("/admin/api/passkey/auth/start", post(api_passkey_auth_start))
+        .route("/admin/api/passkey/auth/finish", post(api_passkey_auth_finish))
         .route("/admin/api/exec", post(api_exec))
         .route("/admin/api/jobs/{id}", get(api_job))
         .route("/admin/api/jobs/{id}/stream", get(api_job_stream))
@@ -99,6 +117,8 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/users/create", post(create_user))
         .route("/admin/users/update", post(update_user))
         .route("/admin/users/delete", post(delete_user))
+        .route("/admin/users/2fa-global", post(toggle_global_2fa))
+        .route("/admin/users/reset-2fa", post(reset_user_2fa))
         .route("/admin/system/restart", post(restart))
         .route("/admin/assets/app.css", get(css))
         .route("/admin/assets/app.js", get(js))
@@ -118,13 +138,22 @@ fn redirect(to: &str) -> Response {
     Redirect::to(to).into_response()
 }
 
-/// Every page handler funnels through this: anonymous callers get bounced to the
-/// login form with a `next` hint.
-fn gate(state: &WebState, headers: &HeaderMap) -> Result<CurrentUser, Response> {
+/// Resolves the signed-in user even when first-login 2FA enrollment is pending.
+fn gate_allow_setup(state: &WebState, headers: &HeaderMap) -> Result<CurrentUser, Response> {
     match auth::current_user(&state.db, headers) {
         Some(user) => Ok(user),
         None => Err(redirect("/admin/login")),
     }
+}
+
+/// Every standard page handler funnels through this: anonymous callers get bounced
+/// to `/admin/login`, and users required to enroll 2FA get directed to `/admin/security`.
+fn gate(state: &WebState, headers: &HeaderMap) -> Result<CurrentUser, Response> {
+    let user = gate_allow_setup(state, headers)?;
+    if user.needs_2fa_setup {
+        return Err(redirect("/admin/security?setup=1"));
+    }
+    Ok(user)
 }
 
 fn gate_admin(state: &WebState, headers: &HeaderMap) -> Result<CurrentUser, Response> {
@@ -149,10 +178,13 @@ fn flash_from(query: &HashMap<String, String>) -> Option<(bool, String)> {
 // -------------------------------------------------------------------- pages
 
 async fn login_page(State(state): State<WebState>, headers: HeaderMap) -> Response {
-    if auth::current_user(&state.db, &headers).is_some() {
+    if let Some(u) = auth::current_user(&state.db, &headers) {
+        if u.needs_2fa_setup {
+            return redirect("/admin/security?setup=1");
+        }
         return redirect("/admin");
     }
-    html(pages::login_page(None, "/admin".to_string()))
+    html(pages::login_page(None, "/admin".to_string(), None))
 }
 
 #[derive(Deserialize)]
@@ -176,11 +208,21 @@ async fn login_submit(
         .to_string();
 
     match auth::login(&state.db, form.username.trim(), &form.password, &ip, &ua) {
-        Ok(Some(token)) => {
+        Ok(auth::LoginOutcome::Session(token)) => {
             state
                 .db
                 .audit(&form.username, "login", "-", "Login successful", &ip, true);
-            let next = if form.next.starts_with("/admin") && !form.next.starts_with("/admin/login") {
+            let global_2fa = state.db.is_global_2fa_enabled();
+            let needs_setup = state
+                .db
+                .find_user(form.username.trim())
+                .ok()
+                .flatten()
+                .map(|u| u.needs_2fa_setup(global_2fa))
+                .unwrap_or(false);
+            let next = if needs_setup {
+                "/admin/security?setup=1".to_string()
+            } else if form.next.starts_with("/admin") && !form.next.starts_with("/admin/login") {
                 form.next
             } else {
                 "/admin".to_string()
@@ -191,18 +233,127 @@ async fn login_submit(
             }
             resp
         }
-        Ok(None) => {
+        Ok(auth::LoginOutcome::Require2fa {
+            pending_token,
+            user,
+        }) => {
+            let challenge = pages::LoginChallenge {
+                pending_token,
+                username: user.username,
+                has_totp: user.totp_enabled,
+                has_passkey: user.passkey_count > 0,
+            };
+            html(pages::login_page(None, form.next, Some(challenge)))
+        }
+        Ok(auth::LoginOutcome::Invalid) => {
             state
                 .db
                 .audit(&form.username, "login", "-", "Invalid username or password", &ip, false);
             html(pages::login_page(
                 Some("Invalid username or password, or account is disabled".to_string()),
                 form.next,
+                None,
             ))
         }
         Err(e) => {
             tracing::error!("admin login failed: {e}");
-            html(pages::login_page(Some("Login failed, please check server logs".to_string()), form.next))
+            html(pages::login_page(
+                Some("Login failed, please check server logs".to_string()),
+                form.next,
+                None,
+            ))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct Login2faForm {
+    pending_token: String,
+    totp_code: String,
+    #[serde(default)]
+    next: String,
+}
+
+async fn login_2fa_submit(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<Login2faForm>,
+) -> Response {
+    let ip = auth::client_ip(&headers);
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let token_hash = auth::token_hash(form.pending_token.trim());
+    let Some((user, _)) = state.db.get_pending_2fa(&token_hash).ok().flatten() else {
+        return html(pages::login_page(
+            Some("2FA session expired. Please sign in again.".to_string()),
+            form.next,
+            None,
+        ));
+    };
+
+    let Some((secret, enabled)) = state.db.get_totp_secret(user.id).ok().flatten() else {
+        return html(pages::login_page(
+            Some("Authenticator OTP is not configured for this account.".to_string()),
+            form.next,
+            None,
+        ));
+    };
+
+    if !enabled || !totp::verify_totp(&secret, &form.totp_code) {
+        state.db.audit(
+            &user.username,
+            "login.2fa",
+            "totp",
+            "Invalid OTP code",
+            &ip,
+            false,
+        );
+        let challenge = pages::LoginChallenge {
+            pending_token: form.pending_token,
+            username: user.username,
+            has_totp: user.totp_enabled,
+            has_passkey: user.passkey_count > 0,
+        };
+        return html(pages::login_page(
+            Some("Invalid 8-digit authenticator code. Please try again.".to_string()),
+            form.next,
+            Some(challenge),
+        ));
+    }
+
+    let _ = state.db.consume_pending_2fa(&token_hash);
+    match auth::mint_session_for_user(&state.db, user.id, &ip, &ua) {
+        Ok(session_token) => {
+            state.db.audit(
+                &user.username,
+                "login.2fa",
+                "totp",
+                "2FA OTP verified",
+                &ip,
+                true,
+            );
+            let next = if form.next.starts_with("/admin") && !form.next.starts_with("/admin/login") {
+                form.next
+            } else {
+                "/admin".to_string()
+            };
+            let mut resp = redirect(&next);
+            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&session_token)) {
+                resp.headers_mut().append(header::SET_COOKIE, value);
+            }
+            resp
+        }
+        Err(e) => {
+            tracing::error!("mint session after 2fa failed: {e}");
+            html(pages::login_page(
+                Some("Failed to create session".to_string()),
+                form.next,
+                None,
+            ))
         }
     }
 }
@@ -477,13 +628,516 @@ async fn users_page(
     };
     let users = build_user_cards(&state);
     let repos = all_repos(&state);
-    html(pages::users_page(user, users, repos, flash))
+    let global_2fa = state.db.is_global_2fa_enabled();
+    html(pages::users_page(user, users, repos, global_2fa, flash))
+}
+
+async fn security_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let flash = flash_from(&query);
+    let user = match gate_allow_setup(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+
+    let (totp_setup_secret, totp_setup_qr, totp_setup_url) = if user.totp_enabled {
+        (String::new(), String::new(), String::new())
+    } else {
+        match totp::generate_totp_setup(state.passkey.rp_name(), &user.username) {
+            Ok(setup) => (setup.secret, setup.qr_data_url, setup.otpauth_url),
+            Err(e) => {
+                tracing::error!("generate_totp_setup failed: {e}");
+                (String::new(), String::new(), String::new())
+            }
+        }
+    };
+
+    let passkeys = state
+        .db
+        .list_user_passkeys(user.id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|pk| pages::PasskeyItem {
+            id: pk.id,
+            name: pk.device_name,
+            created_at: pk.created_at.replace('T', " ").chars().take(16).collect(),
+            last_used_at: pk
+                .last_used_at
+                .map(|t| t.replace('T', " ").chars().take(16).collect())
+                .unwrap_or_default(),
+        })
+        .collect();
+
+    let data = pages::SecurityPageData {
+        rp_id: state.passkey.rp_id().to_string(),
+        rp_origin: state.passkey.rp_origin().to_string(),
+        rp_name: state.passkey.rp_name().to_string(),
+        global_2fa: state.db.is_global_2fa_enabled(),
+        totp_enabled: user.totp_enabled,
+        totp_setup_secret,
+        totp_setup_qr,
+        totp_setup_url,
+        passkeys,
+    };
+
+    html(pages::security_page(user, data, flash))
+}
+
+#[derive(Deserialize)]
+struct TotpActivateForm {
+    secret: String,
+    code: String,
+}
+
+async fn totp_activate(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<TotpActivateForm>,
+) -> Response {
+    let user = match gate_allow_setup(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let ip = auth::client_ip(&headers);
+    let secret = form.secret.trim();
+    let code = form.code.trim();
+
+    if !totp::verify_totp(secret, code) {
+        state.db.audit(
+            &user.username,
+            "2fa.totp.activate",
+            "-",
+            "Invalid verification code during TOTP setup",
+            &ip,
+            false,
+        );
+        return security_flash(false, "Invalid 8-digit verification code. Please check your authenticator app and try again.");
+    }
+
+    match state.db.activate_totp(user.id, secret) {
+        Ok(_) => {
+            state.db.audit(
+                &user.username,
+                "2fa.totp.activate",
+                "-",
+                "Activated 8-digit SHA512 TOTP",
+                &ip,
+                true,
+            );
+            security_flash(true, "Authenticator App (SHA512 · 8-digit OTP) activated successfully")
+        }
+        Err(e) => security_flash(false, &format!("Failed to save OTP secret: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct TotpDisableForm {
+    password: String,
+}
+
+async fn totp_disable(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<TotpDisableForm>,
+) -> Response {
+    let user = match gate_allow_setup(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let ip = auth::client_ip(&headers);
+
+    let Some(hash) = state.db.password_hash(user.id).ok().flatten() else {
+        return security_flash(false, "Unable to verify account password");
+    };
+    if !auth::verify_password(&form.password, &hash) {
+        state.db.audit(
+            &user.username,
+            "2fa.totp.disable",
+            "-",
+            "Password verification failed",
+            &ip,
+            false,
+        );
+        return security_flash(false, "Incorrect password");
+    }
+
+    if let Err(e) = state.db.disable_totp(user.id) {
+        return security_flash(false, &format!("Failed to disable OTP: {e}"));
+    }
+
+    state.db.audit(
+        &user.username,
+        "2fa.totp.disable",
+        "-",
+        "Disabled Authenticator OTP",
+        &ip,
+        true,
+    );
+    security_flash(true, "Authenticator OTP disabled")
+}
+
+#[derive(Deserialize)]
+struct PasskeyDeleteForm {
+    id: i64,
+}
+
+async fn passkey_delete(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<PasskeyDeleteForm>,
+) -> Response {
+    let user = match gate_allow_setup(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let ip = auth::client_ip(&headers);
+
+    match state.db.delete_passkey(form.id, user.id) {
+        Ok(true) => {
+            state.db.audit(
+                &user.username,
+                "2fa.passkey.delete",
+                &form.id.to_string(),
+                "Removed Passkey",
+                &ip,
+                true,
+            );
+            security_flash(true, "Passkey removed")
+        }
+        Ok(false) => security_flash(false, "Passkey not found"),
+        Err(e) => security_flash(false, &format!("Failed to remove Passkey: {e}")),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct PasskeyRegStartReq {
+    #[serde(default)]
+    #[allow(dead_code)]
+    device_name: String,
+}
+
+async fn api_passkey_register_start(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(_req): Json<PasskeyRegStartReq>,
+) -> Response {
+    let user = match gate_allow_setup(&state, &headers) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Unauthorized" })),
+            )
+                .into_response()
+        }
+    };
+
+    let existing_keys = state.db.list_user_passkeys(user.id).unwrap_or_default();
+    let exclude: Vec<webauthn_rs::prelude::CredentialID> = existing_keys
+        .iter()
+        .filter_map(|row| serde_json::from_str::<webauthn_rs::prelude::Passkey>(&row.passkey_json).ok())
+        .map(|pk| pk.cred_id().clone())
+        .collect();
+    let exclude_opt = if exclude.is_empty() {
+        None
+    } else {
+        Some(exclude)
+    };
+
+    match state
+        .passkey
+        .start_registration(user.id, &user.username, &user.display_name, exclude_opt)
+    {
+        Ok(ccr) => Json(json!({ "options": ccr })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PasskeyRegFinishReq {
+    #[serde(default)]
+    device_name: String,
+    credential: webauthn_rs::prelude::RegisterPublicKeyCredential,
+}
+
+async fn api_passkey_register_finish(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<PasskeyRegFinishReq>,
+) -> Response {
+    let user = match gate_allow_setup(&state, &headers) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Unauthorized" })),
+            )
+                .into_response()
+        }
+    };
+    let ip = auth::client_ip(&headers);
+
+    let passkey = match state.passkey.finish_registration(user.id, &req.credential) {
+        Ok(pk) => pk,
+        Err(e) => {
+            state.db.audit(
+                &user.username,
+                "2fa.passkey.register",
+                "-",
+                &e,
+                &ip,
+                false,
+            );
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+        }
+    };
+
+    use base64::Engine;
+    let cred_id_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(passkey.cred_id());
+    let passkey_json = match serde_json::to_string(&passkey) {
+        Ok(j) => j,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to serialize passkey: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    let dev_name = if req.device_name.trim().is_empty() {
+        "Passkey".to_string()
+    } else {
+        req.device_name.trim().to_string()
+    };
+
+    match state
+        .db
+        .save_passkey(user.id, &cred_id_b64, &dev_name, &passkey_json, 0)
+    {
+        Ok(_) => {
+            state.db.audit(
+                &user.username,
+                "2fa.passkey.register",
+                &dev_name,
+                "Registered WebAuthn Passkey",
+                &ip,
+                true,
+            );
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Failed to save passkey: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct PasskeyAuthStartReq {
+    #[serde(default)]
+    #[allow(dead_code)]
+    pending_token: Option<String>,
+}
+
+async fn api_passkey_auth_start(
+    State(state): State<WebState>,
+    Json(_req): Json<PasskeyAuthStartReq>,
+) -> Response {
+    match state.passkey.start_discoverable_authentication() {
+        Ok(rcr) => Json(json!({ "options": rcr })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PasskeyAuthFinishReq {
+    #[serde(default)]
+    pending_token: Option<String>,
+    #[serde(default)]
+    next: Option<String>,
+    credential: webauthn_rs::prelude::PublicKeyCredential,
+}
+
+async fn api_passkey_auth_finish(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<PasskeyAuthFinishReq>,
+) -> Response {
+    let ip = auth::client_ip(&headers);
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let (claimed_uid, cred_id_b64) = match state.passkey.identify_credential(&req.credential) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+        }
+    };
+
+    // If this is a 2nd-factor verification against a pending_token, enforce that the
+    // passkey belongs to the same user who completed step 1 (password login).
+    let pending_user = if let Some(ref pt) = req.pending_token {
+        if !pt.trim().is_empty() {
+            let th = auth::token_hash(pt.trim());
+            match state.db.get_pending_2fa(&th).ok().flatten() {
+                Some((u, _)) => Some((u, th)),
+                None => {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "error": "2FA session expired. Please sign in again." })),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let target_uid = if let Some((ref pu, _)) = pending_user {
+        if claimed_uid > 0 && claimed_uid != pu.id {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "Passkey belongs to a different user account" })),
+            )
+                .into_response();
+        }
+        pu.id
+    } else {
+        claimed_uid
+    };
+
+    let stored_rows = if target_uid > 0 {
+        state.db.list_user_passkeys(target_uid).unwrap_or_default()
+    } else {
+        state
+            .db
+            .list_all_passkeys()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.credential_id == cred_id_b64)
+            .collect()
+    };
+
+    if stored_rows.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Unrecognized Passkey credential" })),
+        )
+            .into_response();
+    }
+
+    let resolved_user_id = stored_rows[0].user_id;
+    let Some(user_row) = state.db.get_user(resolved_user_id).ok().flatten() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Account not found" })),
+        )
+            .into_response();
+    };
+    if !user_row.active {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Account is disabled" })),
+        )
+            .into_response();
+    }
+
+    let mut passkeys: Vec<webauthn_rs::prelude::Passkey> = stored_rows
+        .iter()
+        .filter_map(|r| serde_json::from_str::<webauthn_rs::prelude::Passkey>(&r.passkey_json).ok())
+        .collect();
+    let discoverable: Vec<webauthn_rs::prelude::DiscoverableKey> =
+        passkeys.iter().map(|pk| pk.into()).collect();
+
+    let auth_result = match state
+        .passkey
+        .finish_discoverable_authentication(&req.credential, &discoverable)
+    {
+        Ok(res) => res,
+        Err(e) => {
+            state.db.audit(
+                &user_row.username,
+                "login.passkey",
+                "-",
+                &e,
+                &ip,
+                false,
+            );
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))).into_response();
+        }
+    };
+
+    // Update credential counter & last_used_at
+    for pk in passkeys.iter_mut() {
+        if pk.cred_id() == auth_result.cred_id() {
+            pk.update_credential(&auth_result);
+            if let Ok(updated_json) = serde_json::to_string(pk) {
+                let _ = state.db.update_passkey_usage(
+                    &cred_id_b64,
+                    auth_result.counter() as i64,
+                    &updated_json,
+                );
+            }
+            break;
+        }
+    }
+
+    if let Some((_, ref th)) = pending_user {
+        let _ = state.db.consume_pending_2fa(th);
+    }
+
+    match auth::mint_session_for_user(&state.db, user_row.id, &ip, &ua) {
+        Ok(session_token) => {
+            state.db.audit(
+                &user_row.username,
+                "login.passkey",
+                &cred_id_b64,
+                "Authenticated via Passkey",
+                &ip,
+                true,
+            );
+            let next_raw = req.next.unwrap_or_else(|| "/admin".to_string());
+            let redirect_url =
+                if next_raw.starts_with("/admin") && !next_raw.starts_with("/admin/login") {
+                    next_raw
+                } else {
+                    "/admin".to_string()
+                };
+            let mut resp = Json(json!({ "ok": true, "redirect": redirect_url })).into_response();
+            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&session_token)) {
+                resp.headers_mut().append(header::SET_COOKIE, value);
+            }
+            resp
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to create session: {e}") })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize, Default)]
 struct PageQuery {
     #[serde(default)]
     page: i64,
+    #[serde(default)]
+    tab: String,
+    #[serde(default)]
+    ok: Option<String>,
+    #[serde(default)]
+    msg: Option<String>,
 }
 
 async fn audit_page(
@@ -496,23 +1150,275 @@ async fn audit_page(
         Err(r) => return r,
     };
     let page = query.page.max(0);
-    let rows = state
-        .db
-        .list_audit(50, page * 50)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| pages::AuditCard {
-            ts: r.ts.replace('T', " ").chars().take(19).collect(),
-            username: r.username,
-            action: r.action,
-            target: r.target,
-            detail: r.detail,
-            ip: r.ip,
-            ok: r.ok,
-        })
-        .collect();
-    let total = state.db.count_audit().unwrap_or(0);
-    html(pages::audit_page(user, rows, page, total))
+    let tab = if query.tab.is_empty() {
+        "audit".to_string()
+    } else {
+        query.tab
+    };
+    let flash = query
+        .msg
+        .map(|m| (query.ok.as_deref().unwrap_or("1") == "1", m));
+    let log_settings = state.db.get_security_log_settings();
+    let log_file_path = crate::security_log::resolve_log_file_path(&state.config.db_path)
+        .display()
+        .to_string();
+
+    if tab == "inbound" || tab == "github" || tab == "notify" || tab == "http_all" {
+        let dir_filter = match tab.as_str() {
+            "inbound" => Some("INBOUND_API"),
+            "github" => Some("OUTBOUND_GITHUB"),
+            "notify" => Some("OUTBOUND_NOTIFY"),
+            _ => None,
+        };
+        let http_rows = state
+            .db
+            .list_security_http_logs(dir_filter, 50, page * 50)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| pages::SecurityHttpCard {
+                ts: r.ts.replace('T', " ").chars().take(19).collect(),
+                direction: r.direction,
+                method: r.method,
+                target: r.target,
+                status: r.status,
+                duration_ms: r.duration_ms,
+                ip: r.ip,
+                actor: r.actor,
+                detail: r.detail,
+            })
+            .collect();
+        let total = state.db.count_security_http_logs(dir_filter).unwrap_or(0);
+        html(pages::audit_page(
+            user,
+            tab,
+            Vec::new(),
+            http_rows,
+            page,
+            total,
+            log_file_path,
+            log_settings,
+            flash,
+        ))
+    } else {
+        let rows = state
+            .db
+            .list_audit(50, page * 50)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| pages::AuditCard {
+                ts: r.ts.replace('T', " ").chars().take(19).collect(),
+                username: r.username,
+                action: r.action,
+                target: r.target,
+                detail: r.detail,
+                ip: r.ip,
+                ok: r.ok,
+            })
+            .collect();
+        let total = state.db.count_audit().unwrap_or(0);
+        html(pages::audit_page(
+            user,
+            tab,
+            rows,
+            Vec::new(),
+            page,
+            total,
+            log_file_path,
+            log_settings,
+            flash,
+        ))
+    }
+}
+
+async fn save_audit_settings(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let tab = form.get("tab").cloned().unwrap_or_else(|| "audit".to_string());
+    let settings = crate::security_log::SecurityLogSettings {
+        admin_audit: form.contains_key("admin_audit"),
+        inbound_webhooks: form.contains_key("inbound_webhooks"),
+        inbound_admin: form.contains_key("inbound_admin"),
+        outbound_github: form.contains_key("outbound_github"),
+        outbound_lark: form.contains_key("outbound_lark"),
+        outbound_discord: form.contains_key("outbound_discord"),
+        outbound_zulip: form.contains_key("outbound_zulip"),
+        retention_days: form
+            .get("retention_days")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .clamp(0, 36500),
+    };
+    match state.db.set_security_log_settings(&settings) {
+        Ok(_) => {
+            state.db.audit(
+                &user.username,
+                "security.log_settings",
+                "-",
+                &format!(
+                    "admin_audit={} inbound_webhooks={} inbound_admin={} github={} lark={} discord={} zulip={} retention_days={}",
+                    settings.admin_audit,
+                    settings.inbound_webhooks,
+                    settings.inbound_admin,
+                    settings.outbound_github,
+                    settings.outbound_lark,
+                    settings.outbound_discord,
+                    settings.outbound_zulip,
+                    settings.retention_days
+                ),
+                &auth::client_ip(&headers),
+                true,
+            );
+            redirect(&format!(
+                "/admin/audit?tab={}&ok=1&msg={}",
+                urlencode(&tab),
+                urlencode("Saved security log collection settings")
+            ))
+        }
+        Err(e) => redirect(&format!(
+            "/admin/audit?tab={}&ok=0&msg={}",
+            urlencode(&tab),
+            urlencode(&format!("Failed to save logging settings: {e}"))
+        )),
+    }
+}
+
+async fn purge_audit_logs(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let tab = form.get("tab").cloned().unwrap_or_else(|| "http_all".to_string());
+    let days = form
+        .get("days")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(-1);
+    if days < 0 {
+        return redirect(&format!(
+            "/admin/audit?tab={}&ok=0&msg={}",
+            urlencode(&tab),
+            urlencode("Please enter a valid number of days (0 or more)")
+        ));
+    }
+    match state.db.purge_security_http_logs(days) {
+        Ok(n) => {
+            state.db.audit(
+                &user.username,
+                "security.log_purge",
+                "security_http_logs",
+                &format!("Deleted {n} rows older than {days} days"),
+                &auth::client_ip(&headers),
+                true,
+            );
+            redirect(&format!(
+                "/admin/audit?tab={}&ok=1&msg={}",
+                urlencode(&tab),
+                urlencode(&format!("Deleted {n} log records older than {days} days"))
+            ))
+        }
+        Err(e) => redirect(&format!(
+            "/admin/audit?tab={}&ok=0&msg={}",
+            urlencode(&tab),
+            urlencode(&format!("Failed to purge logs: {e}"))
+        )),
+    }
+}
+
+fn csv_cell(v: &str) -> String {
+    let mut s = v.to_string();
+    // Neutralise spreadsheet formula injection.
+    if matches!(s.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r')) {
+        s.insert(0, '\'');
+    }
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+async fn export_audit_csv(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<PageQuery>,
+) -> Response {
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let tab = if query.tab.is_empty() { "audit".to_string() } else { query.tab };
+    let mut out = String::new();
+    match tab.as_str() {
+        "inbound" | "github" | "notify" | "http_all" => {
+            let dir = match tab.as_str() {
+                "inbound" => Some("INBOUND_API"),
+                "github" => Some("OUTBOUND_GITHUB"),
+                "notify" => Some("OUTBOUND_NOTIFY"),
+                _ => None,
+            };
+            out.push_str("id,timestamp,direction,method,target,status,duration_ms,ip,actor,detail\n");
+            for r in state.db.list_security_http_logs(dir, 100_000, 0).unwrap_or_default() {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{}\n",
+                    r.id,
+                    csv_cell(&r.ts),
+                    csv_cell(&r.direction),
+                    csv_cell(&r.method),
+                    csv_cell(&r.target),
+                    r.status,
+                    r.duration_ms,
+                    csv_cell(&r.ip),
+                    csv_cell(&r.actor),
+                    csv_cell(&r.detail)
+                ));
+            }
+        }
+        _ => {
+            out.push_str("id,timestamp,username,action,target,detail,ip,result\n");
+            for r in state.db.list_audit(100_000, 0).unwrap_or_default() {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{}\n",
+                    r.id,
+                    csv_cell(&r.ts),
+                    csv_cell(&r.username),
+                    csv_cell(&r.action),
+                    csv_cell(&r.target),
+                    csv_cell(&r.detail),
+                    csv_cell(&r.ip),
+                    if r.ok { "success" } else { "denied" }
+                ));
+            }
+        }
+    }
+    state.db.audit(
+        &user.username,
+        "security.log_export",
+        &tab,
+        "Exported CSV",
+        &auth::client_ip(&headers),
+        true,
+    );
+    let filename = format!(
+        "sugie-{}-{}.csv",
+        tab,
+        Utc::now().format("%Y%m%d-%H%M%S")
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        out,
+    )
+        .into_response()
 }
 
 // --------------------------------------------------------------- api: exec
@@ -889,6 +1795,9 @@ fn build_user_cards(state: &WebState) -> Vec<pages::UserCard> {
             display_name: u.display_name,
             role: u.role,
             active: u.active,
+            totp_enabled: u.totp_enabled,
+            passkey_count: u.passkey_count,
+            two_fa_policy: u.two_fa_policy,
         })
         .collect()
 }
@@ -906,6 +1815,11 @@ async fn create_user(
     let password = form.get("password").cloned().unwrap_or_default();
     let role = form.get("role").cloned().unwrap_or_else(|| "viewer".into());
     let display = form.get("display_name").cloned().unwrap_or_default();
+    let two_fa_policy = if actor.is_owner() {
+        form.get("two_fa_policy").cloned().unwrap_or_else(|| "default".into())
+    } else {
+        "default".into()
+    };
 
     if username.len() < 3 {
         return users_flash(false, "Username must be at least 3 characters");
@@ -924,6 +1838,9 @@ async fn create_user(
 
     match state.db.create_user(&username, &hash, &role, &display) {
         Ok(id) => {
+            if actor.is_owner() && two_fa_policy != "default" {
+                let _ = state.db.set_user_two_fa_policy(id, &two_fa_policy);
+            }
             let repos: Vec<String> = form
                 .get("repos")
                 .map(|v| v.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
@@ -935,7 +1852,7 @@ async fn create_user(
                 &actor.username,
                 "user.create",
                 &username,
-                &format!("role={role}"),
+                &format!("role={role} 2fa_policy={two_fa_policy}"),
                 &auth::client_ip(&headers),
                 true,
             );
@@ -978,6 +1895,12 @@ async fn update_user(
         return users_flash(false, &format!("Failed to update user: {e}"));
     }
 
+    if actor.is_owner() {
+        if let Some(policy) = form.get("two_fa_policy") {
+            let _ = state.db.set_user_two_fa_policy(id, policy);
+        }
+    }
+
     if let Some(repos) = form.get("repos") {
         let list: Vec<String> = repos
             .lines()
@@ -1017,6 +1940,80 @@ async fn update_user(
         true,
     );
     users_flash(true, &format!("Updated user {}", target.username))
+}
+
+async fn toggle_global_2fa(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let actor = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if !actor.is_owner() {
+        return users_flash(false, "Only owners can change the global 2FA policy");
+    }
+    let enabled = form.get("enabled").map(|v| v == "1" || v == "true").unwrap_or(false);
+    match state.db.set_global_2fa_enabled(enabled) {
+        Ok(_) => {
+            state.db.audit(
+                &actor.username,
+                "2fa.global_policy",
+                "-",
+                &format!("global_2fa_required={enabled}"),
+                &auth::client_ip(&headers),
+                true,
+            );
+            users_flash(
+                true,
+                if enabled {
+                    "Global 2FA requirement enabled for all users"
+                } else {
+                    "Global 2FA requirement disabled"
+                },
+            )
+        }
+        Err(e) => users_flash(false, &format!("Failed to update global 2FA policy: {e}")),
+    }
+}
+
+async fn reset_user_2fa(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let actor = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(id) = form.get("id").and_then(|v| v.parse::<i64>().ok()) else {
+        return users_flash(false, "Missing user ID");
+    };
+    let Some(target) = state.db.get_user(id).ok().flatten() else {
+        return users_flash(false, "User not found");
+    };
+    if target.role == "owner" && !actor.is_owner() {
+        return users_flash(false, "Only owners can reset 2FA for owner accounts");
+    }
+
+    match state.db.reset_user_2fa(id) {
+        Ok(_) => {
+            state.db.audit(
+                &actor.username,
+                "user.reset_2fa",
+                &target.username,
+                "Cleared TOTP and Passkeys",
+                &auth::client_ip(&headers),
+                true,
+            );
+            users_flash(
+                true,
+                &format!("Reset 2FA credentials for {}", target.username),
+            )
+        }
+        Err(e) => users_flash(false, &format!("Failed to reset 2FA: {e}")),
+    }
 }
 
 async fn delete_user(
@@ -1084,6 +2081,10 @@ fn config_flash(ok: bool, msg: &str) -> Response {
 
 fn users_flash(ok: bool, msg: &str) -> Response {
     flash_to("/admin/users", ok, msg)
+}
+
+fn security_flash(ok: bool, msg: &str) -> Response {
+    flash_to("/admin/security", ok, msg)
 }
 
 fn flash_to(path: &str, ok: bool, msg: &str) -> Response {

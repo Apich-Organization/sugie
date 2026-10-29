@@ -55,6 +55,47 @@ impl GitHubClient {
         &self.token
     }
 
+    async fn send_logged(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        let start = std::time::Instant::now();
+        let detail = payload
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        let mut req = self.http.request(method.clone(), url);
+        if let Some(body) = payload {
+            req = req.json(body);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let ms = start.elapsed().as_millis() as u64;
+                crate::security_log::log_github_request(
+                    method.as_str(),
+                    url,
+                    status,
+                    ms,
+                    &detail,
+                );
+                Ok(resp)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_millis() as u64;
+                crate::security_log::log_github_request(
+                    method.as_str(),
+                    url,
+                    0,
+                    ms,
+                    &format!("error={e} {detail}"),
+                );
+                Err(e.into())
+            }
+        }
+    }
+
     // --- Issues API ---
 
     pub async fn get_issue(&self, owner: &str, repo: &str, issue_number: u64) -> Result<Issue> {
@@ -62,7 +103,10 @@ impl GitHubClient {
             "{}/repos/{}/{}/issues/{}",
             self.base_url, owner, repo, issue_number
         );
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         let issue = resp.json::<Issue>().await?;
         Ok(issue)
     }
@@ -91,10 +135,7 @@ impl GitHubClient {
         }
 
         let resp = self
-            .http
-            .post(&url)
-            .json(&payload)
-            .send()
+            .send_logged(reqwest::Method::POST, &url, Some(&payload))
             .await?
             .error_for_status()?;
         let issue = resp.json::<Issue>().await?;
@@ -117,10 +158,7 @@ impl GitHubClient {
         if let Some(reason) = state_reason {
             payload["state_reason"] = json!(reason);
         }
-        self.http
-            .patch(&url)
-            .json(&payload)
-            .send()
+        self.send_logged(reqwest::Method::PATCH, &url, Some(&payload))
             .await?
             .error_for_status()?;
         Ok(())
@@ -139,10 +177,7 @@ impl GitHubClient {
         );
         let payload = json!({ "body": body });
         let resp = self
-            .http
-            .post(&url)
-            .json(&payload)
-            .send()
+            .send_logged(reqwest::Method::POST, &url, Some(&payload))
             .await?
             .error_for_status()?;
         let comment = resp.json::<Comment>().await?;
@@ -161,10 +196,7 @@ impl GitHubClient {
             self.base_url, owner, repo, comment_id
         );
         let payload = json!({ "body": body });
-        self.http
-            .patch(&url)
-            .json(&payload)
-            .send()
+        self.send_logged(reqwest::Method::PATCH, &url, Some(&payload))
             .await?
             .error_for_status()?;
         Ok(())
@@ -180,7 +212,10 @@ impl GitHubClient {
             "{}/repos/{}/{}/issues/{}/comments?per_page=100",
             self.base_url, owner, repo, issue_number
         );
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         let comments = resp.json::<Vec<Comment>>().await?;
         Ok(comments)
     }
@@ -200,10 +235,7 @@ impl GitHubClient {
             self.base_url, owner, repo, issue_number
         );
         let payload = json!({ "labels": labels });
-        self.http
-            .post(&url)
-            .json(&payload)
-            .send()
+        self.send_logged(reqwest::Method::POST, &url, Some(&payload))
             .await?
             .error_for_status()?;
         Ok(())
@@ -220,7 +252,7 @@ impl GitHubClient {
             "{}/repos/{}/{}/issues/{}/labels/{}",
             self.base_url, owner, repo, issue_number, label
         );
-        let _ = self.http.delete(&url).send().await;
+        let _ = self.send_logged(reqwest::Method::DELETE, &url, None).await;
         Ok(())
     }
 
@@ -239,10 +271,7 @@ impl GitHubClient {
             self.base_url, owner, repo, issue_number
         );
         let payload = json!({ "assignees": assignees });
-        self.http
-            .post(&url)
-            .json(&payload)
-            .send()
+        self.send_logged(reqwest::Method::POST, &url, Some(&payload))
             .await?
             .error_for_status()?;
         Ok(())
@@ -263,10 +292,7 @@ impl GitHubClient {
             self.base_url, owner, repo, issue_number
         );
         let payload = json!({ "assignees": assignees });
-        self.http
-            .delete(&url)
-            .json(&payload)
-            .send()
+        self.send_logged(reqwest::Method::DELETE, &url, Some(&payload))
             .await?
             .error_for_status()?;
         Ok(())
@@ -287,10 +313,7 @@ impl GitHubClient {
         if let Some(r) = lock_reason {
             payload["lock_reason"] = json!(r);
         }
-        self.http
-            .put(&url)
-            .json(&payload)
-            .send()
+        self.send_logged(reqwest::Method::PUT, &url, Some(&payload))
             .await?
             .error_for_status()?;
         Ok(())
@@ -307,7 +330,10 @@ impl GitHubClient {
             "{}/repos/{}/{}/issues?state={}&per_page={}&sort=updated&direction=desc",
             self.base_url, owner, repo, state, per_page
         );
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         let issues = resp.json::<Vec<Issue>>().await?;
         Ok(issues)
     }
@@ -324,7 +350,10 @@ impl GitHubClient {
             "{}/repos/{}/{}/pulls/{}",
             self.base_url, owner, repo, pr_number
         );
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         let pr = resp.json::<PullRequest>().await?;
         Ok(pr)
     }
@@ -339,7 +368,10 @@ impl GitHubClient {
             "{}/repos/{}/{}/pulls/{}/files?per_page=100",
             self.base_url, owner, repo, pr_number
         );
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         let files = resp.json::<Vec<PullRequestFile>>().await?;
         Ok(files)
     }
@@ -354,7 +386,10 @@ impl GitHubClient {
             "{}/repos/{}/{}/pulls/{}/commits?per_page=100",
             self.base_url, owner, repo, pr_number
         );
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         let commits = resp.json::<Vec<CommitItem>>().await?;
         Ok(commits)
     }
@@ -374,10 +409,7 @@ impl GitHubClient {
             self.base_url, owner, repo, pr_number
         );
         let payload = json!({ "reviewers": reviewers });
-        self.http
-            .post(&url)
-            .json(&payload)
-            .send()
+        self.send_logged(reqwest::Method::POST, &url, Some(&payload))
             .await?
             .error_for_status()?;
         Ok(())
@@ -398,10 +430,7 @@ impl GitHubClient {
             self.base_url, owner, repo, pr_number
         );
         let payload = json!({ "reviewers": reviewers });
-        self.http
-            .delete(&url)
-            .json(&payload)
-            .send()
+        self.send_logged(reqwest::Method::DELETE, &url, Some(&payload))
             .await?
             .error_for_status()?;
         Ok(())
@@ -418,7 +447,10 @@ impl GitHubClient {
             "{}/repos/{}/{}/pulls?state={}&per_page={}&sort=updated&direction=desc",
             self.base_url, owner, repo, state, per_page
         );
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         let pulls = resp.json::<Vec<PullRequest>>().await?;
         Ok(pulls)
     }
@@ -447,10 +479,7 @@ impl GitHubClient {
         if let Some(target) = target_url {
             payload["target_url"] = json!(target);
         }
-        self.http
-            .post(&url)
-            .json(&payload)
-            .send()
+        self.send_logged(reqwest::Method::POST, &url, Some(&payload))
             .await?
             .error_for_status()?;
         Ok(())
@@ -468,7 +497,10 @@ impl GitHubClient {
             "{}/repos/{}/{}/commits/{}/check-runs",
             self.base_url, owner, repo, git_ref
         );
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         let data = resp.json::<CheckRunsResponse>().await?;
         Ok(data.check_runs)
     }
@@ -483,7 +515,9 @@ impl GitHubClient {
             "{}/repos/{}/{}/check-suites/{}/rerequest",
             self.base_url, owner, repo, check_suite_id
         );
-        self.http.post(&url).send().await?.error_for_status()?;
+        self.send_logged(reqwest::Method::POST, &url, None)
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -498,7 +532,10 @@ impl GitHubClient {
             "{}/repos/{}/{}/commits/{}/check-suites?per_page=50",
             self.base_url, owner, repo, git_ref
         );
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         let data: serde_json::Value = resp.json().await?;
         Ok(data
             .get("check_suites")
@@ -512,7 +549,10 @@ impl GitHubClient {
     /// Raw repository payload: stars, forks, open issue counters, default branch.
     pub async fn get_repo(&self, owner: &str, repo: &str) -> Result<serde_json::Value> {
         let url = format!("{}/repos/{}/{}", self.base_url, owner, repo);
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         Ok(resp.json::<serde_json::Value>().await?)
     }
 
@@ -531,7 +571,10 @@ impl GitHubClient {
         if let Some(since) = since {
             url.push_str(&format!("&since={}", since));
         }
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
         Ok(resp.json::<Vec<serde_json::Value>>().await?)
     }
 
@@ -552,7 +595,7 @@ impl GitHubClient {
             url.push_str(&format!("?ref={}", r));
         }
 
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.send_logged(reqwest::Method::GET, &url, None).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -596,10 +639,7 @@ impl GitHubClient {
         });
 
         let resp = self
-            .http
-            .post(&url)
-            .json(&payload)
-            .send()
+            .send_logged(reqwest::Method::POST, &url, Some(&payload))
             .await?
             .error_for_status()?;
         let result = resp.json::<GraphQLResponse<T>>().await?;

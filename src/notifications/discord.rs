@@ -85,19 +85,47 @@ impl DiscordNotifier {
             payload["avatar_url"] = json!(avatar);
         }
 
-        let resp = self
-            .http
-            .post(target_url)
-            .json(&payload)
-            .send()
-            .await
-            .context("Failed to send webhook to Discord")?;
+        let started = std::time::Instant::now();
+        let send_res = self.http.post(target_url).json(&payload).send().await;
+        let duration_ms = started.elapsed().as_millis() as u64;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let resp = match send_res {
+            Ok(r) => r,
+            Err(e) => {
+                crate::security_log::log_notification_request(
+                    "discord",
+                    "POST",
+                    target_url,
+                    0,
+                    duration_ms,
+                    &format!("title={title} error={e}"),
+                );
+                return Err(e).context("Failed to send webhook to Discord");
+            }
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            crate::security_log::log_notification_request(
+                "discord",
+                "POST",
+                target_url,
+                status.as_u16(),
+                duration_ms,
+                &format!("title={title} error={body}"),
+            );
             anyhow::bail!("Discord webhook failed with HTTP {}: {}", status, body);
         }
+
+        crate::security_log::log_notification_request(
+            "discord",
+            "POST",
+            target_url,
+            status.as_u16(),
+            duration_ms,
+            &format!("title={title} is_report={is_report}"),
+        );
 
         Ok(())
     }

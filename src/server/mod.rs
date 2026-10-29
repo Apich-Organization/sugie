@@ -29,6 +29,7 @@ pub fn create_router(state: AppState) -> Router {
 
 /// Build the bot router and optionally mount the admin console at `/admin`.
 pub fn create_router_with_web(state: AppState, web: Option<crate::web::WebState>) -> Router {
+    let web_db = web.as_ref().map(|w| w.db.clone());
     let router = Router::new()
         .route("/health", get(health_check))
         .route("/status", get(status_check))
@@ -38,13 +39,97 @@ pub fn create_router_with_web(state: AppState, web: Option<crate::web::WebState>
         .route("/api/chat/lark", post(chat::lark_chat_handler))
         .route("/api/chat/discord", post(chat::discord_chat_handler))
         .route("/api/chat/command", post(chat::generic_chat_command_handler))
-        .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    match web {
+    let merged = match web {
         Some(web_state) => router.merge(crate::web::router(web_state)),
         None => router,
+    };
+
+    merged
+        .layer(axum::middleware::from_fn_with_state(
+            web_db,
+            security_http_log_middleware,
+        ))
+        .layer(TraceLayer::new_for_http())
+}
+
+async fn security_http_log_middleware(
+    State(web_db): State<Option<crate::web::db::WebDb>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_string();
+    // Skip static assets to keep security review logs focused on API/webhook/admin requests
+    let skip_log = path.starts_with("/admin/assets/") || path == "/favicon.ico";
+
+    let method = req.method().as_str().to_string();
+    let uri = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| path.clone());
+
+    let headers = req.headers();
+    let ip = crate::web::auth::client_ip(headers);
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let gh_event = headers
+        .get("X-GitHub-Event")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let gh_delivery = headers
+        .get("X-GitHub-Delivery")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let actor = if gh_event.is_some() {
+        "github-webhook".to_string()
+    } else if path.starts_with("/api/chat/discord") {
+        "discord-webhook".to_string()
+    } else if path.starts_with("/api/chat/lark") {
+        "lark-webhook".to_string()
+    } else if path.starts_with("/api/chat/zulip") {
+        "zulip-webhook".to_string()
+    } else if let Some(ref db) = web_db {
+        crate::web::auth::current_user(db, headers)
+            .map(|u| u.username)
+            .unwrap_or_else(|| "anonymous".to_string())
+    } else {
+        "anonymous".to_string()
+    };
+
+    let mut detail_parts = Vec::new();
+    if let Some(ev) = gh_event {
+        detail_parts.push(format!("github_event={ev}"));
     }
+    if let Some(del) = gh_delivery {
+        detail_parts.push(format!("delivery={del}"));
+    }
+    if ua != "-" && !ua.is_empty() {
+        detail_parts.push(format!("ua={ua}"));
+    }
+    let detail = detail_parts.join(" ");
+
+    let start = std::time::Instant::now();
+    let resp = next.run(req).await;
+    if !skip_log {
+        let status = resp.status().as_u16();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        crate::security_log::log_inbound_http(
+            &method,
+            &uri,
+            status,
+            duration_ms,
+            &ip,
+            &actor,
+            &detail,
+        );
+    }
+    resp
 }
 
 async fn health_check() -> impl IntoResponse {

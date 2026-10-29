@@ -38,6 +38,11 @@ leptos = { version = "0.8", features = ["ssr"] }
 argon2 = "0.5"
 toml_edit = "0.22"
 async-stream = "0.3"
+totp-rs = { version = "6.0", features = ["qr", "gen_secret", "otpauth"] }
+qrcodegen-image = "1.5"
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3.13"

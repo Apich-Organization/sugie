@@ -1,5 +1,5 @@
 //! Persistent storage for the admin console: users, sessions, per-repo ACLs,
-//! per-command grants and the audit trail.
+//! per-command grants, 2FA (TOTP + WebAuthn passkeys), and the audit trail.
 //!
 //! Tables are namespaced with `web_` and live in the same SQLite file as the
 //! bot's own storage, so operations only ever have to back up one file.
@@ -7,8 +7,11 @@
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+pub const KEY_GLOBAL_2FA_ENABLED: &str = "global_2fa_enabled";
 
 #[derive(Clone)]
 pub struct WebDb {
@@ -24,6 +27,44 @@ pub struct UserRow {
     pub active: bool,
     pub created_at: String,
     pub last_login: Option<String>,
+    pub totp_enabled: bool,
+    /// `"default"` (follow global setting), `"required"` (always enforce 2FA), or `"disabled"` (exempt from 2FA).
+    pub two_fa_policy: String,
+    pub passkey_count: i64,
+}
+
+impl UserRow {
+    pub fn has_2fa_enrolled(&self) -> bool {
+        self.totp_enabled || self.passkey_count > 0
+    }
+
+    pub fn is_2fa_disabled(&self) -> bool {
+        self.two_fa_policy == "disabled"
+    }
+
+    pub fn is_2fa_required(&self, global_2fa: bool) -> bool {
+        match self.two_fa_policy.as_str() {
+            "required" => true,
+            "disabled" => false,
+            _ => global_2fa,
+        }
+    }
+
+    pub fn needs_2fa_setup(&self, global_2fa: bool) -> bool {
+        self.is_2fa_required(global_2fa) && !self.has_2fa_enrolled()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PasskeyRow {
+    pub id: i64,
+    pub user_id: i64,
+    pub credential_id: String,
+    pub device_name: String,
+    pub passkey_json: String,
+    pub counter: i64,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +78,13 @@ pub struct AuditRow {
     pub ip: String,
     pub ok: bool,
 }
+
+const USER_SELECT_SQL: &str = "
+    SELECT u.id, u.username, u.display_name, u.role, u.active, u.created_at, u.last_login,
+           u.totp_enabled, u.two_fa_policy,
+           (SELECT COUNT(*) FROM web_passkeys p WHERE p.user_id = u.id) AS passkey_count
+    FROM web_users u
+";
 
 impl WebDb {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -77,7 +125,10 @@ impl WebDb {
                 display_name TEXT NOT NULL DEFAULT '',
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
-                last_login TEXT
+                last_login TEXT,
+                totp_secret TEXT NOT NULL DEFAULT '',
+                totp_enabled INTEGER NOT NULL DEFAULT 0,
+                two_fa_policy TEXT NOT NULL DEFAULT 'default'
             );
 
             CREATE TABLE IF NOT EXISTS web_sessions (
@@ -87,6 +138,35 @@ impl WebDb {
                 expires_at TEXT NOT NULL,
                 ip TEXT NOT NULL DEFAULT '',
                 user_agent TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS web_pending_2fa (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                next_url TEXT NOT NULL DEFAULT '/admin',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                ip TEXT NOT NULL DEFAULT '',
+                user_agent TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS web_passkeys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                credential_id TEXT UNIQUE NOT NULL,
+                device_name TEXT NOT NULL DEFAULT 'Passkey',
+                passkey_json TEXT NOT NULL,
+                counter INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_web_passkeys_user ON web_passkeys(user_id);
+
+            CREATE TABLE IF NOT EXISTS web_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS web_repo_perms (
@@ -113,8 +193,43 @@ impl WebDb {
             );
 
             CREATE INDEX IF NOT EXISTS idx_web_audit_ts ON web_audit(ts DESC);
+
+            CREATE TABLE IF NOT EXISTS security_http_logs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          TEXT NOT NULL,
+                direction   TEXT NOT NULL,
+                method      TEXT NOT NULL,
+                target      TEXT NOT NULL,
+                status      INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                ip          TEXT NOT NULL DEFAULT '-',
+                actor       TEXT NOT NULL DEFAULT '-',
+                detail      TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_sec_http_logs_ts ON security_http_logs (id DESC);
+            CREATE INDEX IF NOT EXISTS idx_sec_http_logs_dir ON security_http_logs (direction, id DESC);
             "#,
         )?;
+
+        // Idempotent column migrations for existing databases
+        let _ = conn.execute(
+            "ALTER TABLE web_users ADD COLUMN totp_secret TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE web_users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE web_users ADD COLUMN two_fa_policy TEXT NOT NULL DEFAULT 'default'",
+            [],
+        );
+
+        // Seed default global 2FA policy (enabled by default so first-time logins prompt 2FA setup)
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO web_settings (key, value, updated_at) VALUES (?1, 'true', ?2)",
+            params![KEY_GLOBAL_2FA_ENABLED, Utc::now().to_rfc3339()],
+        );
 
         // Auto-migrate legacy Chinese defaults from early database initializations
         let _ = conn.execute(
@@ -126,6 +241,69 @@ impl WebDb {
             [],
         );
 
+        Ok(())
+    }
+
+    // ------------------------------------------------------------- settings
+
+    pub fn is_global_2fa_enabled(&self) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT value FROM web_settings WHERE key = ?1",
+            params![KEY_GLOBAL_2FA_ENABLED],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(true)
+    }
+
+    pub fn set_global_2fa_enabled(&self, enabled: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO web_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![
+                KEY_GLOBAL_2FA_ENABLED,
+                if enabled { "true" } else { "false" },
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_security_log_settings(&self) -> crate::security_log::SecurityLogSettings {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT value FROM web_settings WHERE key = ?1",
+            params![crate::security_log::KEY_SECURITY_LOG_SETTINGS],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str::<crate::security_log::SecurityLogSettings>(&v).ok())
+        .unwrap_or_default()
+    }
+
+    pub fn set_security_log_settings(
+        &self,
+        settings: &crate::security_log::SecurityLogSettings,
+    ) -> Result<()> {
+        let json_str = serde_json::to_string(settings)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO web_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![
+                crate::security_log::KEY_SECURITY_LOG_SETTINGS,
+                json_str,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        crate::security_log::apply_settings(*settings);
         Ok(())
     }
 
@@ -144,38 +322,38 @@ impl WebDb {
         role: &str,
         display_name: &str,
     ) -> Result<i64> {
+        self.create_user_with_policy(username, password_hash, role, display_name, "default")
+    }
+
+    pub fn create_user_with_policy(
+        &self,
+        username: &str,
+        password_hash: &str,
+        role: &str,
+        display_name: &str,
+        two_fa_policy: &str,
+    ) -> Result<i64> {
+        let policy = normalize_policy(two_fa_policy);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO web_users (username, password_hash, role, display_name, active, created_at)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5)",
-            params![username, password_hash, role, display_name, Utc::now().to_rfc3339()],
+            "INSERT INTO web_users (username, password_hash, role, display_name, active, created_at, two_fa_policy)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
+            params![username, password_hash, role, display_name, Utc::now().to_rfc3339(), policy],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
     pub fn find_user(&self, username: &str) -> Result<Option<UserRow>> {
         let conn = self.conn.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT id, username, display_name, role, active, created_at, last_login
-                 FROM web_users WHERE username = ?1 COLLATE NOCASE",
-                params![username],
-                map_user,
-            )
-            .optional()?;
+        let sql = format!("{USER_SELECT_SQL} WHERE u.username = ?1 COLLATE NOCASE");
+        let row = conn.query_row(&sql, params![username], map_user).optional()?;
         Ok(row)
     }
 
     pub fn get_user(&self, id: i64) -> Result<Option<UserRow>> {
         let conn = self.conn.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT id, username, display_name, role, active, created_at, last_login
-                 FROM web_users WHERE id = ?1",
-                params![id],
-                map_user,
-            )
-            .optional()?;
+        let sql = format!("{USER_SELECT_SQL} WHERE u.id = ?1");
+        let row = conn.query_row(&sql, params![id], map_user).optional()?;
         Ok(row)
     }
 
@@ -193,21 +371,35 @@ impl WebDb {
 
     pub fn list_users(&self) -> Result<Vec<UserRow>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, username, display_name, role, active, created_at, last_login
-             FROM web_users ORDER BY id ASC",
-        )?;
+        let sql = format!("{USER_SELECT_SQL} ORDER BY u.id ASC");
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map([], map_user)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    pub fn update_user_profile(&self, id: i64, role: &str, display_name: &str, active: bool) -> Result<()> {
+    pub fn update_user_profile(
+        &self,
+        id: i64,
+        role: &str,
+        display_name: &str,
+        active: bool,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE web_users SET role = ?2, display_name = ?3, active = ?4 WHERE id = ?1",
             params![id, role, display_name, active as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_user_two_fa_policy(&self, id: i64, policy: &str) -> Result<()> {
+        let p = normalize_policy(policy);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE web_users SET two_fa_policy = ?2 WHERE id = ?1",
+            params![id, p],
         )?;
         Ok(())
     }
@@ -226,6 +418,8 @@ impl WebDb {
         conn.execute("DELETE FROM web_repo_perms WHERE user_id = ?1", params![id])?;
         conn.execute("DELETE FROM web_command_perms WHERE user_id = ?1", params![id])?;
         conn.execute("DELETE FROM web_sessions WHERE user_id = ?1", params![id])?;
+        conn.execute("DELETE FROM web_pending_2fa WHERE user_id = ?1", params![id])?;
+        conn.execute("DELETE FROM web_passkeys WHERE user_id = ?1", params![id])?;
         conn.execute("DELETE FROM web_users WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -237,6 +431,130 @@ impl WebDb {
             params![id, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    // --------------------------------------------------------- 2FA: TOTP
+
+    pub fn get_totp_secret(&self, user_id: i64) -> Result<Option<(String, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT totp_secret, totp_enabled FROM web_users WHERE id = ?1",
+                params![user_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? == 1)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn activate_totp(&self, user_id: i64, secret: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE web_users SET totp_secret = ?2, totp_enabled = 1 WHERE id = ?1",
+            params![user_id, secret],
+        )?;
+        Ok(())
+    }
+
+    pub fn disable_totp(&self, user_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE web_users SET totp_secret = '', totp_enabled = 0 WHERE id = ?1",
+            params![user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn reset_user_2fa(&self, user_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE web_users SET totp_secret = '', totp_enabled = 0 WHERE id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM web_passkeys WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        Ok(())
+    }
+
+    // --------------------------------------------------------- 2FA: Passkeys
+
+    pub fn list_user_passkeys(&self, user_id: i64) -> Result<Vec<PasskeyRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, user_id, credential_id, device_name, passkey_json, counter, created_at, last_used_at
+             FROM web_passkeys WHERE user_id = ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id], map_passkey)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_all_passkeys(&self) -> Result<Vec<PasskeyRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, user_id, credential_id, device_name, passkey_json, counter, created_at, last_used_at
+             FROM web_passkeys ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], map_passkey)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn save_passkey(
+        &self,
+        user_id: i64,
+        credential_id: &str,
+        device_name: &str,
+        passkey_json: &str,
+        counter: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO web_passkeys (user_id, credential_id, device_name, passkey_json, counter, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                user_id,
+                credential_id,
+                device_name,
+                passkey_json,
+                counter,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn update_passkey_usage(
+        &self,
+        credential_id: &str,
+        counter: i64,
+        passkey_json: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE web_passkeys SET counter = ?2, passkey_json = ?3, last_used_at = ?4
+             WHERE credential_id = ?1",
+            params![
+                credential_id,
+                counter,
+                passkey_json,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_passkey(&self, id: i64, user_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "DELETE FROM web_passkeys WHERE id = ?1 AND user_id = ?2",
+            params![id, user_id],
+        )?;
+        Ok(affected > 0)
     }
 
     // ------------------------------------------------------------- sessions
@@ -294,14 +612,8 @@ impl WebDb {
             return Ok(None);
         }
 
-        let row = conn
-            .query_row(
-                "SELECT id, username, display_name, role, active, created_at, last_login
-                 FROM web_users WHERE id = ?1",
-                params![user_id],
-                map_user,
-            )
-            .optional()?;
+        let sql = format!("{USER_SELECT_SQL} WHERE u.id = ?1");
+        let row = conn.query_row(&sql, params![user_id], map_user).optional()?;
         Ok(row.filter(|u| u.active))
     }
 
@@ -316,11 +628,89 @@ impl WebDb {
 
     pub fn purge_sessions(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute("DELETE FROM web_sessions WHERE expires_at < ?1", params![now])?;
         conn.execute(
-            "DELETE FROM web_sessions WHERE expires_at < ?1",
-            params![Utc::now().to_rfc3339()],
+            "DELETE FROM web_pending_2fa WHERE expires_at < ?1",
+            params![now],
         )?;
         Ok(())
+    }
+
+    // --------------------------------------------------------- pending 2FA
+
+    pub fn create_pending_2fa(
+        &self,
+        token_hash: &str,
+        user_id: i64,
+        next_url: &str,
+        ip: &str,
+        user_agent: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        let expires = now + chrono::Duration::minutes(5);
+        conn.execute(
+            "DELETE FROM web_pending_2fa WHERE expires_at < ?1",
+            params![now.to_rfc3339()],
+        )?;
+        conn.execute(
+            "INSERT INTO web_pending_2fa (token_hash, user_id, next_url, created_at, expires_at, ip, user_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                token_hash,
+                user_id,
+                next_url,
+                now.to_rfc3339(),
+                expires.to_rfc3339(),
+                ip,
+                user_agent
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_pending_2fa(&self, token_hash: &str) -> Result<Option<(UserRow, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let found: Option<(String, i64, String)> = conn
+            .query_row(
+                "SELECT expires_at, user_id, next_url FROM web_pending_2fa WHERE token_hash = ?1",
+                params![token_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((expires_at, user_id, next_url)) = found else {
+            return Ok(None);
+        };
+
+        let expired = chrono::DateTime::parse_from_rfc3339(&expires_at)
+            .map(|d| d.with_timezone(&Utc) < Utc::now())
+            .unwrap_or(true);
+
+        if expired {
+            conn.execute(
+                "DELETE FROM web_pending_2fa WHERE token_hash = ?1",
+                params![token_hash],
+            )?;
+            return Ok(None);
+        }
+
+        let sql = format!("{USER_SELECT_SQL} WHERE u.id = ?1");
+        let row = conn.query_row(&sql, params![user_id], map_user).optional()?;
+        Ok(row.filter(|u| u.active).map(|u| (u, next_url)))
+    }
+
+    pub fn consume_pending_2fa(&self, token_hash: &str) -> Result<Option<(UserRow, String)>> {
+        let res = self.get_pending_2fa(token_hash)?;
+        if res.is_some() {
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute(
+                "DELETE FROM web_pending_2fa WHERE token_hash = ?1",
+                params![token_hash],
+            );
+        }
+        Ok(res)
     }
 
     // --------------------------------------------------------------- perms
@@ -387,6 +777,10 @@ impl WebDb {
         ip: &str,
         ok: bool,
     ) {
+        if action != "security.log_settings" && !crate::security_log::current_settings().admin_audit
+        {
+            return;
+        }
         // Audit must never take down a request path.
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
@@ -432,6 +826,96 @@ impl WebDb {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM web_audit", [], |r| r.get(0))?;
         Ok(n)
     }
+
+    pub fn list_security_http_logs(
+        &self,
+        direction: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SecurityHttpRow>> {
+        let conn = self.conn.lock().unwrap();
+        let map_row = |r: &rusqlite::Row<'_>| {
+            Ok(SecurityHttpRow {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                direction: r.get(2)?,
+                method: r.get(3)?,
+                target: r.get(4)?,
+                status: r.get(5)?,
+                duration_ms: r.get(6)?,
+                ip: r.get(7)?,
+                actor: r.get(8)?,
+                detail: r.get(9)?,
+            })
+        };
+        if let Some(dir) = direction {
+            let mut stmt = conn.prepare(
+                "SELECT id, ts, direction, method, target, status, duration_ms, ip, actor, detail
+                 FROM security_http_logs WHERE direction = ?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
+            )?;
+            let rows = stmt
+                .query_map(params![dir, limit, offset], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, ts, direction, method, target, status, duration_ms, ip, actor, detail
+                 FROM security_http_logs ORDER BY id DESC LIMIT ?1 OFFSET ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![limit, offset], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        }
+    }
+
+    /// Deletes security HTTP log rows older than `days` days; returns the number removed.
+    pub fn purge_security_http_logs(&self, days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days.max(0))).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM security_http_logs WHERE ts < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
+
+    pub fn count_security_http_logs(&self, direction: Option<&str>) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(dir) = direction {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM security_http_logs WHERE direction = ?1",
+                params![dir],
+                |r| r.get(0),
+            )?;
+            Ok(n)
+        } else {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM security_http_logs", [], |r| r.get(0))?;
+            Ok(n)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SecurityHttpRow {
+    pub id: i64,
+    pub ts: String,
+    pub direction: String,
+    pub method: String,
+    pub target: String,
+    pub status: i64,
+    pub duration_ms: i64,
+    pub ip: String,
+    pub actor: String,
+    pub detail: String,
+}
+
+pub fn normalize_policy(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "required" | "enforce" | "true" | "1" => "required",
+        "disabled" | "exempt" | "false" | "0" => "disabled",
+        _ => "default",
+    }
 }
 
 fn map_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
@@ -443,6 +927,22 @@ fn map_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
         active: r.get::<_, i64>(4)? == 1,
         created_at: r.get(5)?,
         last_login: r.get(6)?,
+        totp_enabled: r.get::<_, i64>(7)? == 1,
+        two_fa_policy: r.get::<_, String>(8).unwrap_or_else(|_| "default".to_string()),
+        passkey_count: r.get::<_, i64>(9).unwrap_or(0),
+    })
+}
+
+fn map_passkey(r: &rusqlite::Row<'_>) -> rusqlite::Result<PasskeyRow> {
+    Ok(PasskeyRow {
+        id: r.get(0)?,
+        user_id: r.get(1)?,
+        credential_id: r.get(2)?,
+        device_name: r.get(3)?,
+        passkey_json: r.get(4)?,
+        counter: r.get(5)?,
+        created_at: r.get(6)?,
+        last_used_at: r.get(7)?,
     })
 }
 

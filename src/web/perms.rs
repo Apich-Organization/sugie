@@ -50,10 +50,15 @@ pub struct CurrentUser {
     pub role: Role,
     pub repos: Vec<String>,
     pub commands: Vec<String>,
+    pub totp_enabled: bool,
+    pub two_fa_policy: String,
+    pub passkey_count: i64,
+    pub needs_2fa_setup: bool,
 }
 
 impl CurrentUser {
-    pub fn from_row(row: UserRow, repos: Vec<String>, commands: Vec<String>) -> Self {
+    pub fn from_row(row: UserRow, repos: Vec<String>, commands: Vec<String>, global_2fa: bool) -> Self {
+        let needs_2fa_setup = row.needs_2fa_setup(global_2fa);
         Self {
             id: row.id,
             display_name: if row.display_name.is_empty() {
@@ -65,6 +70,10 @@ impl CurrentUser {
             role: Role::parse(&row.role),
             repos,
             commands,
+            totp_enabled: row.totp_enabled,
+            two_fa_policy: row.two_fa_policy,
+            passkey_count: row.passkey_count,
+            needs_2fa_setup,
         }
     }
 

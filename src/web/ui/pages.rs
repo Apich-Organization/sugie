@@ -51,6 +51,38 @@ pub struct UserCard {
     pub last_login: String,
     pub repos: Vec<String>,
     pub commands: Vec<String>,
+    pub totp_enabled: bool,
+    pub passkey_count: i64,
+    pub two_fa_policy: String,
+}
+
+#[derive(Clone, Default)]
+pub struct LoginChallenge {
+    pub pending_token: String,
+    pub username: String,
+    pub has_totp: bool,
+    pub has_passkey: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct PasskeyItem {
+    pub id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub last_used_at: String,
+}
+
+#[derive(Clone, Default)]
+pub struct SecurityPageData {
+    pub rp_id: String,
+    pub rp_origin: String,
+    pub rp_name: String,
+    pub global_2fa: bool,
+    pub totp_enabled: bool,
+    pub totp_setup_secret: String,
+    pub totp_setup_qr: String,
+    pub totp_setup_url: String,
+    pub passkeys: Vec<PasskeyItem>,
 }
 
 #[derive(Clone, Default)]
@@ -64,12 +96,135 @@ pub struct AuditCard {
     pub ok: bool,
 }
 
+#[derive(Clone, Default)]
+pub struct SecurityHttpCard {
+    pub ts: String,
+    pub direction: String,
+    pub method: String,
+    pub target: String,
+    pub status: i64,
+    pub duration_ms: i64,
+    pub ip: String,
+    pub actor: String,
+    pub detail: String,
+}
+
 // --------------------------------------------------------------------- login
 
-pub fn login_page(error: Option<String>, next: String) -> impl IntoView {
+pub fn login_page(
+    error: Option<String>,
+    next: String,
+    challenge: Option<LoginChallenge>,
+) -> impl IntoView {
     let err_view = match error {
         Some(e) if !e.is_empty() => view! { <div class="alert err">{e}</div> }.into_any(),
         _ => view! { <span></span> }.into_any(),
+    };
+
+    let body_content = match challenge {
+        Some(ch) => {
+            let totp_form = if ch.has_totp {
+                let pending = ch.pending_token.clone();
+                let next_val = next.clone();
+                view! {
+                    <form method="post" action="/admin/login/2fa">
+                        <input type="hidden" name="pending_token" value=pending/>
+                        <input type="hidden" name="next" value=next_val/>
+                        <label class="field">
+                            <span>"8-Digit Authenticator Code (SHA512)"</span>
+                            <input
+                                type="text"
+                                name="totp_code"
+                                inputmode="numeric"
+                                pattern="[0-9]{6,8}"
+                                maxlength="8"
+                                placeholder="00000000"
+                                autocomplete="one-time-code"
+                                autofocus=""
+                                required=""
+                                class="mono"
+                                style="text-align:center;font-size:20px;letter-spacing:.28em;padding:12px"
+                            />
+                        </label>
+                        <button class="btn primary" type="submit" style="width:100%">"Verify OTP Code"</button>
+                    </form>
+                }
+                .into_any()
+            } else {
+                view! { <span></span> }.into_any()
+            };
+
+            let passkey_btn = if ch.has_passkey {
+                let pending = ch.pending_token.clone();
+                let next_val = next.clone();
+                view! {
+                    <div style=if ch.has_totp { "margin-top:12px" } else { "" }>
+                        <button
+                            type="button"
+                            class="btn"
+                            id="btn-passkey-login"
+                            data-pending-token=pending
+                            data-next=next_val
+                            style="width:100%"
+                        >
+                            "Verify with Passkey / Security Key"
+                        </button>
+                    </div>
+                }
+                .into_any()
+            } else {
+                view! { <span></span> }.into_any()
+            };
+
+            view! {
+                <h1>"Two-Factor Verification"</h1>
+                <p class="sub">{format!("Complete 2FA verification for @{}", ch.username)}</p>
+                {err_view}
+                <div id="passkey-err" class="alert err" style="display:none"></div>
+                {totp_form}
+                {passkey_btn}
+                <div class="auth-foot" style="margin-top:18px">
+                    <a href="/admin/login">"← Back to Sign In"</a>
+                </div>
+            }
+            .into_any()
+        }
+        None => {
+            let next_for_pk = next.clone();
+            view! {
+                <h1>"Sign In"</h1>
+                <p class="sub">"Enter your credentials or use a Passkey to access the admin console"</p>
+                {err_view}
+                <div id="passkey-err" class="alert err" style="display:none"></div>
+                <form method="post" action="/admin/login">
+                    <input type="hidden" name="next" value=next/>
+                    <label class="field">
+                        <span>"Username"</span>
+                        <input type="text" name="username" autocomplete="username webauthn" autofocus="" required=""/>
+                    </label>
+                    <label class="field">
+                        <span>"Password"</span>
+                        <input type="password" name="password" autocomplete="current-password" required=""/>
+                    </label>
+                    <button class="btn primary" type="submit" style="width:100%">"Sign In"</button>
+                </form>
+                <div style="display:flex;align-items:center;gap:10px;margin:16px 0">
+                    <div style="flex:1;height:1px;background:var(--border)"></div>
+                    <span class="hint">"or"</span>
+                    <div style="flex:1;height:1px;background:var(--border)"></div>
+                </div>
+                <button
+                    type="button"
+                    class="btn"
+                    id="btn-passkey-login"
+                    data-next=next_for_pk
+                    style="width:100%"
+                >
+                    "Sign in with Passkey / Security Key"
+                </button>
+            }
+            .into_any()
+        }
     };
 
     view! {
@@ -91,22 +246,7 @@ pub fn login_page(error: Option<String>, next: String) -> impl IntoView {
                                 <div class="hint">"GitHub Triage Bot Admin Console"</div>
                             </div>
                         </div>
-                        <h1>"Sign In"</h1>
-                        <p class="sub">"Enter your credentials to access the admin console"</p>
-                        {err_view}
-                        <form method="post" action="/admin/login">
-                            <input type="hidden" name="next" value=next/>
-                            <label class="field">
-                                <span>"Username"</span>
-                                <input type="text" name="username" autocomplete="username" autofocus="" required=""/>
-                            </label>
-                            <label class="field">
-                                <span>"Password"</span>
-                                <input type="password" name="password" autocomplete="current-password" required=""/>
-                            </label>
-                            <button class="btn primary" type="submit" style="width:100%">"Sign In"</button>
-                        </form>
-                        <div class="auth-foot">"Initial credentials for first launch are stored in data/admin-initial-password.txt"</div>
+                        {body_content}
                     </div>
                 </div>
                 <script src="/admin/assets/app.js"></script>
@@ -139,16 +279,27 @@ pub fn dashboard_page(
                     String::new(),
                     true,
                 ),
-                Some(s) => (
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "badge bad",
-                    "Error",
-                    s.error.clone().unwrap_or_else(|| "Failed to fetch repository status".to_string()),
-                    false,
-                ),
+                Some(s) => {
+                    let err_msg = s
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Failed to fetch repository status".to_string());
+                    let (cls, txt) = if is_suspended_error(&err_msg) {
+                        ("badge warn", "Suspended")
+                    } else {
+                        ("badge bad", "Error")
+                    };
+                    (
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        cls,
+                        txt,
+                        err_msg,
+                        false,
+                    )
+                }
                 None => (
                     "…".to_string(),
                     "…".to_string(),
@@ -162,8 +313,15 @@ pub fn dashboard_page(
             };
             let link = format!("/admin/chat?repo={}", urlencode(&card.full_name));
             let dot_cls = if is_ok { "dot" } else { "dot bad" };
+            let row_status = if is_ok {
+                "ok"
+            } else if status_txt == "Pending" {
+                "pending"
+            } else {
+                "error"
+            };
             view! {
-                <tr>
+                <tr data-status=row_status>
                     <td><div class="repo-name"><span class=dot_cls></span>{name.clone()}</div></td>
                     <td class="num">{issues}</td>
                     <td class="num">{prs}</td>
@@ -221,13 +379,17 @@ pub fn dashboard_page(
                 <StatCard label="Open PRs".to_string() value=number(totals.prs) sub="Pending pull requests".to_string() accent=false/>
                 <StatCard label="30d Commits".to_string() value=number(totals.commits) sub="Commits on default branch".to_string() accent=false/>
             </div>
-            <div class="grid" style="grid-template-columns:minmax(0,1.9fr) minmax(0,1fr);align-items:start">
+            <div class="grid split-19">
                 <div class="card tight">
                     <div class="card-head" style="padding:18px 20px 0">
                         <h2>"Repositories"</h2>
                         <span class="hint">{format!("{} repositories", cards.len())}</span>
                     </div>
-                    <table style="margin-top:10px">
+                    <div class="toolbar">
+                        <input type="search" placeholder="Search repositories…" data-filter-table="dash-table" data-filter-kind="text" />
+                        <label class="pill-check"><input type="checkbox" data-filter-table="dash-table" data-filter-kind="errors" /><span>"Show only errors"</span></label>
+                    </div>
+                    <table id="dash-table" style="margin-top:10px">
                         <thead>
                             <tr>
                                 <th>"Repository"</th><th>"Issues"</th><th>"PRs"</th><th>"Commits"</th><th>"Stars"</th><th>"Status"</th><th>""</th>
@@ -293,10 +455,25 @@ pub fn repos_page(user: CurrentUser, cards: Vec<RepoCard>) -> impl IntoView {
             };
             let link = format!("/admin/chat?repo={}", urlencode(&card.full_name));
             let stats_link = format!("/admin/api/stats?repo={}", urlencode(&card.full_name));
+            let fetched_cell = if err.is_empty() {
+                view! { <span>{updated}</span> }.into_any()
+            } else if is_suspended_error(&err) {
+                view! { <span class="badge warn" title=err.clone()>"Suspended"</span> }.into_any()
+            } else {
+                view! { <span class="badge bad" title=err.clone()>"Error"</span> }.into_any()
+            };
+            let row_status = if err.is_empty() {
+                if card.stats.is_some() { "ok" } else { "pending" }
+            } else if is_suspended_error(&err) {
+                "suspended"
+            } else {
+                "error"
+            };
+            let dot_cls = if err.is_empty() { "dot" } else { "dot bad" };
             view! {
-                <tr>
+                <tr data-status=row_status>
                     <td>
-                        <div class="repo-name"><span class="dot"></span>{name.clone()}</div>
+                        <div class="repo-name"><span class=dot_cls></span>{name.clone()}</div>
                         <div class="hint mono">{format!("installation {}", card.installation_id)}</div>
                     </td>
                     <td class="num">{issues}</td>
@@ -304,7 +481,7 @@ pub fn repos_page(user: CurrentUser, cards: Vec<RepoCard>) -> impl IntoView {
                     <td class="num">{commits}</td>
                     <td class="num">{merged}</td>
                     <td class="mono">{branch}</td>
-                    <td class="hint">{if err.is_empty() { updated } else { err }}</td>
+                    <td class="hint">{fetched_cell}</td>
                     <td>
                         <div class="row">
                             <a class="btn sm ghost" href=link>"Console"</a>
@@ -341,7 +518,17 @@ pub fn repos_page(user: CurrentUser, cards: Vec<RepoCard>) -> impl IntoView {
                 </div>
             </div>
             <div class="card tight">
-                <table>
+                <div class="toolbar">
+                    <input type="search" placeholder="Search repositories or installation id…" data-filter-table="repos-table" data-filter-kind="text" />
+                    <select data-filter-table="repos-table" data-filter-kind="status">
+                        <option value="">"All statuses"</option>
+                        <option value="ok">"Healthy"</option>
+                        <option value="suspended">"Suspended"</option>
+                        <option value="error">"Error"</option>
+                        <option value="pending">"Pending"</option>
+                    </select>
+                </div>
+                <table id="repos-table">
                     <thead>
                         <tr>
                             <th>"Repository"</th><th>"Issues"</th><th>"PRs"</th><th>"30d Commits"</th><th>"30d Merged"</th><th>"Default Branch"</th><th>"Last Fetched"</th><th>""</th>
@@ -676,6 +863,7 @@ pub fn users_page(
     user: CurrentUser,
     users: Vec<UserCard>,
     repos: Vec<String>,
+    global_2fa: bool,
     flash: Option<(bool, String)>,
 ) -> impl IntoView {
     let flash_view = match flash {
@@ -688,6 +876,8 @@ pub fn users_page(
     } else {
         repos.join("\n")
     };
+
+    let is_owner = user.is_owner();
 
     let rows = users
         .iter()
@@ -714,13 +904,45 @@ pub fn users_page(
             let name = u.username.clone();
             let display = u.display_name.clone();
             let onclick = format!("document.getElementById('{}').showModal()", modal_id);
+
+            let mut factors = Vec::new();
+            if u.totp_enabled {
+                factors.push("OTP".to_string());
+            }
+            if u.passkey_count > 0 {
+                factors.push(format!("Passkey ×{}", u.passkey_count));
+            }
+            let enrolled_txt = if factors.is_empty() {
+                "Not Enrolled".to_string()
+            } else {
+                factors.join(" + ")
+            };
+            let enrolled_cls = if factors.is_empty() {
+                let effective_req = u.two_fa_policy == "required" || (u.two_fa_policy != "disabled" && global_2fa);
+                if effective_req { "badge warn" } else { "badge muted" }
+            } else {
+                "badge ok"
+            };
+            let policy_label = match u.two_fa_policy.as_str() {
+                "required" => "Enforced",
+                "disabled" => "Disabled",
+                _ => if global_2fa { "Global (Req)" } else { "Global (Opt)" },
+            };
+
+            let row_role = u.role.clone();
+            let row_state = if u.active { "active" } else { "disabled" };
+            let row_2fa = if u.totp_enabled || u.passkey_count > 0 { "enrolled" } else { "none" };
             view! {
-                <tr>
+                <tr data-role=row_role data-state=row_state data-twofa=row_2fa>
                     <td>
                         <div class="repo-name">{name.clone()}</div>
                         <div class="hint">{display.clone()}</div>
                     </td>
                     <td><span class=badge_cls>{u.role_label.clone()}</span></td>
+                    <td>
+                        <div><span class=enrolled_cls>{enrolled_txt}</span></div>
+                        <div class="hint" style="margin-top:2px">{policy_label}</div>
+                    </td>
                     <td class="hint mono">{repos_txt}</td>
                     <td class="hint mono">{cmds_txt}</td>
                     <td><span class=if u.active { "badge ok" } else { "badge muted" }>{status}</span></td>
@@ -743,13 +965,33 @@ pub fn users_page(
             let name = u.username.clone();
             let display = u.display_name.clone();
             let close_click = format!("document.getElementById('{}').close()", modal_id);
+            let has_enrolled = u.totp_enabled || u.passkey_count > 0;
+            let enrolled_summary = format!(
+                "OTP: {} · Passkeys: {}",
+                if u.totp_enabled { "Enabled" } else { "Not set" },
+                u.passkey_count
+            );
+
+            let reset_2fa_form = if has_enrolled {
+                let id_for_reset = id.clone();
+                view! {
+                    <form method="post" action="/admin/users/reset-2fa" data-confirm="Reset all 2FA credentials (OTP & Passkeys) for this user? If 2FA is required, they will be prompted to register 2FA again on their next login.">
+                        <input type="hidden" name="id" value=id_for_reset/>
+                        <button class="btn sm" type="submit">"Reset User 2FA"</button>
+                    </form>
+                }
+                .into_any()
+            } else {
+                view! { <span></span> }.into_any()
+            };
+
             view! {
                 <dialog id=modal_id.clone() class="modal-dialog" onclick="if(event.target===this)this.close()">
                     <div class="modal-body">
                         <div class="modal-head">
                             <div>
                                 <h3>{format!("Edit User — {}", name)}</h3>
-                                <span class="hint">{format!("User ID: #{}", id)}</span>
+                                <span class="hint">{format!("User ID: #{} · {}", id, enrolled_summary)}</span>
                             </div>
                             <button type="button" class="icon-btn" onclick=close_click.clone() title="Close">"✕"</button>
                         </div>
@@ -766,10 +1008,21 @@ pub fn users_page(
                                 </label>
                                 <label class="field"><span>"Display Name"</span><input type="text" name="display_name" value=display.clone()/></label>
                             </div>
-                            <label class="pill-check" style="align-self:flex-start">
-                                <input type="checkbox" name="active" value="1" checked=u.active/>
-                                <span>"Active Account"</span>
-                            </label>
+                            <div class="grid cols-2">
+                                <label class="field"><span>"Two-Factor Auth (2FA) Policy"</span>
+                                    <select name="two_fa_policy" disabled=!is_owner>
+                                        <option value="default" selected=u.two_fa_policy == "default">"Follow Global Policy"</option>
+                                        <option value="required" selected=u.two_fa_policy == "required">"Enforce 2FA (Required)"</option>
+                                        <option value="disabled" selected=u.two_fa_policy == "disabled">"Disable / Exempt 2FA"</option>
+                                    </select>
+                                </label>
+                                <div style="display:flex;align-items:center;padding-top:14px">
+                                    <label class="pill-check">
+                                        <input type="checkbox" name="active" value="1" checked=u.active/>
+                                        <span>"Active Account"</span>
+                                    </label>
+                                </div>
+                            </div>
                             <label class="field"><span>"Allowed Repositories (one per line, empty for all)"</span>
                                 <textarea name="repos" rows="3" placeholder=repo_hint.clone()>{repos_value}</textarea>
                             </label>
@@ -784,7 +1037,8 @@ pub fn users_page(
                                 <button type="button" class="btn ghost" onclick=close_click.clone()>"Cancel"</button>
                             </div>
                         </form>
-                        <div style="margin-top:16px;padding-top:14px;border-top:1px dashed var(--border-mid);display:flex;justify-content:flex-end">
+                        <div style="margin-top:16px;padding-top:14px;border-top:1px dashed var(--border-mid);display:flex;justify-content:space-between;align-items:center;gap:10px">
+                            <div>{reset_2fa_form}</div>
                             <form method="post" action="/admin/users/delete" data-confirm="Are you sure you want to delete this account? This action cannot be undone.">
                                 <input type="hidden" name="id" value=id.clone()/>
                                 <button class="btn sm danger" type="submit">"Delete Account"</button>
@@ -796,27 +1050,85 @@ pub fn users_page(
         })
         .collect_view();
 
+    let global_2fa_card = {
+        let status_badge = if global_2fa {
+            view! { <span class="badge warn">"Global 2FA Enforced"</span> }.into_any()
+        } else {
+            view! { <span class="badge muted">"Global 2FA Optional"</span> }.into_any()
+        };
+        let toggle_controls = if is_owner {
+            let next_val = if global_2fa { "0" } else { "1" };
+            let btn_label = if global_2fa { "Disable Global 2FA Requirement" } else { "Enable Global 2FA for All Users" };
+            let btn_cls = if global_2fa { "btn sm" } else { "btn sm primary" };
+            view! {
+                <form method="post" action="/admin/users/2fa-global" style="margin:0">
+                    <input type="hidden" name="enabled" value=next_val/>
+                    <button class=btn_cls type="submit">{btn_label}</button>
+                </form>
+            }
+            .into_any()
+        } else {
+            view! { <span class="hint">"Only Owners can change the global 2FA policy"</span> }.into_any()
+        };
+
+        view! {
+            <div class="card" style="margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+                <div>
+                    <div class="row" style="gap:10px;margin-bottom:4px">
+                        <strong style="font-size:14px">"Global Two-Factor Authentication (2FA) Policy"</strong>
+                        {status_badge}
+                    </div>
+                    <div class="hint">
+                        "When enabled globally, all users (unless individually exempted) must register and verify 2FA via 8-digit SHA512 OTP or a Passkey upon sign-in."
+                    </div>
+                </div>
+                {toggle_controls}
+            </div>
+        }
+    };
+
     view! {
         <Shell title="Users".to_string() active="users".to_string() user=Some(user.clone())>
             <div class="page-head">
                 <div>
                     <div class="eyebrow">"Access"</div>
                     <h1>"Users & Permissions"</h1>
-                    <p>"Roles determine baseline permissions; repository and command ACLs define operational scope."</p>
+                    <p>"Roles determine baseline permissions; repository ACLs, command grants, and 2FA policies define security scope."</p>
                 </div>
             </div>
             {flash_view}
-            <div class="grid" style="grid-template-columns:minmax(0,2.2fr) minmax(0,1fr);align-items:start">
+            {global_2fa_card}
+            <div class="stack">
                 <div class="card tight">
-                    <table>
-                        <thead><tr><th>"User"</th><th>"Role"</th><th>"Repositories"</th><th>"Commands"</th><th>"Status"</th><th>"Last Login"</th><th>""</th></tr></thead>
+                    <div class="toolbar">
+                        <input type="search" placeholder="Search users…" data-filter-table="users-table" data-filter-kind="text" />
+                        <select data-filter-table="users-table" data-filter-kind="role">
+                            <option value="">"All roles"</option>
+                            <option value="owner">"Owner"</option>
+                            <option value="admin">"Admin"</option>
+                            <option value="maintainer">"Maintainer"</option>
+                            <option value="viewer">"Viewer"</option>
+                        </select>
+                        <select data-filter-table="users-table" data-filter-kind="state">
+                            <option value="">"Any status"</option>
+                            <option value="active">"Active"</option>
+                            <option value="disabled">"Disabled"</option>
+                        </select>
+                        <select data-filter-table="users-table" data-filter-kind="twofa">
+                            <option value="">"Any 2FA"</option>
+                            <option value="enrolled">"2FA enrolled"</option>
+                            <option value="none">"Not enrolled"</option>
+                        </select>
+                    </div>
+                    <table id="users-table">
+                        <thead><tr><th>"User"</th><th>"Role"</th><th>"2FA"</th><th>"Repositories"</th><th>"Commands"</th><th>"Status"</th><th>"Last Login"</th><th>""</th></tr></thead>
                         <tbody>{rows}</tbody>
                     </table>
                     {dialogs}
                 </div>
-                <div class="card">
+                <div class="card" style="max-width:760px">
                     <div class="card-head"><h2>"Create User"</h2></div>
-                    <form method="post" action="/admin/users/create">
+                    <form method="post" action="/admin/users/create" class="form-grid">
                         <label class="field"><span>"Username"</span><input type="text" name="username" required=""/></label>
                         <label class="field"><span>"Display Name"</span><input type="text" name="display_name"/></label>
                         <label class="field"><span>"Initial Password (min 8 chars)"</span><input type="password" name="password" required=""/></label>
@@ -827,12 +1139,247 @@ pub fn users_page(
                                 <option value="admin">"Admin"</option>
                             </select>
                         </label>
-                        <label class="field">
-                            <span>"Allowed Repositories (one per line, leave empty for all)"</span>
-                            <textarea name="repos" rows="4" placeholder=repo_hint></textarea>
+                        <label class="field"><span>"Two-Factor Auth (2FA) Policy"</span>
+                            <select name="two_fa_policy" disabled=!is_owner>
+                                <option value="default">"Follow Global Policy"</option>
+                                <option value="required">"Enforce 2FA (Required)"</option>
+                                <option value="disabled">"Disable / Exempt 2FA"</option>
+                            </select>
                         </label>
-                        <button class="btn primary" type="submit" style="width:100%">"Create Account"</button>
+                        <label class="field span-2">
+                            <span>"Allowed Repositories (one per line, leave empty for all)"</span>
+                            <textarea name="repos" rows="3" placeholder=repo_hint></textarea>
+                        </label>
+                        <div class="span-2"><button class="btn primary" type="submit">"Create Account"</button></div>
                     </form>
+                </div>
+            </div>
+        </Shell>
+    }
+}
+
+// ------------------------------------------------------------------ security
+
+pub fn security_page(
+    user: CurrentUser,
+    data: SecurityPageData,
+    flash: Option<(bool, String)>,
+) -> impl IntoView {
+    let flash_view = match flash {
+        Some((ok, text)) => view! { <Flash ok=ok text=text/> }.into_any(),
+        None => view! { <span></span> }.into_any(),
+    };
+
+    let setup_banner = if user.needs_2fa_setup {
+        view! {
+            <div class="alert warn" style="border-width:1.5px;font-weight:500">
+                "Two-Factor Authentication Setup Required: Your account policy requires 2FA before you can access the rest of the console. Please register either an 8-digit SHA512 Authenticator App (OTP) or a Passkey / Security Key below."
+            </div>
+        }
+        .into_any()
+    } else {
+        view! { <span></span> }.into_any()
+    };
+
+    let formatted_secret = data
+        .totp_setup_secret
+        .as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let totp_card_body = if data.totp_enabled {
+        view! {
+            <div class="stack">
+                <div class="alert ok" style="margin:0">
+                    "Authenticator App (TOTP · SHA512 · 8 digits) is active on your account."
+                </div>
+                <p class="hint" style="margin:0">
+                    "When signing in with your password, you can enter the 8-digit code generated by your authenticator app."
+                </p>
+                <form
+                    method="post"
+                    action="/admin/security/totp/disable"
+                    data-confirm="Disable Authenticator App (OTP) on your account?"
+                    style="border-top:1px solid var(--border);padding-top:14px"
+                >
+                    <label class="field">
+                        <span>"Confirm Current Password to Disable OTP"</span>
+                        <input type="password" name="password" autocomplete="current-password" required="" placeholder="Enter your password"/>
+                    </label>
+                    <button class="btn danger sm" type="submit">"Disable Authenticator OTP"</button>
+                </form>
+            </div>
+        }
+        .into_any()
+    } else {
+        let qr_src = if data.totp_setup_qr.starts_with("data:") {
+            data.totp_setup_qr.clone()
+        } else {
+            format!("data:image/png;base64,{}", data.totp_setup_qr)
+        };
+        let raw_secret = data.totp_setup_secret.clone();
+        let otpauth_uri = data.totp_setup_url.clone();
+        view! {
+            <div class="stack">
+                <p class="hint" style="margin:0">
+                    "Scan the QR code below with an authenticator app that supports SHA512 & 8-digit codes (such as FreeOTP+, Aegis, Ente Auth, 1Password, or Bitwarden), then enter the 8-digit code to activate."
+                </p>
+                <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;background:var(--surface-alt);padding:16px;border-radius:16px;border:1px solid var(--border)">
+                    <img
+                        src=qr_src
+                        alt="TOTP QR Code"
+                        style="width:164px;height:164px;border-radius:12px;background:#fff;padding:8px;border:1px solid var(--border)"
+                    />
+                    <div style="flex:1;min-width:200px" class="stack">
+                        <div>
+                            <div class="eyebrow" style="margin-bottom:4px">"Manual Setup Key (Base32)"</div>
+                            <div class="mono" style="font-size:13px;font-weight:600;word-break:break-all;padding:8px 10px;border-radius:10px;background:var(--surface-hi);border:1px solid var(--border)">
+                                {formatted_secret}
+                            </div>
+                        </div>
+                        <dl class="kv" style="grid-template-columns:95px 1fr;gap:4px 10px;font-size:12px">
+                            <dt>"Issuer"</dt><dd class="mono">{data.rp_name.clone()}</dd>
+                            <dt>"Algorithm"</dt><dd class="mono">"SHA512"</dd>
+                            <dt>"Digits"</dt><dd class="mono">"8"</dd>
+                            <dt>"Period"</dt><dd class="mono">"30s"</dd>
+                        </dl>
+                    </div>
+                </div>
+                <div>
+                    <div class="eyebrow" style="margin-bottom:4px">"OTPAuth URI"</div>
+                    <div class="mono" style="font-size:12px;word-break:break-all;padding:8px 10px;border-radius:10px;background:var(--surface-hi);border:1px solid var(--border);user-select:all">
+                        {otpauth_uri}
+                    </div>
+                </div>
+                <form method="post" action="/admin/security/totp/activate">
+                    <input type="hidden" name="secret" value=raw_secret/>
+                    <label class="field">
+                        <span>"Verification Code (8 digits)"</span>
+                        <input
+                            type="text"
+                            name="code"
+                            inputmode="numeric"
+                            pattern="[0-9]{8}"
+                            maxlength="8"
+                            placeholder="00000000"
+                            autocomplete="one-time-code"
+                            required=""
+                            class="mono"
+                            style="letter-spacing:.25em;font-size:16px"
+                        />
+                    </label>
+                    <button class="btn primary" type="submit">"Verify & Activate OTP"</button>
+                </form>
+            </div>
+        }
+        .into_any()
+    };
+
+    let passkey_rows = if data.passkeys.is_empty() {
+        view! {
+            <tr><td colspan="4" class="empty" style="padding:20px">"No Passkeys or Security Keys registered yet"</td></tr>
+        }
+        .into_any()
+    } else {
+        data.passkeys
+            .iter()
+            .map(|pk| {
+                let id_str = pk.id.to_string();
+                let name = pk.name.clone();
+                let created = pk.created_at.clone();
+                let last_used = if pk.last_used_at.is_empty() {
+                    "Never".to_string()
+                } else {
+                    pk.last_used_at.clone()
+                };
+                view! {
+                    <tr>
+                        <td style="font-weight:560">{name}</td>
+                        <td class="hint mono">{created}</td>
+                        <td class="hint mono">{last_used}</td>
+                        <td style="text-align:right">
+                            <form method="post" action="/admin/security/passkey/delete" data-confirm="Remove this Passkey from your account?" style="margin:0">
+                                <input type="hidden" name="id" value=id_str/>
+                                <button class="btn sm danger" type="submit">"Remove"</button>
+                            </form>
+                        </td>
+                    </tr>
+                }
+            })
+            .collect_view()
+            .into_any()
+    };
+
+    let policy_badge = match user.two_fa_policy.as_str() {
+        "required" => "Enforced by Owner",
+        "disabled" => "Exempt / Disabled",
+        _ => if data.global_2fa { "Required (Global Policy)" } else { "Optional (Global Policy)" },
+    };
+
+    view! {
+        <Shell title="2FA & Passkeys".to_string() active="security".to_string() user=Some(user.clone())>
+            <div class="page-head">
+                <div>
+                    <div class="eyebrow">"Account Security"</div>
+                    <h1>"Two-Factor Authentication & Passkeys"</h1>
+                    <p>"Configure 8-digit SHA512 Time-based OTP and WebAuthn Passkeys / FIDO2 Security Keys."</p>
+                </div>
+                <span class="badge">{format!("2FA Policy: {policy_badge}")}</span>
+            </div>
+            {flash_view}
+            {setup_banner}
+
+            <div class="card" style="margin-bottom:16px">
+                <div class="card-head" style="margin-bottom:10px">
+                    <h2>"Relying Party (RP) Configuration"</h2>
+                    <span class="hint">"Loaded from environment variables (.env)"</span>
+                </div>
+                <dl class="kv" style="grid-template-columns:130px 1fr">
+                    <dt>"RP Name (Issuer)"</dt><dd class="mono">{data.rp_name.clone()}</dd>
+                    <dt>"RP ID (Domain)"</dt><dd class="mono">{data.rp_id.clone()}</dd>
+                    <dt>"RP Origin"</dt><dd class="mono">{data.rp_origin.clone()}</dd>
+                </dl>
+            </div>
+
+            <div class="grid cols-2" style="align-items:start">
+                <div class="card">
+                    <div class="card-head">
+                        <h2>"Authenticator App (OTP)"</h2>
+                        <span class=if data.totp_enabled { "badge ok" } else { "badge muted" }>
+                            {if data.totp_enabled { "Enabled" } else { "Not Configured" }}
+                        </span>
+                    </div>
+                    {totp_card_body}
+                </div>
+
+                <div class="card">
+                    <div class="card-head">
+                        <h2>"Passkeys & Security Keys"</h2>
+                        <span class=if data.passkeys.is_empty() { "badge muted" } else { "badge ok" }>
+                            {format!("{} registered", data.passkeys.len())}
+                        </span>
+                    </div>
+                    <p class="hint" style="margin-top:0">
+                        "Register a Passkey (Touch ID, Face ID, Windows Hello, or a FIDO2 hardware key like YubiKey) to sign in without a password or complete 2FA verification in one tap."
+                    </p>
+                    <div id="passkey-reg-msg" class="alert" style="display:none"></div>
+                    <div class="row" style="align-items:flex-end;margin-bottom:16px">
+                        <label class="field" style="flex:1;margin-bottom:0">
+                            <span>"Key / Device Nickname"</span>
+                            <input type="text" id="passkey-device-name" placeholder="e.g. MacBook Touch ID, YubiKey 5C"/>
+                        </label>
+                        <button type="button" class="btn primary" id="btn-passkey-register">"Register Passkey"</button>
+                    </div>
+                    <div style="border:1px solid var(--border);border-radius:14px;overflow:hidden">
+                        <table>
+                            <thead>
+                                <tr><th>"Name"</th><th>"Added"</th><th>"Last Used"</th><th>""</th></tr>
+                            </thead>
+                            <tbody>{passkey_rows}</tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
         </Shell>
@@ -843,60 +1390,235 @@ pub fn users_page(
 
 pub fn audit_page(
     user: CurrentUser,
+    tab: String,
     rows: Vec<AuditCard>,
+    http_rows: Vec<SecurityHttpCard>,
     page: i64,
     total: i64,
+    log_file_path: String,
+    log_settings: crate::security_log::SecurityLogSettings,
+    flash: Option<(bool, String)>,
 ) -> impl IntoView {
-    let body = rows
-        .iter()
-        .map(|r| {
-            let cls = if r.ok { "badge ok" } else { "badge bad" };
-            let txt = if r.ok { "Success" } else { "Denied" };
-            view! {
-                <tr>
-                    <td class="hint mono">{r.ts.clone()}</td>
-                    <td>{r.username.clone()}</td>
-                    <td><span class="badge muted">{r.action.clone()}</span></td>
-                    <td class="mono">{r.target.clone()}</td>
-                    <td class="hint">{r.detail.clone()}</td>
-                    <td class="hint mono">{r.ip.clone()}</td>
-                    <td><span class=cls>{txt}</span></td>
-                </tr>
-            }
-        })
-        .collect_view();
+    let is_http_tab = tab == "inbound" || tab == "github" || tab == "notify" || tab == "http_all";
+    let flash_view = flash.map(|(ok, msg)| {
+        let cls = if ok { "alert ok" } else { "alert err" };
+        view! { <div class=cls>{msg}</div> }
+    });
 
-    let body = if rows.is_empty() {
-        view! { <tr><td colspan="7" class="empty">"No audit logs recorded yet"</td></tr> }.into_any()
+    let prev = format!("/admin/audit?tab={}&page={}", urlencode(&tab), (page - 1).max(0));
+    let next = format!("/admin/audit?tab={}&page={}", urlencode(&tab), page + 1);
+    let pages = (total + 49) / 50;
+
+    let table_view = if is_http_tab {
+        let http_body = if http_rows.is_empty() {
+            view! { <tr><td colspan="8" class="empty">"No HTTP security logs recorded yet"</td></tr> }.into_any()
+        } else {
+            http_rows
+                .iter()
+                .map(|r| {
+                    let dir_cls = if r.direction == "OUTBOUND_GITHUB" {
+                        "badge"
+                    } else if r.direction == "OUTBOUND_NOTIFY" {
+                        "badge warn"
+                    } else {
+                        "badge muted"
+                    };
+                    let dir_label = if r.direction == "OUTBOUND_GITHUB" {
+                        "GitHub API"
+                    } else if r.direction == "OUTBOUND_NOTIFY" {
+                        "Notification"
+                    } else {
+                        "Inbound API"
+                    };
+                    let status_cls = if (200..400).contains(&r.status) {
+                        "badge ok"
+                    } else if (400..500).contains(&r.status) {
+                        "badge warn"
+                    } else {
+                        "badge bad"
+                    };
+                    let status_txt = if r.status == 0 {
+                        "ERR".to_string()
+                    } else {
+                        r.status.to_string()
+                    };
+                    view! {
+                        <tr>
+                            <td class="hint mono nowrap">{r.ts.clone()}</td>
+                            <td><span class=dir_cls>{dir_label}</span></td>
+                            <td class="mono" style="font-weight:600">{r.method.clone()}</td>
+                            <td class="mono" style="word-break:break-all;max-width:360px">{r.target.clone()}</td>
+                            <td><span class=status_cls>{status_txt}</span></td>
+                            <td class="num">{format!("{} ms", r.duration_ms)}</td>
+                            <td class="hint mono">{format!("{} ({})", r.actor, r.ip)}</td>
+                            <td class="hint mono" style="word-break:break-word;max-width:260px">{r.detail.clone()}</td>
+                        </tr>
+                    }
+                })
+                .collect_view()
+                .into_any()
+        };
+
+        view! {
+            <table>
+                <thead>
+                    <tr>
+                        <th>"Timestamp"</th>
+                        <th>"Direction"</th>
+                        <th>"Method"</th>
+                        <th>"URL / Path"</th>
+                        <th>"Status"</th>
+                        <th>"Latency"</th>
+                        <th>"Actor / IP"</th>
+                        <th>"Details"</th>
+                    </tr>
+                </thead>
+                <tbody>{http_body}</tbody>
+            </table>
+        }
+        .into_any()
     } else {
-        body.into_any()
+        let body = if rows.is_empty() {
+            view! { <tr><td colspan="7" class="empty">"No audit logs recorded yet"</td></tr> }.into_any()
+        } else {
+            rows.iter()
+                .map(|r| {
+                    let cls = if r.ok { "badge ok" } else { "badge bad" };
+                    let txt = if r.ok { "Success" } else { "Denied" };
+                    view! {
+                        <tr>
+                            <td class="hint mono nowrap">{r.ts.clone()}</td>
+                            <td class="nowrap">{r.username.clone()}</td>
+                            <td class="nowrap"><span class="badge muted">{r.action.clone()}</span></td>
+                            <td class="mono">{r.target.clone()}</td>
+                            <td class="hint">{r.detail.clone()}</td>
+                            <td class="hint mono">{r.ip.clone()}</td>
+                            <td><span class=cls>{txt}</span></td>
+                        </tr>
+                    }
+                })
+                .collect_view()
+                .into_any()
+        };
+
+        view! {
+            <table>
+                <thead>
+                    <tr>
+                        <th>"Timestamp"</th>
+                        <th>"User"</th>
+                        <th>"Action"</th>
+                        <th>"Target"</th>
+                        <th>"Details"</th>
+                        <th>"IP"</th>
+                        <th>"Result"</th>
+                    </tr>
+                </thead>
+                <tbody>{body}</tbody>
+            </table>
+        }
+        .into_any()
     };
 
-    let prev = format!("/admin/audit?page={}", (page - 1).max(0));
-    let next = format!("/admin/audit?page={}", page + 1);
-    let pages = (total + 49) / 50;
+    let tab_audit_cls = if tab == "audit" { "btn sm primary" } else { "btn sm ghost" };
+    let tab_inbound_cls = if tab == "inbound" { "btn sm primary" } else { "btn sm ghost" };
+    let tab_github_cls = if tab == "github" { "btn sm primary" } else { "btn sm ghost" };
+    let tab_notify_cls = if tab == "notify" { "btn sm primary" } else { "btn sm ghost" };
+    let tab_all_cls = if tab == "http_all" { "btn sm primary" } else { "btn sm ghost" };
+    let tab_hidden = tab.clone();
+    let tab_hidden2 = tab.clone();
+    let export_href = format!("/admin/audit/export?tab={}", urlencode(&tab));
 
     view! {
         <Shell title="Audit".to_string() active="audit".to_string() user=Some(user.clone())>
             <div class="page-head">
                 <div>
-                    <div class="eyebrow">"Audit"</div>
-                    <h1>"Operation Audit Logs"</h1>
-                    <p>{format!("{total} total records · Page {} of {}", page + 1, pages.max(1))}</p>
+                    <div class="eyebrow">"Security & Audit"</div>
+                    <h1>"Security Review & Audit Logs"</h1>
+                    <p>
+                        {format!("{total} total records · Page {} of {} · Persistent HTTP log file: ", page + 1, pages.max(1))}
+                        <code class="mono">{log_file_path}</code>
+                    </p>
                 </div>
                 <div class="row">
                     <a class="btn sm ghost" href=prev>"Previous"</a>
                     <a class="btn sm ghost" href=next>"Next"</a>
                 </div>
             </div>
+            {flash_view}
+            <div class="card" style="margin-bottom:20px">
+                <form method="post" action="/admin/audit/settings">
+                    <input type="hidden" name="tab" value=tab_hidden />
+                    <div class="card-head" style="margin-bottom:12px">
+                        <div>
+                            <div class="card-title">"Security Log Collection Settings"</div>
+                            <div class="card-sub">"Configure which log categories are recorded to SQLite and security_http.log (all enabled by default). Changes take effect immediately."</div>
+                        </div>
+                        <button type="submit" class="btn sm primary">"Save Logging Settings"</button>
+                    </div>
+                    <div class="check-grid">
+                        <label class="check">
+                            <input type="checkbox" name="admin_audit" checked=log_settings.admin_audit />
+                            <span>"Admin Portal Action Audit (Logins, Users, 2FA, Config)"</span>
+                        </label>
+                        <label class="check">
+                            <input type="checkbox" name="inbound_webhooks" checked=log_settings.inbound_webhooks />
+                            <span>"Inbound Webhook & Bot API Requests (/webhook, /api/chat/*)"</span>
+                        </label>
+                        <label class="check">
+                            <input type="checkbox" name="inbound_admin" checked=log_settings.inbound_admin />
+                            <span>"Inbound Admin Console HTTP Requests (/admin/*)"</span>
+                        </label>
+                        <label class="check">
+                            <input type="checkbox" name="outbound_github" checked=log_settings.outbound_github />
+                            <span>"Outbound GitHub REST & GraphQL Requests"</span>
+                        </label>
+                        <label class="check">
+                            <input type="checkbox" name="outbound_lark" checked=log_settings.outbound_lark />
+                            <span>"Outbound Lark (Feishu) Notifications"</span>
+                        </label>
+                        <label class="check">
+                            <input type="checkbox" name="outbound_discord" checked=log_settings.outbound_discord />
+                            <span>"Outbound Discord Notifications"</span>
+                        </label>
+                        <label class="check">
+                            <input type="checkbox" name="outbound_zulip" checked=log_settings.outbound_zulip />
+                            <span>"Outbound Zulip Notifications"</span>
+                        </label>
+                    </div>
+                    <label class="field" style="margin:14px 0 0;max-width:420px">
+                        <span>"Auto-delete HTTP security logs older than N days (0 = keep forever)"</span>
+                        <input type="number" name="retention_days" min="0" max="36500" value=log_settings.retention_days.to_string() />
+                    </label>
+                </form>
+                <div class="row" style="margin-top:14px;padding-top:14px;border-top:1px dashed var(--border-mid);justify-content:space-between">
+                    <form method="post" action="/admin/audit/purge" class="row" data-confirm="Permanently delete HTTP security log records older than the specified number of days? (The security_http.log file on disk is not modified.)" style="margin:0">
+                        <input type="hidden" name="tab" value=tab_hidden2 />
+                        <span class="hint">"Clear logs older than"</span>
+                        <input type="number" name="days" min="0" value="30" style="width:90px" />
+                        <span class="hint">"days"</span>
+                        <button type="submit" class="btn sm danger">"Clear Now"</button>
+                    </form>
+                    <a class="btn sm" href=export_href>"Export CSV"</a>
+                </div>
+            </div>
+            <div class="row" style="margin-bottom:16px">
+                <a class=tab_audit_cls href="/admin/audit?tab=audit">"Admin Action Audit"</a>
+                <a class=tab_inbound_cls href="/admin/audit?tab=inbound">"Inbound API & Webhook Requests"</a>
+                <a class=tab_github_cls href="/admin/audit?tab=github">"Outbound GitHub API Requests"</a>
+                <a class=tab_notify_cls href="/admin/audit?tab=notify">"Outbound Notifications (Lark / Discord / Zulip)"</a>
+                <a class=tab_all_cls href="/admin/audit?tab=http_all">"All HTTP Traffic"</a>
+            </div>
             <div class="card tight">
-                <table>
-                    <thead><tr><th>"Timestamp"</th><th>"User"</th><th>"Action"</th><th>"Target"</th><th>"Details"</th><th>"IP"</th><th>"Result"</th></tr></thead>
-                    <tbody>{body}</tbody>
-                </table>
+                {table_view}
             </div>
         </Shell>
     }
+}
+
+/// GitHub returns HTTP 403 "This installation has been suspended" for suspended app installations.
+fn is_suspended_error(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("suspended")
 }
 
 fn urlencode(s: &str) -> String {

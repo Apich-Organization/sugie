@@ -77,6 +77,7 @@ impl GitHubAuthManager {
     pub async fn get_app_info(&self) -> Result<serde_json::Value> {
         let jwt = self.generate_jwt()?;
         let url = format!("{}/app", self.base_url);
+        let start = std::time::Instant::now();
         let res = self
             .http_client
             .get(&url)
@@ -84,6 +85,10 @@ impl GitHubAuthManager {
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
+
+        let status = res.status().as_u16();
+        let ms = start.elapsed().as_millis() as u64;
+        crate::security_log::log_github_request("GET", &url, status, ms, "app_info");
 
         if !res.status().is_success() {
             let status = res.status();
@@ -98,6 +103,7 @@ impl GitHubAuthManager {
     pub async fn get_installations(&self) -> Result<Vec<serde_json::Value>> {
         let jwt = self.generate_jwt()?;
         let url = format!("{}/app/installations", self.base_url);
+        let start = std::time::Instant::now();
         let res = self
             .http_client
             .get(&url)
@@ -105,6 +111,10 @@ impl GitHubAuthManager {
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
+
+        let status = res.status().as_u16();
+        let ms = start.elapsed().as_millis() as u64;
+        crate::security_log::log_github_request("GET", &url, status, ms, "list_installations");
 
         if !res.status().is_success() {
             let status = res.status();
@@ -133,6 +143,7 @@ impl GitHubAuthManager {
                 "{}/installation/repositories?per_page=100&page={}",
                 self.base_url, page
             );
+            let start = std::time::Instant::now();
             let res = self
                 .http_client
                 .get(&url)
@@ -141,6 +152,16 @@ impl GitHubAuthManager {
                 .header("X-GitHub-Api-Version", "2022-11-28")
                 .send()
                 .await?;
+
+            let status = res.status().as_u16();
+            let ms = start.elapsed().as_millis() as u64;
+            crate::security_log::log_github_request(
+                "GET",
+                &url,
+                status,
+                ms,
+                &format!("installation_id={installation_id} page={page}"),
+            );
 
             if !res.status().is_success() {
                 let status = res.status();
@@ -196,6 +217,7 @@ impl GitHubAuthManager {
             self.base_url, installation_id
         );
 
+        let start = std::time::Instant::now();
         let res = self
             .http_client
             .post(&url)
@@ -205,6 +227,16 @@ impl GitHubAuthManager {
             .send()
             .await
             .context("Failed to send installation token request to GitHub API")?;
+
+        let status = res.status().as_u16();
+        let ms = start.elapsed().as_millis() as u64;
+        crate::security_log::log_github_request(
+            "POST",
+            &url,
+            status,
+            ms,
+            &format!("issue_installation_token installation_id={installation_id}"),
+        );
 
         if !res.status().is_success() {
             let status = res.status();

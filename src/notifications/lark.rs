@@ -118,18 +118,42 @@ impl LarkNotifier {
             }
         }
 
-        let resp = self
+        let started = std::time::Instant::now();
+        let send_res = self
             .http
             .post(&self.config.webhook_url)
             .json(&payload)
             .send()
-            .await
-            .context("Failed to send webhook request to Lark")?;
+            .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+
+        let resp = match send_res {
+            Ok(r) => r,
+            Err(e) => {
+                crate::security_log::log_notification_request(
+                    "lark",
+                    "POST",
+                    &self.config.webhook_url,
+                    0,
+                    duration_ms,
+                    &format!("title={title} error={e}"),
+                );
+                return Err(e).context("Failed to send webhook request to Lark");
+            }
+        };
 
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
 
         if !status.is_success() {
+            crate::security_log::log_notification_request(
+                "lark",
+                "POST",
+                &self.config.webhook_url,
+                status.as_u16(),
+                duration_ms,
+                &format!("title={title} http_error={body_text}"),
+            );
             anyhow::bail!("Lark webhook HTTP error {}: {}", status, body_text);
         }
 
@@ -140,10 +164,27 @@ impl LarkNotifier {
                         .get("msg")
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown error");
+                    crate::security_log::log_notification_request(
+                        "lark",
+                        "POST",
+                        &self.config.webhook_url,
+                        status.as_u16(),
+                        duration_ms,
+                        &format!("title={title} lark_code={code} msg={msg}"),
+                    );
                     anyhow::bail!("Lark API rejected notification (code {}): {}", code, msg);
                 }
             }
         }
+
+        crate::security_log::log_notification_request(
+            "lark",
+            "POST",
+            &self.config.webhook_url,
+            status.as_u16(),
+            duration_ms,
+            &format!("title={title} template={color_template}"),
+        );
 
         Ok(())
     }
