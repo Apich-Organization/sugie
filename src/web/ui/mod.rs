@@ -20,6 +20,7 @@ fn nav_items(user: &Option<CurrentUser>) -> Vec<(&'static str, &'static str, &'s
     if user.as_ref().map(|u| u.can_manage()).unwrap_or(false) {
         items.push(("config", "/admin/config", "Configuration"));
         items.push(("users", "/admin/users", "Users"));
+        items.push(("notify", "/admin/notify", "Notify"));
         items.push(("audit", "/admin/audit", "Audit Logs"));
     }
     items.push(("security", "/admin/security", "2FA & Passkeys"));

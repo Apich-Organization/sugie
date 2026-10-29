@@ -1633,3 +1633,78 @@ fn urlencode(s: &str) -> String {
     }
     out
 }
+
+// --------------------------------------------------------------------- notify
+
+pub fn notify_page(
+    user: CurrentUser,
+    discord_ok: bool,
+    lark_ok: bool,
+    zulip_ok: bool,
+    flash: Option<(bool, String)>,
+) -> impl IntoView {
+    let flash_view = match flash {
+        Some((ok, text)) => view! { <Flash ok=ok text=text/> }.into_any(),
+        None => view! { <span></span> }.into_any(),
+    };
+    let status = |ok: bool| if ok { "Configured" } else { "Not configured" };
+    let any_ok = discord_ok || lark_ok || zulip_ok;
+
+    view! {
+        <Shell title="Notify".to_string() active="notify".to_string() user=Some(user.clone())>
+            <div class="page-head">
+                <div>
+                    <div class="eyebrow">"Broadcast"</div>
+                    <h1>"Send Notification"</h1>
+                    <p>"Send a manual announcement to Lark, Discord and/or Zulip. Bypasses event toggles and repository filters."</p>
+                </div>
+            </div>
+            {flash_view}
+            <div class="card" style="max-width:760px">
+                <form method="post" action="/admin/notify/send" class="form-grid">
+                    <label class="field span-2">
+                        <span>"Title"</span>
+                        <input type="text" name="title" required="" maxlength="200" placeholder="Maintenance window tonight"/>
+                    </label>
+                    <label class="field span-2">
+                        <span>"Message"</span>
+                        <textarea name="message" rows="5" required="" maxlength="4000" placeholder="Details of the announcement…"></textarea>
+                    </label>
+                    <label class="field">
+                        <span>"Link (optional)"</span>
+                        <input type="text" name="url" placeholder="https://github.com/org/repo/issues/1"/>
+                    </label>
+                    <label class="field">
+                        <span>"Severity"</span>
+                        <select name="level">
+                            <option value="info">"Info"</option>
+                            <option value="success">"Success"</option>
+                            <option value="warning">"Warning"</option>
+                            <option value="error">"Error"</option>
+                        </select>
+                    </label>
+                    <div class="span-2" style="margin-bottom:16px">
+                        <div class="hint" style="margin-bottom:8px;font-weight:560">"Send to"</div>
+                        <div class="check-grid">
+                            <label class="check">
+                                <input type="checkbox" name="ch_lark" checked=lark_ok disabled=!lark_ok/>
+                                <span>{format!("Lark (Feishu) — {}", status(lark_ok))}</span>
+                            </label>
+                            <label class="check">
+                                <input type="checkbox" name="ch_discord" checked=discord_ok disabled=!discord_ok/>
+                                <span>{format!("Discord — {}", status(discord_ok))}</span>
+                            </label>
+                            <label class="check">
+                                <input type="checkbox" name="ch_zulip" checked=zulip_ok disabled=!zulip_ok/>
+                                <span>{format!("Zulip — {}", status(zulip_ok))}</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="span-2">
+                        <button class="btn primary" type="submit" disabled=!any_ok>"Send Notification"</button>
+                    </div>
+                </form>
+            </div>
+        </Shell>
+    }
+}

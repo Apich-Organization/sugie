@@ -1,5 +1,5 @@
 # ==============================================================================
-# 🦀 Sugie GitHub Triage Bot - Server & Rules Configuration (sugie.toml)
+# Sugie GitHub Triage Bot - Server & Rules Configuration (sugie.toml)
 # Sensitive keys, tokens, and secrets are stored in .env and merged at runtime.
 # ==============================================================================
 

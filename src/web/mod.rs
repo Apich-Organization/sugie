@@ -95,6 +95,8 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/config", get(config_page))
         .route("/admin/users", get(users_page))
         .route("/admin/audit", get(audit_page))
+        .route("/admin/notify", get(notify_page))
+        .route("/admin/notify/send", post(notify_send))
         .route("/admin/audit/settings", post(save_audit_settings))
         .route("/admin/audit/purge", post(purge_audit_logs))
         .route("/admin/audit/export", get(export_audit_csv))
@@ -1286,6 +1288,145 @@ async fn save_audit_settings(
             urlencode(&format!("Failed to save logging settings: {e}"))
         )),
     }
+}
+
+async fn notify_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let flash = flash_from(&query);
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let n = state.triage.notifier();
+    html(pages::notify_page(
+        user,
+        n.discord().is_some(),
+        n.lark().is_some(),
+        n.zulip().is_some(),
+        flash,
+    ))
+}
+
+fn notify_flash(ok: bool, msg: &str) -> Response {
+    flash_to("/admin/notify", ok, msg)
+}
+
+async fn notify_send(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    use crate::notifications::{DiscordEmbedField, NotificationLevel, ZulipTopicCategory};
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let title = form.get("title").map(|s| s.trim().to_string()).unwrap_or_default();
+    let message = form.get("message").map(|s| s.trim().to_string()).unwrap_or_default();
+    if title.is_empty() || message.is_empty() {
+        return notify_flash(false, "Title and message are required");
+    }
+    let url = form
+        .get("url")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(ref u) = url {
+        if !(u.starts_with("https://") || u.starts_with("http://")) {
+            return notify_flash(false, "Link must start with http:// or https://");
+        }
+    }
+    let level = match form.get("level").map(|s| s.as_str()).unwrap_or("info") {
+        "success" => NotificationLevel::Success,
+        "warning" => NotificationLevel::Warning,
+        "error" => NotificationLevel::Error,
+        _ => NotificationLevel::Info,
+    };
+    let want_lark = form.contains_key("ch_lark");
+    let want_discord = form.contains_key("ch_discord");
+    let want_zulip = form.contains_key("ch_zulip");
+    if !(want_lark || want_discord || want_zulip) {
+        return notify_flash(false, "Select at least one channel");
+    }
+
+    let notifier = state.triage.notifier();
+    let mut sent: Vec<&str> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    let fields: Vec<DiscordEmbedField> = vec![DiscordEmbedField {
+        name: "Sent by".into(),
+        value: user.username.clone(),
+        inline: true,
+    }];
+
+    if want_lark {
+        match notifier.lark() {
+            Some(l) => match l
+                .send_notification(
+                    &title,
+                    &message,
+                    url.as_deref(),
+                    level.lark_template(),
+                    &[("Sent by", user.username.as_str())],
+                )
+                .await
+            {
+                Ok(_) => sent.push("Lark"),
+                Err(e) => failed.push(format!("Lark: {e}")),
+            },
+            None => failed.push("Lark: not configured".into()),
+        }
+    }
+    if want_discord {
+        match notifier.discord() {
+            Some(d) => match d
+                .send_embed(&title, &message, url.as_deref(), level.discord_color(), fields.clone(), false)
+                .await
+            {
+                Ok(_) => sent.push("Discord"),
+                Err(e) => failed.push(format!("Discord: {e}")),
+            },
+            None => failed.push("Discord: not configured".into()),
+        }
+    }
+    if want_zulip {
+        match notifier.zulip() {
+            Some(z) => {
+                let mut text = match url.as_deref() {
+                    Some(u) => format!("### [{title}]({u})\n\n{message}"),
+                    None => format!("### {title}\n\n{message}"),
+                };
+                text.push_str(&format!("\n\n* **Sent by**: {}\n", user.username));
+                match z
+                    .send_message(ZulipTopicCategory::Custom("announcements"), &text)
+                    .await
+                {
+                    Ok(_) => sent.push("Zulip"),
+                    Err(e) => failed.push(format!("Zulip: {e}")),
+                }
+            }
+            None => failed.push("Zulip: not configured".into()),
+        }
+    }
+
+    let ok = failed.is_empty();
+    state.db.audit(
+        &user.username,
+        "notify.send",
+        &sent.join(","),
+        &format!("title={title} failed={}", failed.join("; ")),
+        &auth::client_ip(&headers),
+        ok,
+    );
+    let mut msg = String::new();
+    if !sent.is_empty() {
+        msg.push_str(&format!("Sent to {}. ", sent.join(", ")));
+    }
+    if !failed.is_empty() {
+        msg.push_str(&format!("Failed: {}", failed.join("; ")));
+    }
+    notify_flash(ok, msg.trim())
 }
 
 async fn purge_audit_logs(
