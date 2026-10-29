@@ -148,10 +148,17 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "stats", usage: "/stats", help: "Issue / PR / commit statistics for current repository", restricted: false, admin_only: false },
     CommandSpec { name: "issues", usage: "/issues [n]", help: "List recent open issues (default 10)", restricted: false, admin_only: false },
     CommandSpec { name: "prs", usage: "/prs [n]", help: "List recent open PRs (default 10)", restricted: false, admin_only: false },
+    CommandSpec { name: "users", usage: "/users", help: "List eligible GitHub assignees & reviewer pool", restricted: false, admin_only: false },
     CommandSpec { name: "label", usage: "/label <num> <label...>", help: "Add labels to an issue or PR", restricted: true, admin_only: false },
     CommandSpec { name: "unlabel", usage: "/unlabel <num> <label...>", help: "Remove labels from an issue or PR", restricted: true, admin_only: false },
     CommandSpec { name: "assign", usage: "/assign <num> <user...>", help: "Assign an issue or PR to users", restricted: true, admin_only: false },
     CommandSpec { name: "unassign", usage: "/unassign <num> <user...>", help: "Remove assignees from an issue or PR", restricted: true, admin_only: false },
+    CommandSpec { name: "reviewer", usage: "/reviewer <num> [set|+|-] <user...>", help: "List, add, remove or replace (set) PR reviewers", restricted: true, admin_only: false },
+    CommandSpec { name: "unreviewer", usage: "/unreviewer <num> <user...>", help: "Remove requested reviewers from a PR", restricted: true, admin_only: false },
+    CommandSpec { name: "workload", usage: "/workload", help: "Active review workload per reviewer in this repository", restricted: false, admin_only: false },
+    CommandSpec { name: "project", usage: "/project <num> <project> [status]", help: "Add an issue/PR to a GitHub Project v2 board", restricted: true, admin_only: false },
+    CommandSpec { name: "move", usage: "/move <num> <owner/repo>", help: "Move an issue to another repository", restricted: true, admin_only: false },
+    CommandSpec { name: "duplicate", usage: "/duplicate <num> <#original>", help: "Close an issue as a duplicate of another", restricted: true, admin_only: false },
     CommandSpec { name: "close", usage: "/close <num> [reason]", help: "Close an issue or PR", restricted: true, admin_only: false },
     CommandSpec { name: "reopen", usage: "/reopen <num>", help: "Reopen a closed issue or PR", restricted: true, admin_only: false },
     CommandSpec { name: "comment", usage: "/comment <num> <text>", help: "Post a comment on an issue or PR", restricted: true, admin_only: false },
@@ -164,5 +171,12 @@ pub const COMMANDS: &[CommandSpec] = &[
 ];
 
 pub fn command_spec(name: &str) -> Option<&'static CommandSpec> {
-    COMMANDS.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+    let lower = name.to_ascii_lowercase();
+    let canonical = match lower.as_str() {
+        "assignees" | "collaborators" | "team" => "users",
+        "reviewers" | "review" | "reassign" | "rereview" => "reviewer",
+        "unreviewers" => "unreviewer",
+        other => other,
+    };
+    COMMANDS.iter().find(|c| c.name.eq_ignore_ascii_case(canonical))
 }

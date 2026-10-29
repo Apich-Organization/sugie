@@ -417,6 +417,7 @@ pub fn dashboard_page(
                             <a class="btn sm ghost" href="/admin/chat">"/status"</a>
                             <a class="btn sm ghost" href="/admin/chat">"/stats"</a>
                             <a class="btn sm ghost" href="/admin/chat">"/issues"</a>
+                            <a class="btn sm ghost" href="/admin/chat">"/users"</a>
                             <a class="btn sm ghost" href="/admin/chat">"/report"</a>
                         </div>
                     </div>
@@ -607,7 +608,7 @@ pub fn chat_page(
 
     let quick = COMMANDS
         .iter()
-        .take(8)
+        .take(10)
         .map(|spec| {
             let cmd = spec.name.to_string();
             view! { <button type="button" data-cmd=cmd.clone()>{format!("/{cmd}")}</button> }

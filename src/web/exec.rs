@@ -415,14 +415,19 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
         }
 
         "assign" | "unassign" => {
-            let Some(num) = ctx.need_number(args) else { return false };
+            let Some(num) = args.first().and_then(|a| a.trim_start_matches('#').parse::<u64>().ok()) else {
+                ctx.err(format!("Usage: /{cmd} <issue/PR-num> <@username...>  (e.g. `/{cmd} 42 @octocat`)"));
+                print_user_hints(ctx, owner, repo).await;
+                return false;
+            };
             let users: Vec<String> = args[1..]
                 .iter()
                 .map(|u| u.trim_start_matches('@').to_string())
                 .filter(|u| !u.is_empty())
                 .collect();
             if users.is_empty() {
-                ctx.err("Please specify username(s), e.g. `/assign 42 octocat`");
+                ctx.err(format!("Please specify username(s), e.g. `/{cmd} {num} @octocat`"));
+                print_user_hints(ctx, owner, repo).await;
                 return false;
             }
             let client = match ctx.state.triage.get_client_for_repo(ctx.repo).await {
@@ -454,6 +459,36 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 }
             }
         }
+
+        "users" | "assignees" | "collaborators" | "team" => {
+            run_users(ctx, owner, repo).await
+        }
+
+        "workload" => {
+            match ctx.state.triage.storage().list_all_reviewer_workloads(Some(ctx.repo)) {
+                Ok(rows) if rows.is_empty() => {
+                    ctx.info(format!("No reviewer workloads tracked for {}", ctx.repo));
+                    true
+                }
+                Ok(rows) => {
+                    ctx.ok(format!("Active review workload for {}", ctx.repo));
+                    for (username, _repo, active) in rows {
+                        ctx.out(format!("  @{username:<24} {active} active reviews"));
+                    }
+                    true
+                }
+                Err(e) => {
+                    ctx.err(format!("Failed to read workloads: {e}"));
+                    false
+                }
+            }
+        }
+
+        "reviewer" | "reviewers" | "review" | "reassign" | "rereview" | "unreviewer" | "unreviewers" => {
+            run_reviewer(ctx, cmd, args, owner, repo).await
+        }
+
+        "project" | "move" | "duplicate" => run_issue_command(ctx, cmd, args, owner, repo).await,
 
         "close" | "reopen" => {
             let Some(num) = ctx.need_number(args) else { return false };
@@ -699,6 +734,383 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             false
         }
     }
+}
+
+/// `/project <num> <project> [status]`, `/move <num> <owner/repo>`, `/duplicate <num> <#original>`
+/// Reuses the same executor as bot / GitHub-comment commands so behaviour stays identical.
+async fn run_issue_command(
+    ctx: &Ctx<'_>,
+    cmd: &str,
+    args: &[String],
+    owner: &str,
+    repo: &str,
+) -> bool {
+    use crate::github::models::User;
+    use crate::triage::commands::{CommandExecutor, SlashCommand};
+    use crate::triage::projects::ProjectsService;
+    use crate::triage::reviewers::ReviewerLoadBalancer;
+
+    let Some(num) = ctx.need_number(args) else { return false };
+    let command = match cmd {
+        "project" => match args.get(1) {
+            Some(target) => SlashCommand::Project {
+                target: target.clone(),
+                status: if args.len() > 2 { Some(args[2..].join(" ")) } else { None },
+            },
+            None => {
+                ctx.err("Usage: /project <num> <project-number> [status]");
+                return false;
+            }
+        },
+        "move" => match args.get(1) {
+            Some(target) if target.contains('/') => SlashCommand::Move { target_repo: target.clone() },
+            _ => {
+                ctx.err("Usage: /move <num> <owner/target-repo>");
+                return false;
+            }
+        },
+        _ => match args.get(1).and_then(|a| a.trim_start_matches('#').parse::<u64>().ok()) {
+            Some(orig) => SlashCommand::Duplicate(orig),
+            None => {
+                ctx.err("Usage: /duplicate <num> <#original-number>");
+                return false;
+            }
+        },
+    };
+
+    let client = match ctx.state.triage.get_client_for_repo(ctx.repo).await {
+        Ok(c) => c,
+        Err(e) => {
+            ctx.err(format!("Failed to get installation token: {e}"));
+            return false;
+        }
+    };
+    let issue = match client.get_issue(owner, repo, num).await {
+        Ok(i) => i,
+        Err(e) => {
+            ctx.err(format!("Could not find issue/PR #{num}: {e}"));
+            return false;
+        }
+    };
+    let repo_config = ctx.state.triage.load_repo_config(&client, owner, repo).await;
+    let projects = ProjectsService::new(repo_config.projects.clone());
+    let balancer = ReviewerLoadBalancer::new(
+        repo_config.reviewers.clone(),
+        ctx.state.triage.storage().clone(),
+    );
+    // Console permission was already enforced (role + per-user grants), so lift the
+    // super-user restriction that applies to GitHub-comment invocations.
+    let mut commands_cfg = repo_config.commands.clone();
+    commands_cfg.restricted_commands.clear();
+    let executor = CommandExecutor::new(
+        &client,
+        &projects,
+        ctx.state.triage.notifier(),
+        &commands_cfg,
+        Some(balancer),
+    );
+    let sender = User {
+        login: ctx.user.username.clone(),
+        id: 0,
+        r#type: None,
+    };
+    match executor.execute(&command, owner, repo, &issue, &sender).await {
+        Ok(()) => {
+            ctx.ok(format!("Executed /{cmd} on {}#{num}", ctx.repo));
+            true
+        }
+        Err(e) => {
+            ctx.err(format!("/{cmd} failed: {e}"));
+            false
+        }
+    }
+}
+
+/// Collects eligible GitHub assignees, configured reviewer pool members, super users,
+/// and tracked review workloads for `owner/repo`.
+async fn collect_repo_users(
+    ctx: &Ctx<'_>,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    let client = ctx
+        .state
+        .triage
+        .get_client_for_repo(ctx.repo)
+        .await
+        .map_err(|e| format!("Failed to get installation token: {e}"))?;
+
+    let repo_config = ctx.state.triage.load_repo_config(&client, owner, repo).await;
+    let gh_assignees: Vec<String> = client
+        .list_assignees(owner, repo)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|u| u.login)
+        .collect();
+    let workloads = ctx
+        .state
+        .triage
+        .storage()
+        .list_all_reviewer_workloads(Some(ctx.repo))
+        .unwrap_or_default();
+
+    let mut ordered: Vec<String> = Vec::new();
+    let mut push_unique = |name: &str| {
+        let clean = name.trim().trim_start_matches('@');
+        if !clean.is_empty() && !ordered.iter().any(|x| x.eq_ignore_ascii_case(clean)) {
+            ordered.push(clean.to_string());
+        }
+    };
+
+    for u in &repo_config.reviewers.pool {
+        push_unique(u);
+    }
+    for u in &repo_config.commands.super_users {
+        push_unique(u);
+    }
+    for (u, _, _) in &workloads {
+        push_unique(u);
+    }
+    for u in &gh_assignees {
+        push_unique(u);
+    }
+
+    let out = ordered
+        .into_iter()
+        .map(|login| {
+            let mut tags = Vec::new();
+            if repo_config
+                .reviewers
+                .pool
+                .iter()
+                .any(|p| p.trim_start_matches('@').eq_ignore_ascii_case(&login))
+            {
+                tags.push("Reviewer Pool".to_string());
+            }
+            if repo_config
+                .commands
+                .super_users
+                .iter()
+                .any(|s| s.trim_start_matches('@').eq_ignore_ascii_case(&login))
+            {
+                tags.push("Super User".to_string());
+            }
+            if gh_assignees.iter().any(|g| g.eq_ignore_ascii_case(&login)) {
+                tags.push("GitHub Assignee".to_string());
+            }
+            if let Some((_, _, active)) = workloads
+                .iter()
+                .find(|(w, _, _)| w.eq_ignore_ascii_case(&login))
+            {
+                tags.push(format!("{active} active reviews"));
+            }
+            (login, tags)
+        })
+        .collect();
+
+    Ok(out)
+}
+
+async fn run_users(ctx: &Ctx<'_>, owner: &str, repo: &str) -> bool {
+    ctx.info(format!(
+        "Fetching eligible GitHub assignees & reviewer pool for {}…",
+        ctx.repo
+    ));
+    match collect_repo_users(ctx, owner, repo).await {
+        Ok(users) if users.is_empty() => {
+            ctx.info(format!("No assignees or reviewer pool members found for {}", ctx.repo));
+            true
+        }
+        Ok(users) => {
+            ctx.ok(format!(
+                "Available GitHub users for {} ({} total):",
+                ctx.repo,
+                users.len()
+            ));
+            for (login, tags) in &users {
+                let tag_str = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", tags.join(" · "))
+                };
+                ctx.out(format!("  @{login:<24}{tag_str}"));
+            }
+            ctx.info("Tip: Use `/assign <num> @user` or `/reviewer <num> set @user`");
+            true
+        }
+        Err(e) => {
+            ctx.err(e);
+            false
+        }
+    }
+}
+
+async fn print_user_hints(ctx: &Ctx<'_>, owner: &str, repo: &str) {
+    if let Ok(users) = collect_repo_users(ctx, owner, repo).await {
+        if !users.is_empty() {
+            let formatted: Vec<String> = users
+                .iter()
+                .take(20)
+                .map(|(login, tags)| {
+                    if tags.iter().any(|t| t == "Reviewer Pool") {
+                        format!("@{login} (pool)")
+                    } else {
+                        format!("@{login}")
+                    }
+                })
+                .collect();
+            ctx.info(format!(
+                "Available GitHub users in {}: {}",
+                ctx.repo,
+                formatted.join(", ")
+            ));
+        }
+    }
+}
+
+/// `/reviewer <num> [set|add|remove] [+|-]user...` and `/unreviewer <num> user...`
+async fn run_reviewer(ctx: &Ctx<'_>, cmd: &str, args: &[String], owner: &str, repo: &str) -> bool {
+    use crate::triage::reviewers::ReviewerLoadBalancer;
+
+    let Some(num) = args.first().and_then(|a| a.trim_start_matches('#').parse::<u64>().ok()) else {
+        ctx.err("Usage: /reviewer <pr-num> [set|+|-] <@username...>  (e.g. `/reviewer 12 set @alice`)");
+        print_user_hints(ctx, owner, repo).await;
+        return false;
+    };
+    let mut rest: Vec<String> = args[1..].to_vec();
+
+    // Optional sub-command.
+    let mut mode = if matches!(cmd, "reassign" | "rereview") {
+        "set"
+    } else if matches!(cmd, "unreviewer" | "unreviewers") {
+        "remove"
+    } else {
+        "edit"
+    };
+    if matches!(cmd, "reviewer" | "reviewers" | "review") {
+        if let Some(first) = rest.first().map(|s| s.to_ascii_lowercase()) {
+            match first.as_str() {
+                "set" | "replace" | "change" | "swap" => {
+                    mode = "set";
+                    rest.remove(0);
+                }
+                "add" => {
+                    rest.remove(0);
+                }
+                "remove" | "rm" | "del" => {
+                    mode = "remove";
+                    rest.remove(0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let clean = |s: &str| s.trim_start_matches(|c| c == '+' || c == '-').trim_start_matches('@').to_string();
+    let mut add: Vec<String> = Vec::new();
+    let mut remove: Vec<String> = Vec::new();
+    for tok in &rest {
+        let user = clean(tok);
+        if user.is_empty() {
+            continue;
+        }
+        match mode {
+            "remove" => remove.push(user),
+            "set" => add.push(user),
+            _ => {
+                if tok.starts_with('-') {
+                    remove.push(user);
+                } else {
+                    add.push(user);
+                }
+            }
+        }
+    }
+
+    let client = match ctx.state.triage.get_client_for_repo(ctx.repo).await {
+        Ok(c) => c,
+        Err(e) => {
+            ctx.err(format!("Failed to get installation token: {e}"));
+            return false;
+        }
+    };
+    let pr = match client.get_pull_request(owner, repo, num).await {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.err(format!("#{num} is not a pull request or could not be fetched: {e}"));
+            return false;
+        }
+    };
+    let current: Vec<String> = pr.requested_reviewers.iter().map(|u| u.login.clone()).collect();
+
+    // No users given: show the current reviewers and available user hints.
+    if add.is_empty() && remove.is_empty() {
+        if mode == "set" {
+            ctx.err(format!("Specify the new reviewer(s), e.g. `/reviewer {num} set @alice @bob`"));
+            print_user_hints(ctx, owner, repo).await;
+            return false;
+        }
+        if current.is_empty() {
+            ctx.info(format!("{}#{num} has no requested reviewers", ctx.repo));
+        } else {
+            ctx.ok(format!(
+                "{}#{num} requested reviewers: {}",
+                ctx.repo,
+                current.iter().map(|u| format!("@{u}")).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        print_user_hints(ctx, owner, repo).await;
+        return true;
+    }
+
+    let has = |list: &[String], u: &str| list.iter().any(|x| x.eq_ignore_ascii_case(u));
+    if mode == "set" {
+        remove = current.iter().filter(|c| !has(&add, c)).cloned().collect();
+    }
+    add.retain(|u| !has(&current, u) && !u.eq_ignore_ascii_case(&pr.user.login));
+    add.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    remove.retain(|u| has(&current, u));
+
+    if add.is_empty() && remove.is_empty() {
+        ctx.info("Nothing to change: requested reviewers already match");
+        return true;
+    }
+
+    let repo_config = ctx.state.triage.load_repo_config(&client, owner, repo).await;
+    let balancer = ReviewerLoadBalancer::new(
+        repo_config.reviewers.clone(),
+        ctx.state.triage.storage().clone(),
+    );
+
+    if !remove.is_empty() {
+        if let Err(e) = client.remove_reviewers(owner, repo, num, &remove).await {
+            ctx.err(format!("Failed to remove reviewers: {e}"));
+            return false;
+        }
+        for r in &remove {
+            let _ = balancer.on_review_completed_or_closed(ctx.repo, r);
+        }
+        ctx.ok(format!("Removed reviewers: {}", remove.join(", ")));
+    }
+    if !add.is_empty() {
+        if let Err(e) = client.request_reviewers(owner, repo, num, &add).await {
+            ctx.err(format!("Failed to request reviewers: {e}"));
+            return false;
+        }
+        for r in &add {
+            let _ = balancer.on_review_requested(ctx.repo, r);
+        }
+        ctx.ok(format!("Requested reviewers: {}", add.join(", ")));
+    }
+    let body = format!(
+        "🔄 **Reviewers changed by @{}** (via admin console){}{}",
+        ctx.user.username,
+        if remove.is_empty() { String::new() } else { format!("\n- Removed: {}", remove.iter().map(|u| format!("@{u}")).collect::<Vec<_>>().join(", ")) },
+        if add.is_empty() { String::new() } else { format!("\n- Requested: {}", add.iter().map(|u| format!("@{u}")).collect::<Vec<_>>().join(", ")) },
+    );
+    let _ = client.create_comment(owner, repo, num, &body).await;
+    true
 }
 
 fn truncate(s: &str, max: usize) -> String {

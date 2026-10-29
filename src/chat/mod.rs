@@ -39,7 +39,18 @@ pub enum ChatCommand {
     Status,
     Repos,
     Workload { repo: Option<String> },
+    Users { repo: Option<String> },
     Metrics { repo: Option<String> },
+    Issues { repo: Option<String> },
+    Prs { repo: Option<String> },
+    Stats { repo: Option<String> },
+    Config,
+    Stale { repo: Option<String> },
+    Comment {
+        repo: String,
+        number: u64,
+        body: String,
+    },
     IssueAction {
         repo: String,
         number: u64,
@@ -84,9 +95,52 @@ impl ChatCommandParser {
                 let repo = parts.get(1).map(|r| Self::resolve_repo(r, known_repos));
                 ChatCommand::Workload { repo }
             }
+            "users" | "assignees" | "collaborators" | "team" => {
+                let repo = parts.get(1).map(|r| Self::resolve_repo(r, known_repos));
+                ChatCommand::Users { repo }
+            }
             "metrics" | "report" => {
                 let repo = parts.get(1).map(|r| Self::resolve_repo(r, known_repos));
                 ChatCommand::Metrics { repo }
+            }
+            "config" => ChatCommand::Config,
+            "stats" => {
+                let repo = parts.get(1).map(|r| Self::resolve_repo(r, known_repos));
+                ChatCommand::Stats { repo }
+            }
+            "stale" => {
+                let repo = parts.get(1).map(|r| Self::resolve_repo(r, known_repos));
+                ChatCommand::Stale { repo }
+            }
+            "comment" => {
+                // `/comment <repo>#<num> <text>` or `/comment <repo> <num> <text>`
+                if parts.len() >= 3 {
+                    if let Some((repo, number)) = Self::parse_repo_issue_target(parts[1], known_repos) {
+                        return ChatCommand::Comment {
+                            repo,
+                            number,
+                            body: parts[2..].join(" "),
+                        };
+                    }
+                    if parts.len() >= 4 {
+                        if let Ok(number) = parts[2].trim_start_matches('#').parse::<u64>() {
+                            return ChatCommand::Comment {
+                                repo: Self::resolve_repo(parts[1], known_repos),
+                                number,
+                                body: parts[3..].join(" "),
+                            };
+                        }
+                    }
+                }
+                ChatCommand::Unknown(trimmed.to_string())
+            }
+            "issues" | "prs" | "pulls" => {
+                let repo = parts.get(1).map(|r| Self::resolve_repo(r, known_repos));
+                if cmd_key == "issues" {
+                    ChatCommand::Issues { repo }
+                } else {
+                    ChatCommand::Prs { repo }
+                }
             }
             _ => {
                 // Pattern 1: `[repo#num] /command [args...]`
@@ -99,6 +153,24 @@ impl ChatCommandParser {
                             number,
                             command: cmd,
                         };
+                    }
+                }
+
+                // Pattern 2a: `/reviewer set <repo#num> @a @b` (sub-command before the target)
+                if parts.len() >= 3
+                    && matches!(parts[1].to_lowercase().as_str(), "set" | "replace" | "change" | "swap")
+                {
+                    if let Some((repo, number)) = Self::parse_repo_issue_target(parts[2], known_repos) {
+                        let mut reconstructed = vec![parts[0], parts[1]];
+                        reconstructed.extend_from_slice(&parts[3..]);
+                        let cmd_str = reconstructed.join(" ");
+                        if let Some(cmd) = Self::parse_single_slash_command(&cmd_str) {
+                            return ChatCommand::IssueAction {
+                                repo,
+                                number,
+                                command: cmd,
+                            };
+                        }
                     }
                 }
 
@@ -240,7 +312,18 @@ impl<'a> ChatCommandExecutor<'a> {
             ChatCommand::Status => self.render_status().await,
             ChatCommand::Repos => self.render_repos(),
             ChatCommand::Workload { repo } => self.render_workload(repo.as_deref()),
+            ChatCommand::Users { repo } => self.render_users(repo.as_deref()).await,
             ChatCommand::Metrics { repo } => self.render_metrics(repo.as_deref()).await,
+            ChatCommand::Issues { repo } => self.render_open_items(repo.as_deref(), false).await,
+            ChatCommand::Prs { repo } => self.render_open_items(repo.as_deref(), true).await,
+            ChatCommand::Stats { repo } => self.render_stats(repo.as_deref()).await,
+            ChatCommand::Config => self.render_config(),
+            ChatCommand::Stale { repo } => {
+                self.run_stale(&message.sender, repo.as_deref()).await
+            }
+            ChatCommand::Comment { repo, number, body } => {
+                self.post_comment(&message.sender, &repo, number, &body).await
+            }
             ChatCommand::IssueAction {
                 repo,
                 number,
@@ -285,7 +368,12 @@ You can send commands directly to Sugie from this chat:
 | `status` | `@bot status` | Shows bot health, version, and monitored repos |
 | `repos` | `@bot repos` | Lists all onboarded repositories |
 | `workload [repo]` | `@bot workload ensia` | Displays reviewer active review workloads |
+| `users [repo]` | `@bot users ensia` | Lists eligible GitHub assignees & reviewer pool |
 | `metrics [repo]` | `@bot metrics ensia` | Displays 7-day issue & PR triage digest |
+| `stats [repo]` | `@bot stats ensia` | Issue / PR / commit statistics |
+| `config` | `@bot config` | Shows the active configuration summary |
+| `issues [repo]` | `@bot issues ensia` | Lists open issues (first 10) |
+| `prs [repo]` | `@bot prs ensia` | Lists open PRs with their requested reviewers |
 | `help` | `@bot help` | Displays this help manual |
 
 #### 🛠️ Repository & Issue/PR Actions
@@ -294,11 +382,19 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
 | :--- | :--- | :--- |
 | `/reviewer` | `/reviewer ensia#12 @alice @bob` | Requests reviewers (PRs only) |
 | `/reviewer` | `/reviewer ensia#12 +@alice -@bob` | Adds & removes reviewers |
+| `/reviewer set` | `/reviewer set ensia#12 @alice @bob` | **Replaces** all requested reviewers with exactly this list |
+| `/reassign` | `/reassign ensia#12 @carol` | Alias of `/reviewer set` (change reviewer) |
 | `/unreviewer` | `/unreviewer ensia#12 @bob` | Removes requested reviewer |
 | `/reviewer` | `/reviewer ensia#12` | Auto-assigns least-busy reviewers |
 | `/assign` | `/assign ensia#12 @alice` | Assigns user(s) to issue or PR |
 | `/unassign` | `/unassign ensia#12 @alice` | Removes assignment |
 | `/label` | `/label ensia#12 +bug -wip` | Adds/removes labels on GitHub |
+| `/comment` | `/comment ensia#12 Fixed in v0.2.1` | Posts a comment (super users only) |
+| `/stale` | `/stale ensia` | Runs a stale sweep on a repo (super users only) |
+| `/unlabel` | `/unlabel ensia#12 wip` | Removes label(s) |
+| `/project` | `/project ensia#12 1 Triage` | Adds to a GitHub Project v2 board |
+| `/move` | `/move ensia#12 org/other-repo` | Moves issue to another repository |
+| `/duplicate` | `/duplicate ensia#12 #5` | Closes as duplicate of #5 |
 | `/close` | `/close ensia#12 completed` | Closes issue or PR |
 | `/reopen` | `/reopen ensia#12` | Reopens issue or PR |
 | `/retest` | `/retest ensia#12` | Retests failed CI checks (PRs only) |
@@ -409,6 +505,298 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
             lines.push(format!("- **@{}** (`{}`): **{}** active reviews", username, repo, active));
         }
         lines.join("\n")
+    }
+
+    fn is_super_user(&self, sender: &InboundSender) -> bool {
+        self.config
+            .default_rules
+            .commands
+            .super_users
+            .iter()
+            .any(|su| {
+                let clean = su.trim_start_matches('@');
+                clean.eq_ignore_ascii_case(&sender.username) || clean.eq_ignore_ascii_case(&sender.id)
+            })
+    }
+
+    async fn client_for(&self, repo: &str) -> Result<GitHubClient> {
+        match self.triage.get_client_for_repo(repo).await {
+            Ok(c) => Ok(c),
+            Err(_) => self.find_client_dynamically(repo).await,
+        }
+    }
+
+    fn default_repo(&self, target: Option<&str>) -> Option<String> {
+        target
+            .map(|s| s.to_string())
+            .or_else(|| self.get_known_repositories().first().cloned())
+    }
+
+    async fn render_users(&self, target_repo: Option<&str>) -> String {
+        let Some(repo) = self.default_repo(target_repo) else {
+            return "⚠️ Please specify repository: `users <owner/repo>`.".to_string();
+        };
+        let Some((owner, repo_name)) = repo.split_once('/') else {
+            return format!("⚠️ Invalid repository format `{}`.", repo);
+        };
+        let client = match self.client_for(&repo).await {
+            Ok(c) => c,
+            Err(e) => return format!("❌ Could not access repository `{}`: {}", repo, e),
+        };
+
+        let repo_config = self.triage.load_repo_config(&client, owner, repo_name).await;
+        let gh_assignees: Vec<String> = client
+            .list_assignees(owner, repo_name)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|u| u.login)
+            .collect();
+        let workloads = self
+            .triage
+            .storage()
+            .list_all_reviewer_workloads(Some(&repo))
+            .unwrap_or_default();
+
+        let mut ordered: Vec<String> = Vec::new();
+        let mut push_unique = |name: &str| {
+            let clean = name.trim().trim_start_matches('@');
+            if !clean.is_empty() && !ordered.iter().any(|x| x.eq_ignore_ascii_case(clean)) {
+                ordered.push(clean.to_string());
+            }
+        };
+
+        for u in &repo_config.reviewers.pool {
+            push_unique(u);
+        }
+        for u in &repo_config.commands.super_users {
+            push_unique(u);
+        }
+        for (u, _, _) in &workloads {
+            push_unique(u);
+        }
+        for u in &gh_assignees {
+            push_unique(u);
+        }
+
+        if ordered.is_empty() {
+            return format!("👥 No eligible assignees or reviewers found for `{}`.", repo);
+        }
+
+        let mut lines = vec![format!(
+            "👥 **Available GitHub Users for `{}` ({})**:",
+            repo,
+            ordered.len()
+        )];
+        for login in ordered {
+            let mut tags = Vec::new();
+            if repo_config
+                .reviewers
+                .pool
+                .iter()
+                .any(|p| p.trim_start_matches('@').eq_ignore_ascii_case(&login))
+            {
+                tags.push("Reviewer Pool".to_string());
+            }
+            if repo_config
+                .commands
+                .super_users
+                .iter()
+                .any(|s| s.trim_start_matches('@').eq_ignore_ascii_case(&login))
+            {
+                tags.push("Super User".to_string());
+            }
+            if gh_assignees.iter().any(|g| g.eq_ignore_ascii_case(&login)) {
+                tags.push("GitHub Assignee".to_string());
+            }
+            if let Some((_, _, active)) = workloads
+                .iter()
+                .find(|(w, _, _)| w.eq_ignore_ascii_case(&login))
+            {
+                tags.push(format!("{active} active reviews"));
+            }
+            if tags.is_empty() {
+                lines.push(format!("- **@{}**", login));
+            } else {
+                lines.push(format!("- **@{}** ({})", login, tags.join(" · ")));
+            }
+        }
+        lines.join("\n")
+    }
+
+    async fn render_stats(&self, target_repo: Option<&str>) -> String {
+        let Some(repo) = self.default_repo(target_repo) else {
+            return "⚠️ Please specify repository: `stats <owner/repo>`.".to_string();
+        };
+        let cache = crate::web::stats::StatsCache::default();
+        let s = crate::web::stats::fetch(self.triage, &cache, &repo, true).await;
+        if let Some(e) = s.error {
+            return format!("⚠️ Could not fetch stats for `{}`: {}", repo, e);
+        }
+        format!(
+            "📈 **Stats for `{}`**\n\n- Open issues: **{}**\n- Open PRs: **{}**\n- Commits (30d): **{}**\n- Merged PRs (30d): **{}**\n- Stars: **{}** · Forks: **{}**\n- Default branch: `{}`",
+            s.full_name, s.open_issues, s.open_prs, s.commits_30d, s.merged_30d, s.stars, s.forks, s.default_branch
+        )
+    }
+
+    fn render_config(&self) -> String {
+        let s = crate::web::config_store::ConfigSummary::from_config(self.config);
+        format!(
+            "⚙️ **Active Configuration**\n\n- Listen: `{}:{}`\n- Notification channels: {}\n- Repository filter: {}\n- Super users: {}\n- Restricted commands: {}\n- Stale sweep: {} · Auto reviewers: {} · Auto labels: {}",
+            s.host,
+            s.port,
+            if s.channels.is_empty() { "None".to_string() } else { s.channels.join(", ") },
+            if s.allowed_repositories.is_empty() { "all onboarded repositories".to_string() } else { s.allowed_repositories.join(", ") },
+            if s.super_users.is_empty() { "(none)".to_string() } else { s.super_users.join(", ") },
+            if s.restricted_commands.is_empty() { "(none)".to_string() } else { format!("/{}", s.restricted_commands.join(", /")) },
+            if s.stale_enabled { "on" } else { "off" },
+            if s.reviewers_enabled { "on" } else { "off" },
+            if s.labels_enabled { "on" } else { "off" },
+        )
+    }
+
+    async fn run_stale(&self, sender: &InboundSender, target_repo: Option<&str>) -> String {
+        if !self.is_super_user(sender) {
+            return format!(
+                "⛔ Sorry @{}, `/stale` is restricted to authorized super users.",
+                sender.username
+            );
+        }
+        let rules = self.config.default_rules.stale.clone();
+        if !rules.enabled {
+            return "⚠️ Stale lifecycle rules are disabled (`default_rules.stale.enabled = false`).".to_string();
+        }
+        let Some(repo) = self.default_repo(target_repo) else {
+            return "⚠️ Please specify repository: `stale <owner/repo>`.".to_string();
+        };
+        let Some((owner, repo_name)) = repo.split_once('/') else {
+            return format!("⚠️ Invalid repository format `{}`.", repo);
+        };
+        let client = match self.client_for(&repo).await {
+            Ok(c) => c,
+            Err(e) => return format!("❌ Could not access repository `{}`: {}", repo, e),
+        };
+        let mgr = crate::stale::StaleManager::new(
+            rules,
+            self.triage.storage().clone(),
+            crate::notifications::NotificationDispatcher::new(&self.config.notifications),
+        );
+        match mgr.process_repository(&client, owner, repo_name).await {
+            Ok(r) => format!(
+                "🧹 Stale sweep for `{}` completed: warned **{}** · closed **{}** · locked **{}**",
+                repo, r.warned_count, r.closed_count, r.locked_count
+            ),
+            Err(e) => format!("⚠️ Stale sweep failed for `{}`: {}", repo, e),
+        }
+    }
+
+    async fn post_comment(
+        &self,
+        sender: &InboundSender,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> String {
+        if !self.is_super_user(sender) {
+            return format!(
+                "⛔ Sorry @{}, `/comment` is restricted to authorized super users.",
+                sender.username
+            );
+        }
+        let Some((owner, repo_name)) = repo.split_once('/') else {
+            return format!(
+                "⚠️ Invalid repository format `{}`. Please specify `owner/repo`.",
+                repo
+            );
+        };
+        let client = match self.client_for(repo).await {
+            Ok(c) => c,
+            Err(e) => return format!("❌ Could not connect to repository `{}`: {}", repo, e),
+        };
+        let text = format!("{}\n\n— _posted by @{} via Sugie chat_", body.trim(), sender.username);
+        match client.create_comment(owner, repo_name, number, &text).await {
+            Ok(c) => match c.html_url {
+                Some(url) => format!("✅ Commented on [{}#{}]({}) as requested by @{}.", repo, number, url, sender.username),
+                None => format!("✅ Commented on {}#{} as requested by @{}.", repo, number, sender.username),
+            },
+            Err(e) => format!("⚠️ Failed to comment on {}#{}: {}", repo, number, e),
+        }
+    }
+
+    async fn render_open_items(&self, target_repo: Option<&str>, prs: bool) -> String {
+        let repo = match target_repo {
+            Some(r) => r.to_string(),
+            None => match self.get_known_repositories().first() {
+                Some(first) => first.clone(),
+                None => {
+                    return format!(
+                        "⚠️ Please specify repository: `{} <owner/repo>`.",
+                        if prs { "prs" } else { "issues" }
+                    )
+                }
+            },
+        };
+        let Some((owner, repo_name)) = repo.split_once('/') else {
+            return format!("⚠️ Invalid repository format `{}`.", repo);
+        };
+        let client = match self.triage.get_client_for_repo(&repo).await {
+            Ok(c) => c,
+            Err(_) => match self.find_client_dynamically(&repo).await {
+                Ok(c) => c,
+                Err(e) => return format!("❌ Could not access repository `{}`: {}", repo, e),
+            },
+        };
+        const LIMIT: usize = 10;
+        if prs {
+            match client.list_repo_pulls(owner, repo_name, "open", 100).await {
+                Ok(list) => {
+                    let mut lines = vec![format!(
+                        "🔀 **Open PRs in `{}`** ({} total, showing {}):",
+                        repo,
+                        list.len(),
+                        list.len().min(LIMIT)
+                    )];
+                    for p in list.iter().take(LIMIT) {
+                        let reviewers = if p.requested_reviewers.is_empty() {
+                            "no reviewers".to_string()
+                        } else {
+                            p.requested_reviewers
+                                .iter()
+                                .map(|u| format!("@{}", u.login))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        lines.push(format!(
+                            "- #{} {} — @{}{} · reviewers: {}",
+                            p.number,
+                            p.title,
+                            p.user.login,
+                            if p.draft { " (draft)" } else { "" },
+                            reviewers
+                        ));
+                    }
+                    lines.join("\n")
+                }
+                Err(e) => format!("⚠️ Failed to fetch PRs for `{}`: {}", repo, e),
+            }
+        } else {
+            match client.list_repo_issues(owner, repo_name, "open", 100).await {
+                Ok(list) => {
+                    let issues: Vec<_> = list.into_iter().filter(|i| !i.is_pr()).collect();
+                    let mut lines = vec![format!(
+                        "🐞 **Open issues in `{}`** ({} total, showing {}):",
+                        repo,
+                        issues.len(),
+                        issues.len().min(LIMIT)
+                    )];
+                    for i in issues.iter().take(LIMIT) {
+                        lines.push(format!("- #{} {} — @{}", i.number, i.title, i.user.login));
+                    }
+                    lines.join("\n")
+                }
+                Err(e) => format!("⚠️ Failed to fetch issues for `{}`: {}", repo, e),
+            }
+        }
     }
 
     async fn render_metrics(&self, target_repo: Option<&str>) -> String {
@@ -620,6 +1008,28 @@ mod tests {
                 number: 42,
                 command: SlashCommand::Close(Some("not planned".to_string())),
             }
+        );
+
+        // Change reviewers (set/replace)
+        assert_eq!(
+            ChatCommandParser::parse("/reviewer set ensia#12 @alice @bob", &known),
+            ChatCommand::IssueAction {
+                repo: "StarLabsSI/ensia".to_string(),
+                number: 12,
+                command: SlashCommand::ReviewerSet(vec!["alice".to_string(), "bob".to_string()]),
+            }
+        );
+        assert_eq!(
+            ChatCommandParser::parse("/reassign ensia#12 @carol", &known),
+            ChatCommand::IssueAction {
+                repo: "StarLabsSI/ensia".to_string(),
+                number: 12,
+                command: SlashCommand::ReviewerSet(vec!["carol".to_string()]),
+            }
+        );
+        assert_eq!(
+            ChatCommandParser::parse("prs ensia", &known),
+            ChatCommand::Prs { repo: Some("StarLabsSI/ensia".to_string()) }
         );
 
         // Issue actions (Pattern 3: command repo num)

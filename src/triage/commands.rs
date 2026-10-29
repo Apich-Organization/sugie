@@ -34,6 +34,8 @@ pub enum SlashCommand {
         add: Vec<String>,
         remove: Vec<String>,
     },
+    /// Replace the full set of requested reviewers with exactly this list.
+    ReviewerSet(Vec<String>),
     Help,
 }
 
@@ -50,7 +52,7 @@ impl SlashCommand {
             SlashCommand::Project { .. } => "project",
             SlashCommand::Move { .. } => "move",
             SlashCommand::Duplicate(_) => "duplicate",
-            SlashCommand::Reviewer { .. } => "reviewer",
+            SlashCommand::Reviewer { .. } | SlashCommand::ReviewerSet(_) => "reviewer",
             SlashCommand::Help => "help",
         }
     }
@@ -187,6 +189,27 @@ impl CommandParser {
                             commands.push(SlashCommand::Duplicate(num));
                         }
                     }
+                }
+                "reviewer" | "reviewers" | "review"
+                    if args
+                        .first()
+                        .map(|a| matches!(a.to_lowercase().as_str(), "set" | "replace" | "change" | "swap"))
+                        .unwrap_or(false) =>
+                {
+                    let users: Vec<String> = args[1..]
+                        .iter()
+                        .map(|s| s.trim_start_matches('+').trim_start_matches('@').to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    commands.push(SlashCommand::ReviewerSet(users));
+                }
+                "reassign" | "rereview" => {
+                    let users: Vec<String> = args
+                        .iter()
+                        .map(|s| s.trim_start_matches('+').trim_start_matches('@').to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    commands.push(SlashCommand::ReviewerSet(users));
                 }
                 "reviewer" | "reviewers" | "review" => {
                     let mut add = Vec::new();
@@ -802,6 +825,148 @@ impl<'a> CommandExecutor<'a> {
                     )
                     .await;
             }
+            SlashCommand::ReviewerSet(users) => {
+                if !issue.is_pr() {
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            "⚠️ Reviewers can only be changed on Pull Requests, not issues.",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+
+                let mut wanted: Vec<String> = Vec::new();
+                for u in users {
+                    if !wanted.iter().any(|w| w.eq_ignore_ascii_case(u)) {
+                        wanted.push(u.clone());
+                    }
+                }
+                if wanted.is_empty() {
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            "⚠️ Specify the new reviewer(s), e.g. `/reviewer set @alice @bob`.",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+
+                let pr = self
+                    .client
+                    .get_pull_request(owner, repo, issue.number)
+                    .await?;
+                let current: Vec<String> = pr
+                    .requested_reviewers
+                    .iter()
+                    .map(|u| u.login.clone())
+                    .collect();
+                let to_remove: Vec<String> = current
+                    .iter()
+                    .filter(|c| !wanted.iter().any(|w| w.eq_ignore_ascii_case(c)))
+                    .cloned()
+                    .collect();
+                let to_add: Vec<String> = wanted
+                    .iter()
+                    .filter(|w| {
+                        !current.iter().any(|c| c.eq_ignore_ascii_case(w))
+                            && !w.eq_ignore_ascii_case(&pr.user.login)
+                    })
+                    .cloned()
+                    .collect();
+
+                if to_add.is_empty() && to_remove.is_empty() {
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            "ℹ️ Requested reviewers already match the specified list; nothing changed.",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+
+                if !to_remove.is_empty() {
+                    self.client
+                        .remove_reviewers(owner, repo, issue.number, &to_remove)
+                        .await?;
+                    if let Some(balancer) = &self.balancer {
+                        for r in &to_remove {
+                            let _ = balancer.on_review_completed_or_closed(&repo_full_name, r);
+                        }
+                    }
+                }
+                if !to_add.is_empty() {
+                    self.client
+                        .request_reviewers(owner, repo, issue.number, &to_add)
+                        .await?;
+                    if let Some(balancer) = &self.balancer {
+                        for r in &to_add {
+                            let _ = balancer.on_review_requested(&repo_full_name, r);
+                        }
+                    }
+                }
+
+                let fmt = |v: &Vec<String>| {
+                    v.iter().map(|u| format!("@{u}")).collect::<Vec<_>>().join(", ")
+                };
+                let mut parts = Vec::new();
+                if !to_remove.is_empty() {
+                    parts.push(format!("Removed: {}", fmt(&to_remove)));
+                }
+                if !to_add.is_empty() {
+                    parts.push(format!("Requested: {}", fmt(&to_add)));
+                }
+                let comment_body = format!(
+                    "🔄 **Reviewers changed by @{}**:\n- {}",
+                    sender.login,
+                    parts.join("\n- ")
+                );
+                self.client
+                    .create_comment(owner, repo, issue.number, &comment_body)
+                    .await?;
+                info!(
+                    "Replaced reviewers on {}#{} (add: {:?}, remove: {:?})",
+                    repo_full_name, issue.number, to_add, to_remove
+                );
+
+                let title = format!("🔄 Reviewers Changed: {}#{}", repo_full_name, issue.number);
+                let mut embed_fields = Vec::new();
+                if !to_add.is_empty() {
+                    embed_fields.push(DiscordEmbedField {
+                        name: "Added Reviewers".to_string(),
+                        value: to_add.join(", "),
+                        inline: true,
+                    });
+                }
+                if !to_remove.is_empty() {
+                    embed_fields.push(DiscordEmbedField {
+                        name: "Removed Reviewers".to_string(),
+                        value: to_remove.join(", "),
+                        inline: true,
+                    });
+                }
+                embed_fields.push(DiscordEmbedField {
+                    name: "Updated By".to_string(),
+                    value: sender.login.clone(),
+                    inline: true,
+                });
+                self.notifier
+                    .dispatch_event(
+                        SugieEventType::Assigned,
+                        &title,
+                        &comment_body,
+                        Some(&issue_url),
+                        NotificationLevel::Info,
+                        embed_fields,
+                    )
+                    .await;
+            }
             SlashCommand::Help => {
                 let help_text = r#"
 ### 🤖 Sugie Bot Commands Reference
@@ -815,6 +980,7 @@ You can trigger commands either with a slash (`/command`) or by mentioning the b
 | `/label [+name] [-name]` | `/label +bug -wip` or `@bot label +bug` | Adds/removes labels |
 | `/unlabel <name>` | `/unlabel bug` | Removes a label |
 | `/reviewer [+@user] [-@user]` | `/reviewer @alice` or `/reviewer +@alice -@bob` | Requests or removes reviewers (PRs only) |
+| `/reviewer set <@user...>` | `/reviewer set @alice @bob` | Replaces ALL requested reviewers with exactly this list (PRs only) |
 | `/unreviewer <@user...>` | `/unreviewer @bob` | Removes requested reviewer (PRs only) |
 | `/close [reason]` | `/close completed` | Closes issue or PR |
 | `/reopen` | `/reopen` | Reopens issue or PR |
@@ -964,5 +1130,21 @@ mod tests {
                 remove: vec![],
             }
         );
+    }
+
+    #[test]
+    fn test_reviewer_set_command_parsing() {
+        let config = CommandsConfig::default();
+        let cmds = CommandParser::parse_comment(
+            "/reviewer set @alice +@bob\n/reassign @carol\n/reviewer replace",
+            &config,
+        );
+        assert_eq!(
+            cmds[0],
+            SlashCommand::ReviewerSet(vec!["alice".to_string(), "bob".to_string()])
+        );
+        assert_eq!(cmds[1], SlashCommand::ReviewerSet(vec!["carol".to_string()]));
+        assert_eq!(cmds[2], SlashCommand::ReviewerSet(vec![]));
+        assert_eq!(cmds[0].name(), "reviewer");
     }
 }

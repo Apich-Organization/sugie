@@ -1,4 +1,4 @@
-use super::models::{CheckRun, Comment, CommitItem, Issue, PullRequest, PullRequestFile};
+use super::models::{CheckRun, Comment, CommitItem, Issue, PullRequest, PullRequestFile, User};
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
@@ -296,6 +296,19 @@ impl GitHubClient {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+
+    pub async fn list_assignees(&self, owner: &str, repo: &str) -> Result<Vec<User>> {
+        let url = format!(
+            "{}/repos/{}/{}/assignees?per_page=100",
+            self.base_url, owner, repo
+        );
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
+        let users = resp.json::<Vec<User>>().await?;
+        Ok(users)
     }
 
     pub async fn lock_issue(
