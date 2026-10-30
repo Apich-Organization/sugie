@@ -878,10 +878,7 @@ pub fn parse_repo_list(val: &str) -> Option<Vec<String>> {
 }
 
 pub fn load_dotenv() {
-    let candidates = [
-        Path::new(".env"),
-        Path::new("../.env"),
-    ];
+    let candidates = [Path::new(".env"), Path::new("../.env")];
     for path in &candidates {
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
@@ -1080,8 +1077,8 @@ impl SugieConfig {
             std::env::var("SUGIE_ZULIP_BOT_API_KEY"),
         ) {
             if !site.trim().is_empty() && !email.trim().is_empty() && !key.trim().is_empty() {
-                let stream = std::env::var("SUGIE_ZULIP_STREAM")
-                    .unwrap_or_else(|_| default_zulip_stream());
+                let stream =
+                    std::env::var("SUGIE_ZULIP_STREAM").unwrap_or_else(|_| default_zulip_stream());
                 let allowed_repositories = std::env::var("SUGIE_ZULIP_REPOSITORIES")
                     .or_else(|_| std::env::var("SUGIE_ZULIP_REPOS"))
                     .ok()
@@ -1144,8 +1141,8 @@ impl SugieConfig {
         }
 
         // Super users & restricted commands env overrides
-        if let Ok(users) = std::env::var("SUGIE_SUPER_USERS")
-            .or_else(|_| std::env::var("SUGIE_SUPERUSERS"))
+        if let Ok(users) =
+            std::env::var("SUGIE_SUPER_USERS").or_else(|_| std::env::var("SUGIE_SUPERUSERS"))
         {
             let list: Vec<String> = users
                 .split(',')
@@ -1219,7 +1216,8 @@ impl RepoConfig {
                     overridden.commands.super_users = self.commands.super_users.clone();
                 }
                 if overridden.commands.restricted_commands.is_empty() {
-                    overridden.commands.restricted_commands = self.commands.restricted_commands.clone();
+                    overridden.commands.restricted_commands =
+                        self.commands.restricted_commands.clone();
                 }
                 overridden
             }

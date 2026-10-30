@@ -38,7 +38,10 @@ pub fn create_router_with_web(state: AppState, web: Option<crate::web::WebState>
         .route("/api/chat/zulip", post(chat::zulip_chat_handler))
         .route("/api/chat/lark", post(chat::lark_chat_handler))
         .route("/api/chat/discord", post(chat::discord_chat_handler))
-        .route("/api/chat/command", post(chat::generic_chat_command_handler))
+        .route(
+            "/api/chat/command",
+            post(chat::generic_chat_command_handler),
+        )
         .with_state(state);
 
     let merged = match web {

@@ -333,13 +333,7 @@ pub fn log_inbound_http(
 }
 
 /// Record an outbound HTTP request to the GitHub REST or GraphQL API.
-pub fn log_github_request(
-    method: &str,
-    url: &str,
-    status: u16,
-    duration_ms: u64,
-    detail: &str,
-) {
+pub fn log_github_request(method: &str, url: &str, status: u16, duration_ms: u64, detail: &str) {
     if !LOG_OUTBOUND_GITHUB.load(Ordering::Relaxed) {
         return;
     }

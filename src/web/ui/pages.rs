@@ -5,7 +5,7 @@ use crate::web::config_store::{BackupInfo, EnvEntry};
 use crate::web::exec::Job;
 use crate::web::perms::{CurrentUser, COMMANDS};
 use crate::web::stats::RepoStats;
-use crate::web::ui::{number, Flash, Shell, StatCard};
+use crate::web::ui::{number, AmbientBg, Flash, Shell, StatCard};
 use leptos::prelude::*;
 
 #[derive(Clone, Default)]
@@ -237,6 +237,7 @@ pub fn login_page(
                 <link rel="stylesheet" href="/admin/assets/app.css"/>
             </head>
             <body>
+                <AmbientBg/>
                 <div class="auth-wrap">
                     <div class="card auth-card">
                         <div class="auth-brand">
@@ -268,49 +269,50 @@ pub fn dashboard_page(
         .iter()
         .map(|card| {
             let name = card.full_name.clone();
-            let (issues, prs, commits, stars, status_cls, status_txt, err_hint, is_ok) = match &card.stats {
-                Some(s) if s.is_ok() => (
-                    number(s.open_issues),
-                    number(s.open_prs),
-                    number(s.commits_30d),
-                    number(s.stars),
-                    "badge ok",
-                    "Healthy",
-                    String::new(),
-                    true,
-                ),
-                Some(s) => {
-                    let err_msg = s
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "Failed to fetch repository status".to_string());
-                    let (cls, txt) = if is_suspended_error(&err_msg) {
-                        ("badge warn", "Suspended")
-                    } else {
-                        ("badge bad", "Error")
-                    };
-                    (
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        cls,
-                        txt,
-                        err_msg,
+            let (issues, prs, commits, stars, status_cls, status_txt, err_hint, is_ok) =
+                match &card.stats {
+                    Some(s) if s.is_ok() => (
+                        number(s.open_issues),
+                        number(s.open_prs),
+                        number(s.commits_30d),
+                        number(s.stars),
+                        "badge ok",
+                        "Healthy",
+                        String::new(),
+                        true,
+                    ),
+                    Some(s) => {
+                        let err_msg = s
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "Failed to fetch repository status".to_string());
+                        let (cls, txt) = if is_suspended_error(&err_msg) {
+                            ("badge warn", "Suspended")
+                        } else {
+                            ("badge bad", "Error")
+                        };
+                        (
+                            "-".to_string(),
+                            "-".to_string(),
+                            "-".to_string(),
+                            "-".to_string(),
+                            cls,
+                            txt,
+                            err_msg,
+                            false,
+                        )
+                    }
+                    None => (
+                        "…".to_string(),
+                        "…".to_string(),
+                        "…".to_string(),
+                        "…".to_string(),
+                        "badge muted",
+                        "Pending",
+                        String::new(),
                         false,
-                    )
-                }
-                None => (
-                    "…".to_string(),
-                    "…".to_string(),
-                    "…".to_string(),
-                    "…".to_string(),
-                    "badge muted",
-                    "Pending",
-                    String::new(),
-                    false,
-                ),
-            };
+                    ),
+                };
             let link = format!("/admin/chat?repo={}", urlencode(&card.full_name));
             let dot_cls = if is_ok { "dot" } else { "dot bad" };
             let row_status = if is_ok {
@@ -566,7 +568,8 @@ pub fn chat_page(
         "No repository selected".to_string()
     };
     let placeholder = if has_repo {
-        "Enter command, e.g. /issues 5 or /label 42 bug (Enter to send, Shift+Enter for newline)".to_string()
+        "Enter command, e.g. /issues 5 or /label 42 bug (Enter to send, Shift+Enter for newline)"
+            .to_string()
     } else {
         "Please select a repository on the left".to_string()
     };
@@ -1059,8 +1062,16 @@ pub fn users_page(
         };
         let toggle_controls = if is_owner {
             let next_val = if global_2fa { "0" } else { "1" };
-            let btn_label = if global_2fa { "Disable Global 2FA Requirement" } else { "Enable Global 2FA for All Users" };
-            let btn_cls = if global_2fa { "btn sm" } else { "btn sm primary" };
+            let btn_label = if global_2fa {
+                "Disable Global 2FA Requirement"
+            } else {
+                "Enable Global 2FA for All Users"
+            };
+            let btn_cls = if global_2fa {
+                "btn sm"
+            } else {
+                "btn sm primary"
+            };
             view! {
                 <form method="post" action="/admin/users/2fa-global" style="margin:0">
                     <input type="hidden" name="enabled" value=next_val/>
@@ -1069,7 +1080,8 @@ pub fn users_page(
             }
             .into_any()
         } else {
-            view! { <span class="hint">"Only Owners can change the global 2FA policy"</span> }.into_any()
+            view! { <span class="hint">"Only Owners can change the global 2FA policy"</span> }
+                .into_any()
         };
 
         view! {
@@ -1316,7 +1328,13 @@ pub fn security_page(
     let policy_badge = match user.two_fa_policy.as_str() {
         "required" => "Enforced by Owner",
         "disabled" => "Exempt / Disabled",
-        _ => if data.global_2fa { "Required (Global Policy)" } else { "Optional (Global Policy)" },
+        _ => {
+            if data.global_2fa {
+                "Required (Global Policy)"
+            } else {
+                "Optional (Global Policy)"
+            }
+        }
     };
 
     view! {
@@ -1389,6 +1407,119 @@ pub fn security_page(
 
 // --------------------------------------------------------------------- audit
 
+fn build_audit_url(tab: &str, page: i64, f: &crate::web::db::AuditFilter) -> String {
+    let mut q = vec![format!("tab={}", urlencode(tab)), format!("page={}", page)];
+    if !f.ts.is_empty() {
+        q.push(format!("q_ts={}", urlencode(&f.ts)));
+    }
+    if !f.username.is_empty() {
+        q.push(format!("q_user={}", urlencode(&f.username)));
+    }
+    if !f.action.is_empty() {
+        q.push(format!("q_action={}", urlencode(&f.action)));
+    }
+    if !f.target.is_empty() {
+        q.push(format!("q_target={}", urlencode(&f.target)));
+    }
+    if !f.detail.is_empty() {
+        q.push(format!("q_detail={}", urlencode(&f.detail)));
+    }
+    if !f.ip.is_empty() {
+        q.push(format!("q_ip={}", urlencode(&f.ip)));
+    }
+    if !f.result.is_empty() {
+        q.push(format!("q_result={}", urlencode(&f.result)));
+    }
+    format!("/admin/audit?{}", q.join("&"))
+}
+
+fn build_http_url(tab: &str, page: i64, f: &crate::web::db::SecurityHttpFilter) -> String {
+    let mut q = vec![format!("tab={}", urlencode(tab)), format!("page={}", page)];
+    if !f.ts.is_empty() {
+        q.push(format!("q_ts={}", urlencode(&f.ts)));
+    }
+    if !f.direction.is_empty() {
+        q.push(format!("q_dir={}", urlencode(&f.direction)));
+    }
+    if !f.method.is_empty() {
+        q.push(format!("q_method={}", urlencode(&f.method)));
+    }
+    if !f.target.is_empty() {
+        q.push(format!("q_target={}", urlencode(&f.target)));
+    }
+    if !f.status.is_empty() {
+        q.push(format!("q_status={}", urlencode(&f.status)));
+    }
+    if !f.actor.is_empty() {
+        q.push(format!("q_actor={}", urlencode(&f.actor)));
+    }
+    if !f.ip.is_empty() {
+        q.push(format!("q_ip={}", urlencode(&f.ip)));
+    }
+    if !f.detail.is_empty() {
+        q.push(format!("q_detail={}", urlencode(&f.detail)));
+    }
+    format!("/admin/audit?{}", q.join("&"))
+}
+
+fn build_export_url(
+    tab: &str,
+    is_http: bool,
+    af: &crate::web::db::AuditFilter,
+    hf: &crate::web::db::SecurityHttpFilter,
+) -> String {
+    let mut q = vec![format!("tab={}", urlencode(tab))];
+    if is_http {
+        if !hf.ts.is_empty() {
+            q.push(format!("q_ts={}", urlencode(&hf.ts)));
+        }
+        if !hf.direction.is_empty() {
+            q.push(format!("q_dir={}", urlencode(&hf.direction)));
+        }
+        if !hf.method.is_empty() {
+            q.push(format!("q_method={}", urlencode(&hf.method)));
+        }
+        if !hf.target.is_empty() {
+            q.push(format!("q_target={}", urlencode(&hf.target)));
+        }
+        if !hf.status.is_empty() {
+            q.push(format!("q_status={}", urlencode(&hf.status)));
+        }
+        if !hf.actor.is_empty() {
+            q.push(format!("q_actor={}", urlencode(&hf.actor)));
+        }
+        if !hf.ip.is_empty() {
+            q.push(format!("q_ip={}", urlencode(&hf.ip)));
+        }
+        if !hf.detail.is_empty() {
+            q.push(format!("q_detail={}", urlencode(&hf.detail)));
+        }
+    } else {
+        if !af.ts.is_empty() {
+            q.push(format!("q_ts={}", urlencode(&af.ts)));
+        }
+        if !af.username.is_empty() {
+            q.push(format!("q_user={}", urlencode(&af.username)));
+        }
+        if !af.action.is_empty() {
+            q.push(format!("q_action={}", urlencode(&af.action)));
+        }
+        if !af.target.is_empty() {
+            q.push(format!("q_target={}", urlencode(&af.target)));
+        }
+        if !af.detail.is_empty() {
+            q.push(format!("q_detail={}", urlencode(&af.detail)));
+        }
+        if !af.ip.is_empty() {
+            q.push(format!("q_ip={}", urlencode(&af.ip)));
+        }
+        if !af.result.is_empty() {
+            q.push(format!("q_result={}", urlencode(&af.result)));
+        }
+    }
+    format!("/admin/audit/export?{}", q.join("&"))
+}
+
 pub fn audit_page(
     user: CurrentUser,
     tab: String,
@@ -1399,6 +1530,8 @@ pub fn audit_page(
     log_file_path: String,
     log_settings: crate::security_log::SecurityLogSettings,
     flash: Option<(bool, String)>,
+    audit_filter: crate::web::db::AuditFilter,
+    http_filter: crate::web::db::SecurityHttpFilter,
 ) -> impl IntoView {
     let is_http_tab = tab == "inbound" || tab == "github" || tab == "notify" || tab == "http_all";
     let flash_view = flash.map(|(ok, msg)| {
@@ -1406,13 +1539,41 @@ pub fn audit_page(
         view! { <div class=cls>{msg}</div> }
     });
 
-    let prev = format!("/admin/audit?tab={}&page={}", urlencode(&tab), (page - 1).max(0));
-    let next = format!("/admin/audit?tab={}&page={}", urlencode(&tab), page + 1);
+    let prev = if is_http_tab {
+        build_http_url(&tab, (page - 1).max(0), &http_filter)
+    } else {
+        build_audit_url(&tab, (page - 1).max(0), &audit_filter)
+    };
+    let next = if is_http_tab {
+        build_http_url(&tab, page + 1, &http_filter)
+    } else {
+        build_audit_url(&tab, page + 1, &audit_filter)
+    };
     let pages = (total + 49) / 50;
+    let export_href = build_export_url(&tab, is_http_tab, &audit_filter, &http_filter);
+
+    let is_filtered = if is_http_tab {
+        !http_filter.is_empty()
+    } else {
+        !audit_filter.is_empty()
+    };
+
+    let filter_badge = if is_filtered {
+        let reset_url = format!("/admin/audit?tab={}", urlencode(&tab));
+        view! {
+            <span class="badge warn" style="margin-left:8px">
+                "Filtered"
+                <a href=reset_url style="margin-left:6px;text-decoration:underline">"Clear"</a>
+            </span>
+        }
+        .into_any()
+    } else {
+        view! { <span></span> }.into_any()
+    };
 
     let table_view = if is_http_tab {
         let http_body = if http_rows.is_empty() {
-            view! { <tr><td colspan="8" class="empty">"No HTTP security logs recorded yet"</td></tr> }.into_any()
+            view! { <tr><td colspan="9" class="empty">"No HTTP security logs match the current filters"</td></tr> }.into_any()
         } else {
             http_rows
                 .iter()
@@ -1445,7 +1606,7 @@ pub fn audit_page(
                     };
                     view! {
                         <tr>
-                            <td class="hint mono nowrap">{r.ts.clone()}</td>
+                            <td class="hint mono nowrap col-ts">{r.ts.clone()}</td>
                             <td><span class=dir_cls>{dir_label}</span></td>
                             <td class="mono" style="font-weight:600">{r.method.clone()}</td>
                             <td class="mono" style="word-break:break-all;max-width:360px">{r.target.clone()}</td>
@@ -1453,6 +1614,7 @@ pub fn audit_page(
                             <td class="num">{format!("{} ms", r.duration_ms)}</td>
                             <td class="hint mono">{format!("{} ({})", r.actor, r.ip)}</td>
                             <td class="hint mono" style="word-break:break-word;max-width:260px">{r.detail.clone()}</td>
+                            <td></td>
                         </tr>
                     }
                 })
@@ -1460,27 +1622,100 @@ pub fn audit_page(
                 .into_any()
         };
 
+        let http_ts_val = if http_filter.ts.len() >= 10
+            && http_filter.ts.chars().nth(4) == Some('-')
+            && http_filter.ts.chars().nth(7) == Some('-')
+        {
+            http_filter.ts.chars().take(10).collect::<String>()
+        } else {
+            http_filter.ts.clone()
+        };
+
+        let dir_all = http_filter.direction.is_empty();
+        let dir_inbound = http_filter.direction == "INBOUND_API";
+        let dir_github = http_filter.direction == "OUTBOUND_GITHUB";
+        let dir_notify = http_filter.direction == "OUTBOUND_NOTIFY";
+
+        let dir_cell = if tab == "http_all" {
+            view! {
+                <select name="q_dir" class="col-filter" onchange="this.form.submit()">
+                    <option value="" selected=dir_all>"All"</option>
+                    <option value="INBOUND_API" selected=dir_inbound>"Inbound"</option>
+                    <option value="OUTBOUND_GITHUB" selected=dir_github>"GitHub"</option>
+                    <option value="OUTBOUND_NOTIFY" selected=dir_notify>"Notify"</option>
+                </select>
+            }
+            .into_any()
+        } else {
+            view! { <span class="hint mono" style="font-size:11px">"Locked"</span> }.into_any()
+        };
+
+        let m_all = http_filter.method.is_empty();
+        let m_get = http_filter.method == "GET";
+        let m_post = http_filter.method == "POST";
+        let m_put = http_filter.method == "PUT";
+        let m_delete = http_filter.method == "DELETE";
+
+        let reset_http_url = format!("/admin/audit?tab={}", urlencode(&tab));
+
         view! {
-            <table>
-                <thead>
-                    <tr>
-                        <th>"Timestamp"</th>
-                        <th>"Direction"</th>
-                        <th>"Method"</th>
-                        <th>"URL / Path"</th>
-                        <th>"Status"</th>
-                        <th>"Latency"</th>
-                        <th>"Actor / IP"</th>
-                        <th>"Details"</th>
-                    </tr>
-                </thead>
-                <tbody>{http_body}</tbody>
-            </table>
+            <form method="get" action="/admin/audit" style="margin:0">
+                <input type="hidden" name="tab" value=tab.clone() />
+                <table class="audit-table">
+                    <thead>
+                        <tr>
+                            <th class="col-ts">"Timestamp"</th>
+                            <th>"Direction"</th>
+                            <th>"Method"</th>
+                            <th>"URL / Path"</th>
+                            <th>"Status"</th>
+                            <th>"Latency"</th>
+                            <th>"Actor / IP"</th>
+                            <th>"Details"</th>
+                            <th style="text-align:right">"Action"</th>
+                        </tr>
+                        <tr class="filter-row">
+                            <th class="col-ts">
+                                <input
+                                    type="date"
+                                    name="q_ts"
+                                    value=http_ts_val
+                                    class="col-filter"
+                                    onchange="this.form.submit()"
+                                    title="Filter by date"
+                                />
+                            </th>
+                            <th>{dir_cell}</th>
+                            <th>
+                                <select name="q_method" class="col-filter" onchange="this.form.submit()">
+                                    <option value="" selected=m_all>"All"</option>
+                                    <option value="GET" selected=m_get>"GET"</option>
+                                    <option value="POST" selected=m_post>"POST"</option>
+                                    <option value="PUT" selected=m_put>"PUT"</option>
+                                    <option value="DELETE" selected=m_delete>"DELETE"</option>
+                                </select>
+                            </th>
+                            <th><input type="text" name="q_target" value=http_filter.target.clone() placeholder="URL / Path…" class="col-filter" /></th>
+                            <th><input type="text" name="q_status" value=http_filter.status.clone() placeholder="200, 4xx…" class="col-filter" /></th>
+                            <th><span class="hint mono" style="font-size:11px">"-"</span></th>
+                            <th><input type="text" name="q_actor" value=http_filter.actor.clone() placeholder="Actor or IP…" class="col-filter" /></th>
+                            <th><input type="text" name="q_detail" value=http_filter.detail.clone() placeholder="Details…" class="col-filter" /></th>
+                            <th class="nowrap" style="text-align:right">
+                                <div class="row" style="flex-wrap:nowrap;justify-content:flex-end">
+                                    <button type="submit" class="btn sm primary">"Filter"</button>
+                                    <a href=reset_http_url class="btn sm ghost" style="margin-left:4px">"Reset"</a>
+                                </div>
+                            </th>
+                        </tr>
+                    </thead>
+                    <tbody>{http_body}</tbody>
+                </table>
+            </form>
         }
         .into_any()
     } else {
         let body = if rows.is_empty() {
-            view! { <tr><td colspan="7" class="empty">"No audit logs recorded yet"</td></tr> }.into_any()
+            view! { <tr><td colspan="8" class="empty">"No audit logs match the current filters"</td></tr> }.into_any()
         } else {
             rows.iter()
                 .map(|r| {
@@ -1488,13 +1723,14 @@ pub fn audit_page(
                     let txt = if r.ok { "Success" } else { "Denied" };
                     view! {
                         <tr>
-                            <td class="hint mono nowrap">{r.ts.clone()}</td>
+                            <td class="hint mono nowrap col-ts">{r.ts.clone()}</td>
                             <td class="nowrap">{r.username.clone()}</td>
                             <td class="nowrap"><span class="badge muted">{r.action.clone()}</span></td>
                             <td class="mono">{r.target.clone()}</td>
                             <td class="hint">{r.detail.clone()}</td>
                             <td class="hint mono">{r.ip.clone()}</td>
                             <td><span class=cls>{txt}</span></td>
+                            <td></td>
                         </tr>
                     }
                 })
@@ -1502,40 +1738,110 @@ pub fn audit_page(
                 .into_any()
         };
 
+        let audit_ts_val = if audit_filter.ts.len() >= 10
+            && audit_filter.ts.chars().nth(4) == Some('-')
+            && audit_filter.ts.chars().nth(7) == Some('-')
+        {
+            audit_filter.ts.chars().take(10).collect::<String>()
+        } else {
+            audit_filter.ts.clone()
+        };
+
+        let res_all_selected = audit_filter.result.is_empty();
+        let res_ok_selected = audit_filter.result == "ok" || audit_filter.result == "success";
+        let res_fail_selected = audit_filter.result == "fail" || audit_filter.result == "denied";
+        let reset_audit_url = format!("/admin/audit?tab={}", urlencode(&tab));
+
         view! {
-            <table>
-                <thead>
-                    <tr>
-                        <th>"Timestamp"</th>
-                        <th>"User"</th>
-                        <th>"Action"</th>
-                        <th>"Target"</th>
-                        <th>"Details"</th>
-                        <th>"IP"</th>
-                        <th>"Result"</th>
-                    </tr>
-                </thead>
-                <tbody>{body}</tbody>
-            </table>
+            <form method="get" action="/admin/audit" style="margin:0">
+                <input type="hidden" name="tab" value=tab.clone() />
+                <table class="audit-table">
+                    <thead>
+                        <tr>
+                            <th class="col-ts">"Timestamp"</th>
+                            <th>"User"</th>
+                            <th>"Action"</th>
+                            <th>"Target"</th>
+                            <th>"Details"</th>
+                            <th>"IP"</th>
+                            <th>"Result"</th>
+                            <th style="text-align:right">"Action"</th>
+                        </tr>
+                        <tr class="filter-row">
+                            <th class="col-ts">
+                                <input
+                                    type="date"
+                                    name="q_ts"
+                                    value=audit_ts_val
+                                    class="col-filter"
+                                    onchange="this.form.submit()"
+                                    title="Filter by date"
+                                />
+                            </th>
+                            <th><input type="text" name="q_user" value=audit_filter.username.clone() placeholder="User…" class="col-filter" /></th>
+                            <th><input type="text" name="q_action" value=audit_filter.action.clone() placeholder="Action…" class="col-filter" /></th>
+                            <th><input type="text" name="q_target" value=audit_filter.target.clone() placeholder="Target…" class="col-filter" /></th>
+                            <th><input type="text" name="q_detail" value=audit_filter.detail.clone() placeholder="Details…" class="col-filter" /></th>
+                            <th><input type="text" name="q_ip" value=audit_filter.ip.clone() placeholder="IP…" class="col-filter" /></th>
+                            <th>
+                                <select name="q_result" class="col-filter" onchange="this.form.submit()">
+                                    <option value="" selected=res_all_selected>"All"</option>
+                                    <option value="ok" selected=res_ok_selected>"Success"</option>
+                                    <option value="fail" selected=res_fail_selected>"Denied"</option>
+                                </select>
+                            </th>
+                            <th class="nowrap" style="text-align:right">
+                                <div class="row" style="flex-wrap:nowrap;justify-content:flex-end">
+                                    <button type="submit" class="btn sm primary">"Filter"</button>
+                                    <a href=reset_audit_url class="btn sm ghost" style="margin-left:4px">"Reset"</a>
+                                </div>
+                            </th>
+                        </tr>
+                    </thead>
+                    <tbody>{body}</tbody>
+                </table>
+            </form>
         }
         .into_any()
     };
 
-    let tab_audit_cls = if tab == "audit" { "btn sm primary" } else { "btn sm ghost" };
-    let tab_inbound_cls = if tab == "inbound" { "btn sm primary" } else { "btn sm ghost" };
-    let tab_github_cls = if tab == "github" { "btn sm primary" } else { "btn sm ghost" };
-    let tab_notify_cls = if tab == "notify" { "btn sm primary" } else { "btn sm ghost" };
-    let tab_all_cls = if tab == "http_all" { "btn sm primary" } else { "btn sm ghost" };
+    let tab_audit_cls = if tab == "audit" {
+        "btn sm primary"
+    } else {
+        "btn sm ghost"
+    };
+    let tab_inbound_cls = if tab == "inbound" {
+        "btn sm primary"
+    } else {
+        "btn sm ghost"
+    };
+    let tab_github_cls = if tab == "github" {
+        "btn sm primary"
+    } else {
+        "btn sm ghost"
+    };
+    let tab_notify_cls = if tab == "notify" {
+        "btn sm primary"
+    } else {
+        "btn sm ghost"
+    };
+    let tab_all_cls = if tab == "http_all" {
+        "btn sm primary"
+    } else {
+        "btn sm ghost"
+    };
     let tab_hidden = tab.clone();
     let tab_hidden2 = tab.clone();
-    let export_href = format!("/admin/audit/export?tab={}", urlencode(&tab));
 
     view! {
         <Shell title="Audit".to_string() active="audit".to_string() user=Some(user.clone())>
             <div class="page-head">
                 <div>
                     <div class="eyebrow">"Security & Audit"</div>
-                    <h1>"Security Review & Audit Logs"</h1>
+                    <div class="row" style="gap:8px">
+                        <h1>"Security Review & Audit Logs"</h1>
+                        {filter_badge}
+                    </div>
                     <p>
                         {format!("{total} total records · Page {} of {} · Persistent HTTP log file: ", page + 1, pages.max(1))}
                         <code class="mono">{log_file_path}</code>

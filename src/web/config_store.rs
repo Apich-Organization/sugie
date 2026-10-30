@@ -29,9 +29,17 @@ pub struct BackupInfo {
 
 pub fn is_secret_key(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
-    ["SECRET", "TOKEN", "PASSWORD", "API_KEY", "PRIVATE_KEY", "PEM", "SIGNATURE"]
-        .iter()
-        .any(|needle| k.contains(needle))
+    [
+        "SECRET",
+        "TOKEN",
+        "PASSWORD",
+        "API_KEY",
+        "PRIVATE_KEY",
+        "PEM",
+        "SIGNATURE",
+    ]
+    .iter()
+    .any(|needle| k.contains(needle))
 }
 
 pub fn mask(value: &str) -> String {
@@ -90,7 +98,9 @@ impl ConfigFiles {
             .unwrap_or_default()
         {
             if !repo.contains('/') {
-                return Err(format!("`{repo}` in allowed_repositories is not in owner/repo format"));
+                return Err(format!(
+                    "`{repo}` in allowed_repositories is not in owner/repo format"
+                ));
             }
         }
         if let Some(ref z) = cfg.notifications.zulip {
@@ -274,9 +284,8 @@ pub enum Patch {
 }
 
 pub fn patch_toml(text: &str, patches: &[(String, Patch)]) -> Result<String, String> {
-    let mut doc: toml_edit::DocumentMut = text
-        .parse()
-        .map_err(|e| format!("TOML parse error: {e}"))?;
+    let mut doc: toml_edit::DocumentMut =
+        text.parse().map_err(|e| format!("TOML parse error: {e}"))?;
 
     for (path, patch) in patches {
         let segs: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
@@ -302,10 +311,7 @@ pub fn patch_toml(text: &str, patches: &[(String, Patch)]) -> Result<String, Str
     Ok(doc.to_string())
 }
 
-fn ensure_path<'a>(
-    doc: &'a mut toml_edit::DocumentMut,
-    segs: &[&str],
-) -> &'a mut toml_edit::Item {
+fn ensure_path<'a>(doc: &'a mut toml_edit::DocumentMut, segs: &[&str]) -> &'a mut toml_edit::Item {
     let mut cur: &mut toml_edit::Item = doc.as_item_mut();
     for seg in segs {
         if !cur.is_table() {

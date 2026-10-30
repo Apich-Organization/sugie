@@ -38,14 +38,28 @@ pub enum ChatCommand {
     Help,
     Status,
     Repos,
-    Workload { repo: Option<String> },
-    Users { repo: Option<String> },
-    Metrics { repo: Option<String> },
-    Issues { repo: Option<String> },
-    Prs { repo: Option<String> },
-    Stats { repo: Option<String> },
+    Workload {
+        repo: Option<String>,
+    },
+    Users {
+        repo: Option<String>,
+    },
+    Metrics {
+        repo: Option<String>,
+    },
+    Issues {
+        repo: Option<String>,
+    },
+    Prs {
+        repo: Option<String>,
+    },
+    Stats {
+        repo: Option<String>,
+    },
     Config,
-    Stale { repo: Option<String> },
+    Stale {
+        repo: Option<String>,
+    },
     Comment {
         repo: String,
         number: u64,
@@ -115,7 +129,9 @@ impl ChatCommandParser {
             "comment" => {
                 // `/comment <repo>#<num> <text>` or `/comment <repo> <num> <text>`
                 if parts.len() >= 3 {
-                    if let Some((repo, number)) = Self::parse_repo_issue_target(parts[1], known_repos) {
+                    if let Some((repo, number)) =
+                        Self::parse_repo_issue_target(parts[1], known_repos)
+                    {
                         return ChatCommand::Comment {
                             repo,
                             number,
@@ -158,9 +174,14 @@ impl ChatCommandParser {
 
                 // Pattern 2a: `/reviewer set <repo#num> @a @b` (sub-command before the target)
                 if parts.len() >= 3
-                    && matches!(parts[1].to_lowercase().as_str(), "set" | "replace" | "change" | "swap")
+                    && matches!(
+                        parts[1].to_lowercase().as_str(),
+                        "set" | "replace" | "change" | "swap"
+                    )
                 {
-                    if let Some((repo, number)) = Self::parse_repo_issue_target(parts[2], known_repos) {
+                    if let Some((repo, number)) =
+                        Self::parse_repo_issue_target(parts[2], known_repos)
+                    {
                         let mut reconstructed = vec![parts[0], parts[1]];
                         reconstructed.extend_from_slice(&parts[3..]);
                         let cmd_str = reconstructed.join(" ");
@@ -177,7 +198,9 @@ impl ChatCommandParser {
                 // Pattern 2: `/command [repo#num] [args...]`
                 // e.g. "/reviewer ensia#12 +@alice -@bob" or "/close StarLabsSI/ensia#5 completed"
                 if parts.len() >= 2 {
-                    if let Some((repo, number)) = Self::parse_repo_issue_target(parts[1], known_repos) {
+                    if let Some((repo, number)) =
+                        Self::parse_repo_issue_target(parts[1], known_repos)
+                    {
                         let mut reconstructed = vec![parts[0]];
                         reconstructed.extend_from_slice(&parts[2..]);
                         let cmd_str = reconstructed.join(" ");
@@ -221,7 +244,8 @@ impl ChatCommandParser {
 
         while i < chars.len() {
             // Zulip mention: @**...**
-            if i + 2 < chars.len() && chars[i] == '@' && chars[i + 1] == '*' && chars[i + 2] == '*' {
+            if i + 2 < chars.len() && chars[i] == '@' && chars[i + 1] == '*' && chars[i + 2] == '*'
+            {
                 i += 3;
                 while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '*') {
                     i += 1;
@@ -318,11 +342,10 @@ impl<'a> ChatCommandExecutor<'a> {
             ChatCommand::Prs { repo } => self.render_open_items(repo.as_deref(), true).await,
             ChatCommand::Stats { repo } => self.render_stats(repo.as_deref()).await,
             ChatCommand::Config => self.render_config(),
-            ChatCommand::Stale { repo } => {
-                self.run_stale(&message.sender, repo.as_deref()).await
-            }
+            ChatCommand::Stale { repo } => self.run_stale(&message.sender, repo.as_deref()).await,
             ChatCommand::Comment { repo, number, body } => {
-                self.post_comment(&message.sender, &repo, number, &body).await
+                self.post_comment(&message.sender, &repo, number, &body)
+                    .await
             }
             ChatCommand::IssueAction {
                 repo,
@@ -439,11 +462,7 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
             if self.config.default_rules.commands.super_users.is_empty() {
                 "(None)".to_string()
             } else {
-                self.config
-                    .default_rules
-                    .commands
-                    .super_users
-                    .join(", ")
+                self.config.default_rules.commands.super_users.join(", ")
             },
             if self
                 .config
@@ -475,13 +494,20 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
 
         let mut lines = vec![format!("📦 **Onboarded Repositories ({})**:", repos.len())];
         for (id, name, inst_id) in repos {
-            lines.push(format!("- `{}` (ID: {}, Installation: {})", name, id, inst_id));
+            lines.push(format!(
+                "- `{}` (ID: {}, Installation: {})",
+                name, id, inst_id
+            ));
         }
         lines.join("\n")
     }
 
     fn render_workload(&self, target_repo: Option<&str>) -> String {
-        let workloads = match self.triage.storage().list_all_reviewer_workloads(target_repo) {
+        let workloads = match self
+            .triage
+            .storage()
+            .list_all_reviewer_workloads(target_repo)
+        {
             Ok(w) => w,
             Err(e) => return format!("⚠️ Error retrieving workloads: {}", e),
         };
@@ -502,7 +528,10 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
 
         let mut lines = vec![title];
         for (username, repo, active) in workloads {
-            lines.push(format!("- **@{}** (`{}`): **{}** active reviews", username, repo, active));
+            lines.push(format!(
+                "- **@{}** (`{}`): **{}** active reviews",
+                username, repo, active
+            ));
         }
         lines.join("\n")
     }
@@ -515,7 +544,8 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
             .iter()
             .any(|su| {
                 let clean = su.trim_start_matches('@');
-                clean.eq_ignore_ascii_case(&sender.username) || clean.eq_ignore_ascii_case(&sender.id)
+                clean.eq_ignore_ascii_case(&sender.username)
+                    || clean.eq_ignore_ascii_case(&sender.id)
             })
     }
 
@@ -544,7 +574,10 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
             Err(e) => return format!("❌ Could not access repository `{}`: {}", repo, e),
         };
 
-        let repo_config = self.triage.load_repo_config(&client, owner, repo_name).await;
+        let repo_config = self
+            .triage
+            .load_repo_config(&client, owner, repo_name)
+            .await;
         let gh_assignees: Vec<String> = client
             .list_assignees(owner, repo_name)
             .await
@@ -580,7 +613,10 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
         }
 
         if ordered.is_empty() {
-            return format!("👥 No eligible assignees or reviewers found for `{}`.", repo);
+            return format!(
+                "👥 No eligible assignees or reviewers found for `{}`.",
+                repo
+            );
         }
 
         let mut lines = vec![format!(
@@ -713,11 +749,21 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
             Ok(c) => c,
             Err(e) => return format!("❌ Could not connect to repository `{}`: {}", repo, e),
         };
-        let text = format!("{}\n\n— _posted by @{} via Sugie chat_", body.trim(), sender.username);
+        let text = format!(
+            "{}\n\n— _posted by @{} via Sugie chat_",
+            body.trim(),
+            sender.username
+        );
         match client.create_comment(owner, repo_name, number, &text).await {
             Ok(c) => match c.html_url {
-                Some(url) => format!("✅ Commented on [{}#{}]({}) as requested by @{}.", repo, number, url, sender.username),
-                None => format!("✅ Commented on {}#{} as requested by @{}.", repo, number, sender.username),
+                Some(url) => format!(
+                    "✅ Commented on [{}#{}]({}) as requested by @{}.",
+                    repo, number, url, sender.username
+                ),
+                None => format!(
+                    "✅ Commented on {}#{} as requested by @{}.",
+                    repo, number, sender.username
+                ),
             },
             Err(e) => format!("⚠️ Failed to comment on {}#{}: {}", repo, number, e),
         }
@@ -906,12 +952,13 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
             r#type: Some(format!("{:?}", sender.id)),
         };
 
-        let repo_config = self.triage.load_repo_config(&client, owner, repo_name).await;
+        let repo_config = self
+            .triage
+            .load_repo_config(&client, owner, repo_name)
+            .await;
         let projects = ProjectsService::new(repo_config.projects.clone());
-        let balancer = ReviewerLoadBalancer::new(
-            repo_config.reviewers.clone(),
-            self.triage.storage().clone(),
-        );
+        let balancer =
+            ReviewerLoadBalancer::new(repo_config.reviewers.clone(), self.triage.storage().clone());
         let executor = CommandExecutor::new(
             &client,
             &projects,
@@ -928,7 +975,10 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
                 let link = if issue.is_pr() {
                     format!("https://github.com/{}/{}/pull/{}", owner, repo_name, number)
                 } else {
-                    format!("https://github.com/{}/{}/issues/{}", owner, repo_name, number)
+                    format!(
+                        "https://github.com/{}/{}/issues/{}",
+                        owner, repo_name, number
+                    )
                 };
                 format!(
                     "✅ Successfully executed `/{}` on [{}#{}]({}) requested by @{}.",
@@ -956,7 +1006,10 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
                             r.get("id").and_then(|v| v.as_u64()),
                         ) {
                             if full_name.eq_ignore_ascii_case(repo) {
-                                let _ = self.triage.storage().upsert_repository(repo_id, full_name, inst_id);
+                                let _ = self
+                                    .triage
+                                    .storage()
+                                    .upsert_repository(repo_id, full_name, inst_id);
                                 return self.triage.get_client_for_installation(inst_id).await;
                             }
                         }
@@ -964,7 +1017,10 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
                 }
             }
         }
-        anyhow::bail!("Repository {} not found across active GitHub App installations.", repo)
+        anyhow::bail!(
+            "Repository {} not found across active GitHub App installations.",
+            repo
+        )
     }
 }
 
@@ -974,17 +1030,37 @@ mod tests {
 
     #[test]
     fn test_chat_command_parsing() {
-        let known = vec!["StarLabsSI/ensia".to_string(), "StarLabsSI/bincode".to_string()];
+        let known = vec![
+            "StarLabsSI/ensia".to_string(),
+            "StarLabsSI/bincode".to_string(),
+        ];
 
         // Global commands
-        assert_eq!(ChatCommandParser::parse("status", &known), ChatCommand::Status);
-        assert_eq!(ChatCommandParser::parse("/status", &known), ChatCommand::Status);
-        assert_eq!(ChatCommandParser::parse("@**sugie-bot** status", &known), ChatCommand::Status);
-        assert_eq!(ChatCommandParser::parse("<@123456> repos", &known), ChatCommand::Repos);
-        assert_eq!(ChatCommandParser::parse("@_user_1 help", &known), ChatCommand::Help);
+        assert_eq!(
+            ChatCommandParser::parse("status", &known),
+            ChatCommand::Status
+        );
+        assert_eq!(
+            ChatCommandParser::parse("/status", &known),
+            ChatCommand::Status
+        );
+        assert_eq!(
+            ChatCommandParser::parse("@**sugie-bot** status", &known),
+            ChatCommand::Status
+        );
+        assert_eq!(
+            ChatCommandParser::parse("<@123456> repos", &known),
+            ChatCommand::Repos
+        );
+        assert_eq!(
+            ChatCommandParser::parse("@_user_1 help", &known),
+            ChatCommand::Help
+        );
         assert_eq!(
             ChatCommandParser::parse("workload ensia", &known),
-            ChatCommand::Workload { repo: Some("StarLabsSI/ensia".to_string()) }
+            ChatCommand::Workload {
+                repo: Some("StarLabsSI/ensia".to_string())
+            }
         );
 
         // Issue actions (Pattern 1: repo#num command)
@@ -1029,7 +1105,9 @@ mod tests {
         );
         assert_eq!(
             ChatCommandParser::parse("prs ensia", &known),
-            ChatCommand::Prs { repo: Some("StarLabsSI/ensia".to_string()) }
+            ChatCommand::Prs {
+                repo: Some("StarLabsSI/ensia".to_string())
+            }
         );
 
         // Issue actions (Pattern 3: command repo num)

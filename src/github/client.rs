@@ -62,9 +62,7 @@ impl GitHubClient {
         payload: Option<&serde_json::Value>,
     ) -> Result<reqwest::Response> {
         let start = std::time::Instant::now();
-        let detail = payload
-            .map(|p| p.to_string())
-            .unwrap_or_default();
+        let detail = payload.map(|p| p.to_string()).unwrap_or_default();
         let mut req = self.http.request(method.clone(), url);
         if let Some(body) = payload {
             req = req.json(body);
@@ -73,13 +71,7 @@ impl GitHubClient {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let ms = start.elapsed().as_millis() as u64;
-                crate::security_log::log_github_request(
-                    method.as_str(),
-                    url,
-                    status,
-                    ms,
-                    &detail,
-                );
+                crate::security_log::log_github_request(method.as_str(), url, status, ms, &detail);
                 Ok(resp)
             }
             Err(e) => {

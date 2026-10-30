@@ -32,11 +32,11 @@ use leptos::prelude::*;
 use perms::CurrentUser;
 use serde::Deserialize;
 use serde_json::json;
+use stats::StatsCache;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use stats::StatsCache;
 use ui::pages;
 
 #[derive(Clone)]
@@ -104,10 +104,22 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/security/totp/activate", post(totp_activate))
         .route("/admin/security/totp/disable", post(totp_disable))
         .route("/admin/security/passkey/delete", post(passkey_delete))
-        .route("/admin/api/passkey/register/start", post(api_passkey_register_start))
-        .route("/admin/api/passkey/register/finish", post(api_passkey_register_finish))
-        .route("/admin/api/passkey/auth/start", post(api_passkey_auth_start))
-        .route("/admin/api/passkey/auth/finish", post(api_passkey_auth_finish))
+        .route(
+            "/admin/api/passkey/register/start",
+            post(api_passkey_register_start),
+        )
+        .route(
+            "/admin/api/passkey/register/finish",
+            post(api_passkey_register_finish),
+        )
+        .route(
+            "/admin/api/passkey/auth/start",
+            post(api_passkey_auth_start),
+        )
+        .route(
+            "/admin/api/passkey/auth/finish",
+            post(api_passkey_auth_finish),
+        )
         .route("/admin/api/exec", post(api_exec))
         .route("/admin/api/jobs/{id}", get(api_job))
         .route("/admin/api/jobs/{id}/stream", get(api_job_stream))
@@ -248,9 +260,14 @@ async fn login_submit(
             html(pages::login_page(None, form.next, Some(challenge)))
         }
         Ok(auth::LoginOutcome::Invalid) => {
-            state
-                .db
-                .audit(&form.username, "login", "-", "Invalid username or password", &ip, false);
+            state.db.audit(
+                &form.username,
+                "login",
+                "-",
+                "Invalid username or password",
+                &ip,
+                false,
+            );
             html(pages::login_page(
                 Some("Invalid username or password, or account is disabled".to_string()),
                 form.next,
@@ -338,7 +355,8 @@ async fn login_2fa_submit(
                 &ip,
                 true,
             );
-            let next = if form.next.starts_with("/admin") && !form.next.starts_with("/admin/login") {
+            let next = if form.next.starts_with("/admin") && !form.next.starts_with("/admin/login")
+            {
                 form.next
             } else {
                 "/admin".to_string()
@@ -376,7 +394,11 @@ async fn dashboard(State(state): State<WebState>, headers: HeaderMap) -> Respons
         Ok(u) => u,
         Err(r) => return r,
     };
-    let mut repos = state.triage.storage().list_repositories().unwrap_or_default();
+    let mut repos = state
+        .triage
+        .storage()
+        .list_repositories()
+        .unwrap_or_default();
     if repos.is_empty() {
         if let Ok(synced) = state.triage.sync_all_repositories().await {
             repos = synced;
@@ -384,7 +406,10 @@ async fn dashboard(State(state): State<WebState>, headers: HeaderMap) -> Respons
     }
     if let Some(ref allowed) = state.config.notifications.allowed_repositories {
         for r in allowed {
-            if !repos.iter().any(|(_, name, _)| name.eq_ignore_ascii_case(r)) {
+            if !repos
+                .iter()
+                .any(|(_, name, _)| name.eq_ignore_ascii_case(r))
+            {
                 repos.push((0, r.clone(), 0));
             }
         }
@@ -442,7 +467,11 @@ async fn repos_page(State(state): State<WebState>, headers: HeaderMap) -> Respon
         Ok(u) => u,
         Err(r) => return r,
     };
-    let mut repos = state.triage.storage().list_repositories().unwrap_or_default();
+    let mut repos = state
+        .triage
+        .storage()
+        .list_repositories()
+        .unwrap_or_default();
     if repos.is_empty() {
         if let Ok(synced) = state.triage.sync_all_repositories().await {
             repos = synced;
@@ -450,7 +479,10 @@ async fn repos_page(State(state): State<WebState>, headers: HeaderMap) -> Respon
     }
     if let Some(ref allowed) = state.config.notifications.allowed_repositories {
         for r in allowed {
-            if !repos.iter().any(|(_, name, _)| name.eq_ignore_ascii_case(r)) {
+            if !repos
+                .iter()
+                .any(|(_, name, _)| name.eq_ignore_ascii_case(r))
+            {
                 repos.push((0, r.clone(), 0));
             }
         }
@@ -495,7 +527,10 @@ async fn sync_repos(State(state): State<WebState>, headers: HeaderMap) -> Respon
                 &user.username,
                 "repos.sync",
                 "-",
-                &format!("Synced {} repositories from GitHub App installations", synced.len()),
+                &format!(
+                    "Synced {} repositories from GitHub App installations",
+                    synced.len()
+                ),
                 &ip,
                 true,
             );
@@ -716,7 +751,10 @@ async fn totp_activate(
             &ip,
             false,
         );
-        return security_flash(false, "Invalid 8-digit verification code. Please check your authenticator app and try again.");
+        return security_flash(
+            false,
+            "Invalid 8-digit verification code. Please check your authenticator app and try again.",
+        );
     }
 
     match state.db.activate_totp(user.id, secret) {
@@ -729,7 +767,10 @@ async fn totp_activate(
                 &ip,
                 true,
             );
-            security_flash(true, "Authenticator App (SHA512 · 8-digit OTP) activated successfully")
+            security_flash(
+                true,
+                "Authenticator App (SHA512 · 8-digit OTP) activated successfully",
+            )
         }
         Err(e) => security_flash(false, &format!("Failed to save OTP secret: {e}")),
     }
@@ -840,7 +881,9 @@ async fn api_passkey_register_start(
     let existing_keys = state.db.list_user_passkeys(user.id).unwrap_or_default();
     let exclude: Vec<webauthn_rs::prelude::CredentialID> = existing_keys
         .iter()
-        .filter_map(|row| serde_json::from_str::<webauthn_rs::prelude::Passkey>(&row.passkey_json).ok())
+        .filter_map(|row| {
+            serde_json::from_str::<webauthn_rs::prelude::Passkey>(&row.passkey_json).ok()
+        })
         .map(|pk| pk.cred_id().clone())
         .collect();
     let exclude_opt = if exclude.is_empty() {
@@ -885,21 +928,15 @@ async fn api_passkey_register_finish(
     let passkey = match state.passkey.finish_registration(user.id, &req.credential) {
         Ok(pk) => pk,
         Err(e) => {
-            state.db.audit(
-                &user.username,
-                "2fa.passkey.register",
-                "-",
-                &e,
-                &ip,
-                false,
-            );
+            state
+                .db
+                .audit(&user.username, "2fa.passkey.register", "-", &e, &ip, false);
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
         }
     };
 
     use base64::Engine;
-    let cred_id_b64 =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(passkey.cred_id());
+    let cred_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(passkey.cred_id());
     let passkey_json = match serde_json::to_string(&passkey) {
         Ok(j) => j,
         Err(e) => {
@@ -1068,14 +1105,9 @@ async fn api_passkey_auth_finish(
     {
         Ok(res) => res,
         Err(e) => {
-            state.db.audit(
-                &user_row.username,
-                "login.passkey",
-                "-",
-                &e,
-                &ip,
-                false,
-            );
+            state
+                .db
+                .audit(&user_row.username, "login.passkey", "-", &e, &ip, false);
             return (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))).into_response();
         }
     };
@@ -1130,8 +1162,8 @@ async fn api_passkey_auth_finish(
     }
 }
 
-#[derive(Deserialize, Default)]
-struct PageQuery {
+#[derive(Deserialize, Default, Clone)]
+struct AuditPageQuery {
     #[serde(default)]
     page: i64,
     #[serde(default)]
@@ -1140,12 +1172,36 @@ struct PageQuery {
     ok: Option<String>,
     #[serde(default)]
     msg: Option<String>,
+
+    #[serde(default)]
+    q_ts: String,
+    #[serde(default)]
+    q_user: String,
+    #[serde(default)]
+    q_action: String,
+    #[serde(default)]
+    q_target: String,
+    #[serde(default)]
+    q_detail: String,
+    #[serde(default)]
+    q_ip: String,
+    #[serde(default)]
+    q_result: String,
+
+    #[serde(default)]
+    q_dir: String,
+    #[serde(default)]
+    q_method: String,
+    #[serde(default)]
+    q_status: String,
+    #[serde(default)]
+    q_actor: String,
 }
 
 async fn audit_page(
     State(state): State<WebState>,
     headers: HeaderMap,
-    Query(query): Query<PageQuery>,
+    Query(query): Query<AuditPageQuery>,
 ) -> Response {
     let user = match gate_admin(&state, &headers) {
         Ok(u) => u,
@@ -1155,7 +1211,7 @@ async fn audit_page(
     let tab = if query.tab.is_empty() {
         "audit".to_string()
     } else {
-        query.tab
+        query.tab.clone()
     };
     let flash = query
         .msg
@@ -1164,6 +1220,26 @@ async fn audit_page(
     let log_file_path = crate::security_log::resolve_log_file_path(&state.config.db_path)
         .display()
         .to_string();
+
+    let audit_filter = crate::web::db::AuditFilter {
+        ts: query.q_ts.clone(),
+        username: query.q_user.clone(),
+        action: query.q_action.clone(),
+        target: query.q_target.clone(),
+        detail: query.q_detail.clone(),
+        ip: query.q_ip.clone(),
+        result: query.q_result.clone(),
+    };
+    let http_filter = crate::web::db::SecurityHttpFilter {
+        ts: query.q_ts.clone(),
+        direction: query.q_dir.clone(),
+        method: query.q_method.clone(),
+        target: query.q_target.clone(),
+        status: query.q_status.clone(),
+        actor: query.q_actor.clone(),
+        ip: query.q_ip.clone(),
+        detail: query.q_detail.clone(),
+    };
 
     if tab == "inbound" || tab == "github" || tab == "notify" || tab == "http_all" {
         let dir_filter = match tab.as_str() {
@@ -1174,7 +1250,7 @@ async fn audit_page(
         };
         let http_rows = state
             .db
-            .list_security_http_logs(dir_filter, 50, page * 50)
+            .list_security_http_logs_filtered(dir_filter, &http_filter, 50, page * 50)
             .unwrap_or_default()
             .into_iter()
             .map(|r| pages::SecurityHttpCard {
@@ -1189,7 +1265,10 @@ async fn audit_page(
                 detail: r.detail,
             })
             .collect();
-        let total = state.db.count_security_http_logs(dir_filter).unwrap_or(0);
+        let total = state
+            .db
+            .count_security_http_logs_filtered(dir_filter, &http_filter)
+            .unwrap_or(0);
         html(pages::audit_page(
             user,
             tab,
@@ -1200,11 +1279,13 @@ async fn audit_page(
             log_file_path,
             log_settings,
             flash,
+            audit_filter,
+            http_filter,
         ))
     } else {
         let rows = state
             .db
-            .list_audit(50, page * 50)
+            .list_audit_filtered(&audit_filter, 50, page * 50)
             .unwrap_or_default()
             .into_iter()
             .map(|r| pages::AuditCard {
@@ -1217,7 +1298,7 @@ async fn audit_page(
                 ok: r.ok,
             })
             .collect();
-        let total = state.db.count_audit().unwrap_or(0);
+        let total = state.db.count_audit_filtered(&audit_filter).unwrap_or(0);
         html(pages::audit_page(
             user,
             tab,
@@ -1228,6 +1309,8 @@ async fn audit_page(
             log_file_path,
             log_settings,
             flash,
+            audit_filter,
+            http_filter,
         ))
     }
 }
@@ -1241,7 +1324,10 @@ async fn save_audit_settings(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let tab = form.get("tab").cloned().unwrap_or_else(|| "audit".to_string());
+    let tab = form
+        .get("tab")
+        .cloned()
+        .unwrap_or_else(|| "audit".to_string());
     let settings = crate::security_log::SecurityLogSettings {
         admin_audit: form.contains_key("admin_audit"),
         inbound_webhooks: form.contains_key("inbound_webhooks"),
@@ -1324,8 +1410,14 @@ async fn notify_send(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let title = form.get("title").map(|s| s.trim().to_string()).unwrap_or_default();
-    let message = form.get("message").map(|s| s.trim().to_string()).unwrap_or_default();
+    let title = form
+        .get("title")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let message = form
+        .get("message")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     if title.is_empty() || message.is_empty() {
         return notify_flash(false, "Title and message are required");
     }
@@ -1381,7 +1473,14 @@ async fn notify_send(
     if want_discord {
         match notifier.discord() {
             Some(d) => match d
-                .send_embed(&title, &message, url.as_deref(), level.discord_color(), fields.clone(), false)
+                .send_embed(
+                    &title,
+                    &message,
+                    url.as_deref(),
+                    level.discord_color(),
+                    fields.clone(),
+                    false,
+                )
                 .await
             {
                 Ok(_) => sent.push("Discord"),
@@ -1438,7 +1537,10 @@ async fn purge_audit_logs(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let tab = form.get("tab").cloned().unwrap_or_else(|| "http_all".to_string());
+    let tab = form
+        .get("tab")
+        .cloned()
+        .unwrap_or_else(|| "http_all".to_string());
     let days = form
         .get("days")
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -1486,14 +1588,39 @@ fn csv_cell(v: &str) -> String {
 async fn export_audit_csv(
     State(state): State<WebState>,
     headers: HeaderMap,
-    Query(query): Query<PageQuery>,
+    Query(query): Query<AuditPageQuery>,
 ) -> Response {
     let user = match gate_admin(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
-    let tab = if query.tab.is_empty() { "audit".to_string() } else { query.tab };
+    let tab = if query.tab.is_empty() {
+        "audit".to_string()
+    } else {
+        query.tab
+    };
     let mut out = String::new();
+
+    let audit_filter = crate::web::db::AuditFilter {
+        ts: query.q_ts.clone(),
+        username: query.q_user.clone(),
+        action: query.q_action.clone(),
+        target: query.q_target.clone(),
+        detail: query.q_detail.clone(),
+        ip: query.q_ip.clone(),
+        result: query.q_result.clone(),
+    };
+    let http_filter = crate::web::db::SecurityHttpFilter {
+        ts: query.q_ts.clone(),
+        direction: query.q_dir.clone(),
+        method: query.q_method.clone(),
+        target: query.q_target.clone(),
+        status: query.q_status.clone(),
+        actor: query.q_actor.clone(),
+        ip: query.q_ip.clone(),
+        detail: query.q_detail.clone(),
+    };
+
     match tab.as_str() {
         "inbound" | "github" | "notify" | "http_all" => {
             let dir = match tab.as_str() {
@@ -1502,8 +1629,14 @@ async fn export_audit_csv(
                 "notify" => Some("OUTBOUND_NOTIFY"),
                 _ => None,
             };
-            out.push_str("id,timestamp,direction,method,target,status,duration_ms,ip,actor,detail\n");
-            for r in state.db.list_security_http_logs(dir, 100_000, 0).unwrap_or_default() {
+            out.push_str(
+                "id,timestamp,direction,method,target,status,duration_ms,ip,actor,detail\n",
+            );
+            for r in state
+                .db
+                .list_security_http_logs_filtered(dir, &http_filter, 100_000, 0)
+                .unwrap_or_default()
+            {
                 out.push_str(&format!(
                     "{},{},{},{},{},{},{},{},{},{}\n",
                     r.id,
@@ -1521,7 +1654,11 @@ async fn export_audit_csv(
         }
         _ => {
             out.push_str("id,timestamp,username,action,target,detail,ip,result\n");
-            for r in state.db.list_audit(100_000, 0).unwrap_or_default() {
+            for r in state
+                .db
+                .list_audit_filtered(&audit_filter, 100_000, 0)
+                .unwrap_or_default()
+            {
                 out.push_str(&format!(
                     "{},{},{},{},{},{},{},{}\n",
                     r.id,
@@ -1544,11 +1681,7 @@ async fn export_audit_csv(
         &auth::client_ip(&headers),
         true,
     );
-    let filename = format!(
-        "sugie-{}-{}.csv",
-        tab,
-        Utc::now().format("%Y%m%d-%H%M%S")
-    );
+    let filename = format!("sugie-{}-{}.csv", tab, Utc::now().format("%Y%m%d-%H%M%S"));
     (
         [
             (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
@@ -1577,7 +1710,13 @@ async fn api_exec(
 ) -> Response {
     let user = match gate(&state, &headers) {
         Ok(u) => u,
-        Err(_) => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Unauthorized"})),
+            )
+                .into_response()
+        }
     };
 
     match exec::dispatch(state.clone(), user, req.repo, req.command) {
@@ -1586,13 +1725,25 @@ async fn api_exec(
     }
 }
 
-async fn api_job(State(state): State<WebState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+async fn api_job(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     if gate(&state, &headers).is_err() {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Unauthorized"})),
+        )
+            .into_response();
     }
     match state.jobs.snapshot(&id) {
         Some(job) => Json(job).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(json!({"error": "Job not found"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Job not found"})),
+        )
+            .into_response(),
     }
 }
 
@@ -1602,7 +1753,11 @@ async fn api_job_stream(
     Path(id): Path<String>,
 ) -> Response {
     if gate(&state, &headers).is_err() {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Unauthorized"})),
+        )
+            .into_response();
     }
 
     let stream = async_stream::stream! {
@@ -1646,10 +1801,18 @@ async fn api_stats(
     Query(query): Query<StatsQuery>,
 ) -> Response {
     if gate(&state, &headers).is_err() {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Unauthorized"})),
+        )
+            .into_response();
     }
     if query.repo.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Missing repo parameter"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Missing repo parameter"})),
+        )
+            .into_response();
     }
     let stats = stats::fetch(&state.triage, &state.stats, &query.repo, true).await;
     Json(stats).into_response()
@@ -1679,7 +1842,9 @@ async fn save_structured(
             .unwrap_or_default()
     };
     let int_or = |k: &str, default: i64| -> i64 {
-        form.get(k).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(default)
+        form.get(k)
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(default)
     };
 
     let text = match state.files.read_toml() {
@@ -1689,7 +1854,10 @@ async fn save_structured(
 
     let mut patches: Vec<(String, config_store::Patch)> = vec![
         ("host".into(), config_store::Patch::Str(get("host"))),
-        ("port".into(), config_store::Patch::Int(int_or("port", 8800))),
+        (
+            "port".into(),
+            config_store::Patch::Int(int_or("port", 8800)),
+        ),
         ("db_path".into(), config_store::Patch::Str(get("db_path"))),
         (
             "default_rules.commands.super_users".into(),
@@ -1745,10 +1913,23 @@ async fn save_structured(
     }
     // Events not submitted are unchecked — flip them off explicitly.
     for name in [
-        "weekly_report", "monthly_report", "assigned", "unassigned", "issue_opened",
-        "issue_closed", "issue_comment", "pr_opened", "pr_merged", "label_changed",
-        "stale_warned", "stale_closed", "ci_failure", "duplicate_detected", "dco_failed",
-        "growth_milestone", "cross_repo_move",
+        "weekly_report",
+        "monthly_report",
+        "assigned",
+        "unassigned",
+        "issue_opened",
+        "issue_closed",
+        "issue_comment",
+        "pr_opened",
+        "pr_merged",
+        "label_changed",
+        "stale_warned",
+        "stale_closed",
+        "ci_failure",
+        "duplicate_detected",
+        "dco_failed",
+        "growth_milestone",
+        "cross_repo_move",
     ] {
         if !form.contains_key(&format!("event_{name}")) {
             patches.push((
@@ -1782,7 +1963,14 @@ async fn save_structured(
                 )
             }
             Err(e) => {
-                state.db.audit(&user.username, "config.save", "sugie.toml", &e.to_string(), "-", false);
+                state.db.audit(
+                    &user.username,
+                    "config.save",
+                    "sugie.toml",
+                    &e.to_string(),
+                    "-",
+                    false,
+                );
                 config_flash(false, &format!("Failed to save: {e}"))
             }
         },
@@ -1824,7 +2012,14 @@ async fn save_toml(
             )
         }
         Err(e) => {
-            state.db.audit(&user.username, "config.save", "sugie.toml", &e.to_string(), "-", false);
+            state.db.audit(
+                &user.username,
+                "config.save",
+                "sugie.toml",
+                &e.to_string(),
+                "-",
+                false,
+            );
             config_flash(false, &format!("Failed to save: {e}"))
         }
     }
@@ -1863,7 +2058,14 @@ async fn save_env(
             config_flash(true, "Saved .env; changes will take effect after restart")
         }
         Err(e) => {
-            state.db.audit(&user.username, "config.save", ".env", &e.to_string(), "-", false);
+            state.db.audit(
+                &user.username,
+                "config.save",
+                ".env",
+                &e.to_string(),
+                "-",
+                false,
+            );
             config_flash(false, &format!("Failed to save .env: {e}"))
         }
     }
@@ -1908,7 +2110,10 @@ fn all_repos(state: &WebState) -> Vec<String> {
         .collect();
     if let Some(ref allowed) = state.config.notifications.allowed_repositories {
         for r in allowed {
-            if !repos.iter().any(|existing| existing.eq_ignore_ascii_case(r)) {
+            if !repos
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(r))
+            {
                 repos.push(r.clone());
             }
         }
@@ -1952,12 +2157,17 @@ async fn create_user(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let username = form.get("username").map(|s| s.trim().to_string()).unwrap_or_default();
+    let username = form
+        .get("username")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     let password = form.get("password").cloned().unwrap_or_default();
     let role = form.get("role").cloned().unwrap_or_else(|| "viewer".into());
     let display = form.get("display_name").cloned().unwrap_or_default();
     let two_fa_policy = if actor.is_owner() {
-        form.get("two_fa_policy").cloned().unwrap_or_else(|| "default".into())
+        form.get("two_fa_policy")
+            .cloned()
+            .unwrap_or_else(|| "default".into())
     } else {
         "default".into()
     };
@@ -1984,7 +2194,12 @@ async fn create_user(
             }
             let repos: Vec<String> = form
                 .get("repos")
-                .map(|v| v.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                .map(|v| {
+                    v.lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
                 .unwrap_or_default();
             if !repos.is_empty() {
                 let _ = state.db.set_repo_perms(id, &repos);
@@ -2022,7 +2237,10 @@ async fn update_user(
         return users_flash(false, "Only owners can modify owner accounts");
     }
 
-    let role = form.get("role").cloned().unwrap_or_else(|| target.role.clone());
+    let role = form
+        .get("role")
+        .cloned()
+        .unwrap_or_else(|| target.role.clone());
     if role == "owner" && !actor.is_owner() {
         return users_flash(false, "Only owners can grant owner role");
     }
@@ -2095,7 +2313,10 @@ async fn toggle_global_2fa(
     if !actor.is_owner() {
         return users_flash(false, "Only owners can change the global 2FA policy");
     }
-    let enabled = form.get("enabled").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let enabled = form
+        .get("enabled")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     match state.db.set_global_2fa_enabled(enabled) {
         Ok(_) => {
             state.db.audit(
@@ -2261,7 +2482,10 @@ async fn css() -> Response {
 
 async fn js() -> Response {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         assets::JS,
     )
         .into_response()

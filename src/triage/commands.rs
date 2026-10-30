@@ -72,7 +72,8 @@ impl CommandParser {
             if trimmed.starts_with('@') {
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
                 if !parts.is_empty() {
-                    let mention_token = parts[0].trim_matches(|c: char| c == ':' || c == ',' || c == ';');
+                    let mention_token =
+                        parts[0].trim_matches(|c: char| c == ':' || c == ',' || c == ';');
                     let lower_mention = mention_token.to_lowercase();
                     // Match bot mentions like @starlabssisugie, @sugie, @...-bot, @...[bot]
                     if lower_mention.contains("sugie")
@@ -101,7 +102,10 @@ impl CommandParser {
                 (cmd, &parts[1..])
             } else if is_bot_mention {
                 // If preceded by @bot, allow command without slash prefix (e.g. "@bot label +bug" or "@bot /label +bug")
-                let cmd = parts[0].strip_prefix(prefix).unwrap_or(parts[0]).to_lowercase();
+                let cmd = parts[0]
+                    .strip_prefix(prefix)
+                    .unwrap_or(parts[0])
+                    .to_lowercase();
                 (cmd, &parts[1..])
             } else {
                 continue;
@@ -193,12 +197,21 @@ impl CommandParser {
                 "reviewer" | "reviewers" | "review"
                     if args
                         .first()
-                        .map(|a| matches!(a.to_lowercase().as_str(), "set" | "replace" | "change" | "swap"))
+                        .map(|a| {
+                            matches!(
+                                a.to_lowercase().as_str(),
+                                "set" | "replace" | "change" | "swap"
+                            )
+                        })
                         .unwrap_or(false) =>
                 {
                     let users: Vec<String> = args[1..]
                         .iter()
-                        .map(|s| s.trim_start_matches('+').trim_start_matches('@').to_string())
+                        .map(|s| {
+                            s.trim_start_matches('+')
+                                .trim_start_matches('@')
+                                .to_string()
+                        })
                         .filter(|s| !s.is_empty())
                         .collect();
                     commands.push(SlashCommand::ReviewerSet(users));
@@ -206,7 +219,11 @@ impl CommandParser {
                 "reassign" | "rereview" => {
                     let users: Vec<String> = args
                         .iter()
-                        .map(|s| s.trim_start_matches('+').trim_start_matches('@').to_string())
+                        .map(|s| {
+                            s.trim_start_matches('+')
+                                .trim_start_matches('@')
+                                .to_string()
+                        })
                         .filter(|s| !s.is_empty())
                         .collect();
                     commands.push(SlashCommand::ReviewerSet(users));
@@ -279,9 +296,11 @@ impl<'a> CommandExecutor<'a> {
     pub fn is_authorized(&self, command: &SlashCommand, sender: &User) -> bool {
         let cmd_name = command.name();
 
-        let is_restricted = self.config.restricted_commands.iter().any(|r| {
-            r.trim_start_matches('/').eq_ignore_ascii_case(cmd_name)
-        });
+        let is_restricted = self
+            .config
+            .restricted_commands
+            .iter()
+            .any(|r| r.trim_start_matches('/').eq_ignore_ascii_case(cmd_name));
 
         if !is_restricted {
             return true;
@@ -289,7 +308,8 @@ impl<'a> CommandExecutor<'a> {
 
         // If restricted, sender MUST be in super_users list
         self.config.super_users.iter().any(|su| {
-            su.trim_start_matches('@').eq_ignore_ascii_case(&sender.login)
+            su.trim_start_matches('@')
+                .eq_ignore_ascii_case(&sender.login)
         })
     }
 
@@ -719,10 +739,11 @@ impl<'a> CommandExecutor<'a> {
                 // If no reviewers specified (e.g. `/reviewer`), attempt auto-selection using load balancer
                 if to_add.is_empty() && to_remove.is_empty() {
                     if let Some(balancer) = &self.balancer {
-                        let pr_files = match self.client.list_pr_files(owner, repo, issue.number).await {
-                            Ok(files) => files.into_iter().map(|f| f.filename).collect(),
-                            Err(_) => Vec::new(),
-                        };
+                        let pr_files =
+                            match self.client.list_pr_files(owner, repo, issue.number).await {
+                                Ok(files) => files.into_iter().map(|f| f.filename).collect(),
+                                Err(_) => Vec::new(),
+                            };
                         let exclude = vec![sender.login.clone(), issue.user.login.clone()];
                         if let Ok(chosen) = balancer.select_reviewers_for_pr(
                             &repo_full_name,
@@ -771,8 +792,12 @@ impl<'a> CommandExecutor<'a> {
                             let _ = balancer.on_review_completed_or_closed(&repo_full_name, r);
                         }
                     }
-                    let mentions: Vec<String> = to_remove.iter().map(|u| format!("@{}", u)).collect();
-                    comment_parts.push(format!("Removed review request for: {}", mentions.join(", ")));
+                    let mentions: Vec<String> =
+                        to_remove.iter().map(|u| format!("@{}", u)).collect();
+                    comment_parts.push(format!(
+                        "Removed review request for: {}",
+                        mentions.join(", ")
+                    ));
                 }
 
                 let comment_body = format!(
@@ -789,10 +814,7 @@ impl<'a> CommandExecutor<'a> {
                     repo_full_name, issue.number, to_add, to_remove
                 );
 
-                let title = format!(
-                    "👥 Reviewers Updated: {}#{}",
-                    repo_full_name, issue.number
-                );
+                let title = format!("👥 Reviewers Updated: {}#{}", repo_full_name, issue.number);
                 let mut embed_fields = Vec::new();
                 if !to_add.is_empty() {
                     embed_fields.push(DiscordEmbedField {
@@ -913,7 +935,10 @@ impl<'a> CommandExecutor<'a> {
                 }
 
                 let fmt = |v: &Vec<String>| {
-                    v.iter().map(|u| format!("@{u}")).collect::<Vec<_>>().join(", ")
+                    v.iter()
+                        .map(|u| format!("@{u}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 };
                 let mut parts = Vec::new();
                 if !to_remove.is_empty() {
@@ -1143,7 +1168,10 @@ mod tests {
             cmds[0],
             SlashCommand::ReviewerSet(vec!["alice".to_string(), "bob".to_string()])
         );
-        assert_eq!(cmds[1], SlashCommand::ReviewerSet(vec!["carol".to_string()]));
+        assert_eq!(
+            cmds[1],
+            SlashCommand::ReviewerSet(vec!["carol".to_string()])
+        );
         assert_eq!(cmds[2], SlashCommand::ReviewerSet(vec![]));
         assert_eq!(cmds[0].name(), "reviewer");
     }

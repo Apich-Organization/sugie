@@ -57,7 +57,12 @@ pub struct CurrentUser {
 }
 
 impl CurrentUser {
-    pub fn from_row(row: UserRow, repos: Vec<String>, commands: Vec<String>, global_2fa: bool) -> Self {
+    pub fn from_row(
+        row: UserRow,
+        repos: Vec<String>,
+        commands: Vec<String>,
+        global_2fa: bool,
+    ) -> Self {
         let needs_2fa_setup = row.needs_2fa_setup(global_2fa);
         Self {
             id: row.id,
@@ -143,31 +148,181 @@ pub struct CommandSpec {
 }
 
 pub const COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "help", usage: "/help", help: "List all available commands", restricted: false, admin_only: false },
-    CommandSpec { name: "status", usage: "/status", help: "Bot operational status and connected repositories", restricted: false, admin_only: false },
-    CommandSpec { name: "stats", usage: "/stats", help: "Issue / PR / commit statistics for current repository", restricted: false, admin_only: false },
-    CommandSpec { name: "issues", usage: "/issues [n]", help: "List recent open issues (default 10)", restricted: false, admin_only: false },
-    CommandSpec { name: "prs", usage: "/prs [n]", help: "List recent open PRs (default 10)", restricted: false, admin_only: false },
-    CommandSpec { name: "users", usage: "/users", help: "List eligible GitHub assignees & reviewer pool", restricted: false, admin_only: false },
-    CommandSpec { name: "label", usage: "/label <num> <label...>", help: "Add labels to an issue or PR", restricted: true, admin_only: false },
-    CommandSpec { name: "unlabel", usage: "/unlabel <num> <label...>", help: "Remove labels from an issue or PR", restricted: true, admin_only: false },
-    CommandSpec { name: "assign", usage: "/assign <num> <user...>", help: "Assign an issue or PR to users", restricted: true, admin_only: false },
-    CommandSpec { name: "unassign", usage: "/unassign <num> <user...>", help: "Remove assignees from an issue or PR", restricted: true, admin_only: false },
-    CommandSpec { name: "reviewer", usage: "/reviewer <num> [set|+|-] <user...>", help: "List, add, remove or replace (set) PR reviewers", restricted: true, admin_only: false },
-    CommandSpec { name: "unreviewer", usage: "/unreviewer <num> <user...>", help: "Remove requested reviewers from a PR", restricted: true, admin_only: false },
-    CommandSpec { name: "workload", usage: "/workload", help: "Active review workload per reviewer in this repository", restricted: false, admin_only: false },
-    CommandSpec { name: "project", usage: "/project <num> <project> [status]", help: "Add an issue/PR to a GitHub Project v2 board", restricted: true, admin_only: false },
-    CommandSpec { name: "move", usage: "/move <num> <owner/repo>", help: "Move an issue to another repository", restricted: true, admin_only: false },
-    CommandSpec { name: "duplicate", usage: "/duplicate <num> <#original>", help: "Close an issue as a duplicate of another", restricted: true, admin_only: false },
-    CommandSpec { name: "close", usage: "/close <num> [reason]", help: "Close an issue or PR", restricted: true, admin_only: false },
-    CommandSpec { name: "reopen", usage: "/reopen <num>", help: "Reopen a closed issue or PR", restricted: true, admin_only: false },
-    CommandSpec { name: "comment", usage: "/comment <num> <text>", help: "Post a comment on an issue or PR", restricted: true, admin_only: false },
-    CommandSpec { name: "retest", usage: "/retest <num>", help: "Re-trigger CI check runs", restricted: true, admin_only: false },
-    CommandSpec { name: "stale", usage: "/stale", help: "Run a stale issues/PRs sweep on current repository", restricted: true, admin_only: false },
-    CommandSpec { name: "report", usage: "/report [weekly|monthly]", help: "Generate repository metrics report", restricted: true, admin_only: false },
-    CommandSpec { name: "config", usage: "/config", help: "View active configuration summary", restricted: false, admin_only: false },
-    CommandSpec { name: "reload", usage: "/reload", help: "Validate configuration files on disk", restricted: true, admin_only: false },
-    CommandSpec { name: "restart", usage: "/restart", help: "Gracefully restart the service process", restricted: true, admin_only: true },
+    CommandSpec {
+        name: "help",
+        usage: "/help",
+        help: "List all available commands",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "status",
+        usage: "/status",
+        help: "Bot operational status and connected repositories",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "stats",
+        usage: "/stats",
+        help: "Issue / PR / commit statistics for current repository",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "issues",
+        usage: "/issues [n]",
+        help: "List recent open issues (default 10)",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "prs",
+        usage: "/prs [n]",
+        help: "List recent open PRs (default 10)",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "users",
+        usage: "/users",
+        help: "List eligible GitHub assignees & reviewer pool",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "label",
+        usage: "/label <num> <label...>",
+        help: "Add labels to an issue or PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "unlabel",
+        usage: "/unlabel <num> <label...>",
+        help: "Remove labels from an issue or PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "assign",
+        usage: "/assign <num> <user...>",
+        help: "Assign an issue or PR to users",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "unassign",
+        usage: "/unassign <num> <user...>",
+        help: "Remove assignees from an issue or PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "reviewer",
+        usage: "/reviewer <num> [set|+|-] <user...>",
+        help: "List, add, remove or replace (set) PR reviewers",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "unreviewer",
+        usage: "/unreviewer <num> <user...>",
+        help: "Remove requested reviewers from a PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "workload",
+        usage: "/workload",
+        help: "Active review workload per reviewer in this repository",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "project",
+        usage: "/project <num> <project> [status]",
+        help: "Add an issue/PR to a GitHub Project v2 board",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "move",
+        usage: "/move <num> <owner/repo>",
+        help: "Move an issue to another repository",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "duplicate",
+        usage: "/duplicate <num> <#original>",
+        help: "Close an issue as a duplicate of another",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "close",
+        usage: "/close <num> [reason]",
+        help: "Close an issue or PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "reopen",
+        usage: "/reopen <num>",
+        help: "Reopen a closed issue or PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "comment",
+        usage: "/comment <num> <text>",
+        help: "Post a comment on an issue or PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "retest",
+        usage: "/retest <num>",
+        help: "Re-trigger CI check runs",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "stale",
+        usage: "/stale",
+        help: "Run a stale issues/PRs sweep on current repository",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "report",
+        usage: "/report [weekly|monthly]",
+        help: "Generate repository metrics report",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "config",
+        usage: "/config",
+        help: "View active configuration summary",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "reload",
+        usage: "/reload",
+        help: "Validate configuration files on disk",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "restart",
+        usage: "/restart",
+        help: "Gracefully restart the service process",
+        restricted: true,
+        admin_only: true,
+    },
 ];
 
 pub fn command_spec(name: &str) -> Option<&'static CommandSpec> {
@@ -178,5 +333,7 @@ pub fn command_spec(name: &str) -> Option<&'static CommandSpec> {
         "unreviewers" => "unreviewer",
         other => other,
     };
-    COMMANDS.iter().find(|c| c.name.eq_ignore_ascii_case(canonical))
+    COMMANDS
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(canonical))
 }

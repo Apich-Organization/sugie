@@ -85,7 +85,9 @@ async fn fetch_uncached(triage: &TriageService, full_name: &str) -> RepoStats {
 
     let client = match triage.get_client_for_repo(full_name).await {
         Ok(c) => c,
-        Err(e) => return RepoStats::failed(full_name, format!("Failed to get installation token: {e}")),
+        Err(e) => {
+            return RepoStats::failed(full_name, format!("Failed to get installation token: {e}"))
+        }
     };
 
     let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
@@ -94,8 +96,7 @@ async fn fetch_uncached(triage: &TriageService, full_name: &str) -> RepoStats {
     let pulls_fut = client.list_repo_pulls(owner, repo, "open", 100);
     let commits_fut = client.list_commits(owner, repo, Some(&since), 100);
 
-    let (meta, issues, pulls, commits) =
-        tokio::join!(meta_fut, issues_fut, pulls_fut, commits_fut);
+    let (meta, issues, pulls, commits) = tokio::join!(meta_fut, issues_fut, pulls_fut, commits_fut);
 
     let mut stats = RepoStats {
         full_name: full_name.to_string(),
@@ -105,7 +106,10 @@ async fn fetch_uncached(triage: &TriageService, full_name: &str) -> RepoStats {
 
     match meta {
         Ok(v) => {
-            stats.stars = v.get("stargazers_count").and_then(|n| n.as_u64()).unwrap_or(0);
+            stats.stars = v
+                .get("stargazers_count")
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
             stats.forks = v.get("forks_count").and_then(|n| n.as_u64()).unwrap_or(0);
             stats.default_branch = v
                 .get("default_branch")
@@ -117,29 +121,29 @@ async fn fetch_uncached(triage: &TriageService, full_name: &str) -> RepoStats {
     }
 
     match issues {
-        Ok(list) => {
-            stats.open_issues = list.iter().filter(|i| !i.is_pr()).count() as u64
-        }
+        Ok(list) => stats.open_issues = list.iter().filter(|i| !i.is_pr()).count() as u64,
         Err(e) => {
-            stats.error.get_or_insert(format!("Failed to fetch issue count: {e}"));
+            stats
+                .error
+                .get_or_insert(format!("Failed to fetch issue count: {e}"));
         }
     }
 
     match pulls {
-        Ok(list) => {
-            stats.open_prs = list.len() as u64
-        }
+        Ok(list) => stats.open_prs = list.len() as u64,
         Err(e) => {
-            stats.error.get_or_insert(format!("Failed to fetch PR count: {e}"));
+            stats
+                .error
+                .get_or_insert(format!("Failed to fetch PR count: {e}"));
         }
     }
 
     match commits {
-        Ok(list) => {
-            stats.commits_30d = list.len() as u64
-        }
+        Ok(list) => stats.commits_30d = list.len() as u64,
         Err(e) => {
-            stats.error.get_or_insert(format!("Failed to fetch commit count: {e}"));
+            stats
+                .error
+                .get_or_insert(format!("Failed to fetch commit count: {e}"));
         }
     }
 

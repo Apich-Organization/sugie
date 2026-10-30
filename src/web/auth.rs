@@ -165,11 +165,18 @@ pub fn bootstrap_admin(db: &WebDb) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let from_env = std::env::var("SUGIE_ADMIN_PASSWORD").ok().filter(|p| p.len() >= 8);
+    let from_env = std::env::var("SUGIE_ADMIN_PASSWORD")
+        .ok()
+        .filter(|p| p.len() >= 8);
     let generated = from_env.is_none();
     let password = from_env.unwrap_or_else(random_token);
 
-    db.create_user("admin", &hash_password(&password)?, Role::Owner.as_str(), "System Administrator")?;
+    db.create_user(
+        "admin",
+        &hash_password(&password)?,
+        Role::Owner.as_str(),
+        "System Administrator",
+    )?;
 
     if generated {
         // Keep the secret out of shell history / process listings.

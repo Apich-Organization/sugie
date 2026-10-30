@@ -422,7 +422,9 @@ async fn test_notification_event_routing() {
 #[tokio::test]
 async fn test_inbound_zulip_chat_webhook() {
     let (state, storage) = create_test_state();
-    storage.upsert_repository(100, "StarLabsSI/ensia", 12345).unwrap();
+    storage
+        .upsert_repository(100, "StarLabsSI/ensia", 12345)
+        .unwrap();
 
     let app = create_router(state);
 
@@ -478,9 +480,14 @@ async fn test_inbound_lark_url_verification_and_event() {
     let resp1 = app.clone().oneshot(req1).await.unwrap();
     assert_eq!(resp1.status(), StatusCode::OK);
 
-    let bytes1 = axum::body::to_bytes(resp1.into_body(), usize::MAX).await.unwrap();
+    let bytes1 = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json1: serde_json::Value = serde_json::from_slice(&bytes1).unwrap();
-    assert_eq!(json1.get("challenge").and_then(|v| v.as_str()), Some("my_unique_challenge_token_123"));
+    assert_eq!(
+        json1.get("challenge").and_then(|v| v.as_str()),
+        Some("my_unique_challenge_token_123")
+    );
 
     // 2. Lark Message Event
     let event_payload = serde_json::json!({
@@ -513,7 +520,9 @@ async fn test_inbound_lark_url_verification_and_event() {
     let resp2 = app.oneshot(req2).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::OK);
 
-    let bytes2 = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+    let bytes2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
     assert_eq!(json2.get("code").and_then(|v| v.as_i64()), Some(0));
 }
@@ -532,7 +541,8 @@ async fn test_inbound_lark_encrypted_callback() {
         "token": "test-lark-token"
     })
     .to_string();
-    let encrypted_challenge = sugie::server::chat::encrypt_lark_payload(encrypt_key, &plaintext).unwrap();
+    let encrypted_challenge =
+        sugie::server::chat::encrypt_lark_payload(encrypt_key, &plaintext).unwrap();
     let encrypted_wrapper = serde_json::json!({
         "encrypt": encrypted_challenge
     });
@@ -547,9 +557,14 @@ async fn test_inbound_lark_encrypted_callback() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json.get("challenge").and_then(|v| v.as_str()), Some("challenge_abc_123"));
+    assert_eq!(
+        json.get("challenge").and_then(|v| v.as_str()),
+        Some("challenge_abc_123")
+    );
 }
 
 #[tokio::test]
@@ -581,7 +596,9 @@ async fn test_inbound_discord_ping_interaction() {
 #[tokio::test]
 async fn test_generic_chat_command_endpoint() {
     let (state, storage) = create_test_state();
-    storage.upsert_repository(100, "StarLabsSI/ensia", 12345).unwrap();
+    storage
+        .upsert_repository(100, "StarLabsSI/ensia", 12345)
+        .unwrap();
     let app = create_router(state);
 
     let payload = serde_json::json!({

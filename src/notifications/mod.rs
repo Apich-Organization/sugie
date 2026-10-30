@@ -134,10 +134,7 @@ pub fn extract_repo_from_context(title: &str, url: Option<&str>) -> Option<Strin
         });
         if let Some((owner, repo_and_rest)) = clean.split_once('/') {
             let repo = repo_and_rest.split('#').next().unwrap_or(repo_and_rest);
-            if !owner.is_empty()
-                && !repo.is_empty()
-                && !owner.contains('/')
-                && !repo.contains('/')
+            if !owner.is_empty() && !repo.is_empty() && !owner.contains('/') && !repo.contains('/')
             {
                 return Some(format!("{}/{}", owner, repo));
             }
@@ -293,13 +290,7 @@ impl NotificationDispatcher {
                     .map(|f| (f.name.as_str(), f.value.as_str()))
                     .collect();
                 if let Err(e) = lark
-                    .send_notification(
-                        title,
-                        message,
-                        url,
-                        level.lark_template(),
-                        &lark_fields,
-                    )
+                    .send_notification(title, message, url, level.lark_template(), &lark_fields)
                     .await
                 {
                     error!("Failed to dispatch Lark notification: {:?}", e);

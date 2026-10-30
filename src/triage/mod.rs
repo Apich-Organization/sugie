@@ -86,7 +86,10 @@ impl TriageService {
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to fetch repositories for installation {}: {:?}", inst_id, e);
+                        warn!(
+                            "Failed to fetch repositories for installation {}: {:?}",
+                            inst_id, e
+                        );
                     }
                 }
             }

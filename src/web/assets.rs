@@ -313,6 +313,162 @@ td:last-child .row{justify-content:flex-end}
   .grid.cols-4{grid-template-columns:minmax(0,1fr)}
   .page-head h1{font-size:22px}
 }
+
+.card.tight table.audit-table{min-width:1040px}
+.audit-table th.col-ts,.audit-table td.col-ts{min-width:145px}
+.filter-row th{padding:6px 10px 10px; background:var(--surface-alt); border-bottom:1px solid var(--border-mid); font-weight:normal}
+.col-filter{width:100%; min-width:85px; box-sizing:border-box; padding:5px 8px; font-size:11.5px; font-family:inherit; border-radius:8px; border:1px solid var(--border-mid); background:var(--surface-hi); color:var(--text-1); transition:border-color .2s, box-shadow .2s}
+.col-filter:focus{border-color:var(--primary); outline:none; box-shadow:0 0 0 2px var(--accent-soft)}
+select.col-filter{padding:4px 6px; cursor:pointer}
+input[type=date].col-filter{min-width:135px; padding:4px 6px; cursor:pointer}
+[data-theme="dark"] input[type=date]::-webkit-calendar-picker-indicator{filter:invert(0.85); cursor:pointer}
+
+/* ================= visual refresh: Bezier motion, living gradient, frosted glass ================= */
+:root{
+  color-scheme:light;
+  --ease-out:cubic-bezier(.22,1,.36,1);
+  --ease-spring:cubic-bezier(.34,1.56,.64,1);
+  --ease-inout:cubic-bezier(.65,0,.35,1);
+  --glass:rgba(255,255,255,.52); --glass-hi:rgba(255,255,255,.72);
+  --glass-edge:rgba(255,255,255,.7); --glass-shade:rgba(110,80,200,.10);
+  --orb-a:rgba(160,120,255,.55); --orb-b:rgba(110,160,255,.42);
+  --orb-c:rgba(236,130,230,.40); --orb-d:rgba(120,90,230,.38);
+}
+[data-theme="dark"]{
+  color-scheme:dark;
+  --glass:rgba(26,18,48,.50); --glass-hi:rgba(40,28,72,.66);
+  --glass-edge:rgba(190,160,255,.22); --glass-shade:rgba(0,0,0,.45);
+  --orb-a:rgba(120,80,240,.50); --orb-b:rgba(60,110,230,.34);
+  --orb-c:rgba(200,80,210,.28); --orb-d:rgba(90,60,200,.40);
+}
+body{background:transparent; position:relative}
+html{background:var(--bg)}
+body::before{
+  background:linear-gradient(135deg,var(--bg) 0%,var(--bg-deep) 50%,var(--bg) 100%);
+  background-size:220% 220%; animation:bg-shift 28s var(--ease-inout) infinite alternate;
+}
+@keyframes bg-shift{0%{background-position:0% 30%}100%{background-position:100% 70%}}
+
+/* ambient layer: drifting gradient orbs + Bezier ribbons */
+.ambient-bg{position:fixed; inset:0; z-index:-1; overflow:hidden; pointer-events:none}
+.orb{position:absolute; border-radius:50%; filter:blur(70px); opacity:.85; will-change:transform}
+.orb-1{width:46vmax;height:46vmax; left:-12vmax; top:-14vmax; background:radial-gradient(circle at 35% 35%,var(--orb-a),transparent 68%); animation:orb-1 26s var(--ease-inout) infinite alternate}
+.orb-2{width:40vmax;height:40vmax; right:-10vmax; top:-6vmax; background:radial-gradient(circle at 60% 40%,var(--orb-b),transparent 68%); animation:orb-2 32s var(--ease-inout) infinite alternate}
+.orb-3{width:44vmax;height:44vmax; left:22vw; bottom:-22vmax; background:radial-gradient(circle,var(--orb-c),transparent 68%); animation:orb-3 36s var(--ease-inout) infinite alternate}
+.orb-4{width:30vmax;height:30vmax; right:4vw; bottom:6vh; background:radial-gradient(circle,var(--orb-d),transparent 70%); animation:orb-4 30s var(--ease-inout) infinite alternate}
+@keyframes orb-1{0%{transform:translate(0,0) scale(1)}50%{transform:translate(9vw,7vh) scale(1.12)}100%{transform:translate(3vw,16vh) scale(.94)}}
+@keyframes orb-2{0%{transform:translate(0,0) scale(1)}50%{transform:translate(-8vw,10vh) scale(1.1)}100%{transform:translate(-14vw,2vh) scale(.92)}}
+@keyframes orb-3{0%{transform:translate(0,0) scale(1)}50%{transform:translate(-10vw,-8vh) scale(1.08)}100%{transform:translate(8vw,-14vh) scale(.96)}}
+@keyframes orb-4{0%{transform:translate(0,0) scale(.9)}100%{transform:translate(-12vw,-10vh) scale(1.15)}}
+.ambient-bezier{position:absolute; inset:0; width:100%; height:100%}
+.bz-wave-1{animation:wave-1 22s var(--ease-inout) infinite alternate; transform-origin:50% 100%}
+.bz-wave-2{animation:wave-2 28s var(--ease-inout) infinite alternate; transform-origin:50% 100%}
+@keyframes wave-1{0%{transform:translateY(0) scaleY(1)}100%{transform:translateY(-28px) scaleY(1.08)}}
+@keyframes wave-2{0%{transform:translateY(0) scaleY(1)}100%{transform:translateY(24px) scaleY(.93)}}
+.bz-line{stroke-dasharray:900 1400; animation:line-flow 18s linear infinite}
+.bz-line-2{animation-duration:24s; animation-direction:reverse}
+.bz-line-3{stroke-dasharray:8 10; animation:none; opacity:.7}
+@keyframes line-flow{to{stroke-dashoffset:-2300}}
+
+/* frosted glass surfaces */
+.topbar{
+  background:var(--glass); backdrop-filter:blur(26px) saturate(180%); -webkit-backdrop-filter:blur(26px) saturate(180%);
+  border-bottom:1px solid var(--glass-edge);
+  box-shadow:inset 0 -1px 0 rgba(255,255,255,.18), 0 10px 40px -24px var(--glass-shade);
+}
+[data-theme="dark"] .topbar{background:var(--glass)}
+.card,.stat,.alert,.tabs,.user-chip,.icon-btn,.check,.msg.bot{
+  backdrop-filter:blur(22px) saturate(170%); -webkit-backdrop-filter:blur(22px) saturate(170%);
+}
+.card,.stat{
+  background:linear-gradient(155deg,var(--glass-hi),var(--glass)) ;
+  border:1px solid var(--glass-edge);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.55), inset 0 -1px 0 rgba(255,255,255,.08), 0 24px 60px -34px var(--glass-shade);
+  position:relative;
+  transition:transform .5s var(--ease-out), box-shadow .5s var(--ease-out), border-color .4s var(--ease-out);
+}
+[data-theme="dark"] .card,[data-theme="dark"] .stat{box-shadow:inset 0 1px 0 rgba(255,255,255,.10), 0 24px 60px -30px var(--glass-shade)}
+.card::before,.stat::before{
+  content:""; position:absolute; inset:0; border-radius:inherit; pointer-events:none;
+  background:linear-gradient(180deg,rgba(255,255,255,.28),transparent 38%);
+  opacity:.55; mask:linear-gradient(#000,transparent 70%); -webkit-mask:linear-gradient(#000,transparent 70%);
+}
+.stat:hover,.card:not(.chat):not(.tight):hover{
+  transform:translateY(-3px); border-color:var(--border-hi);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.6), 0 34px 70px -34px rgba(110,80,200,.55);
+}
+.stat{isolation:isolate}
+.stat::after{display:none}
+.stat-bezier{position:absolute; left:0; right:0; bottom:0; width:100%; height:46px; z-index:-1; opacity:.9}
+.stat-bz-area{fill:var(--accent-soft); transition:transform .8s var(--ease-out); transform-origin:50% 100%}
+.stat-bz-stroke{stroke:var(--primary); stroke-opacity:.55}
+.stat:hover .stat-bz-area{transform:scaleY(1.35)}
+.stat .value{position:relative}
+.alert{background:var(--glass)}
+.alert.ok{background:rgba(74,142,110,.14)} .alert.err{background:rgba(160,64,96,.14)} .alert.warn{background:rgba(144,96,48,.14)}
+.tabs{background:var(--glass)}
+.tabs button{transition:background .3s var(--ease-out), color .3s, box-shadow .3s, transform .3s var(--ease-spring)}
+.tabs button:active{transform:scale(.94)}
+.tabs button.active{background:var(--glass-hi); box-shadow:inset 0 1px 0 rgba(255,255,255,.6), 0 8px 18px -12px rgba(60,40,120,.8)}
+.card.tight{overflow-y:hidden}
+dialog.modal-dialog{
+  background:linear-gradient(155deg,var(--glass-hi),var(--glass)); border:1px solid var(--glass-edge);
+  backdrop-filter:blur(34px) saturate(190%); -webkit-backdrop-filter:blur(34px) saturate(190%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.6), 0 40px 90px -24px rgba(30,10,80,.6);
+}
+dialog.modal-dialog[open]{animation:pop-in .5s var(--ease-spring)}
+dialog.modal-dialog::backdrop{background:rgba(20,10,50,.38); backdrop-filter:blur(10px) saturate(140%); -webkit-backdrop-filter:blur(10px) saturate(140%); animation:fade-in .35s var(--ease-out)}
+@keyframes pop-in{from{opacity:0; transform:translateY(18px) scale(.93)}to{opacity:1; transform:none}}
+@keyframes fade-in{from{opacity:0}to{opacity:1}}
+
+/* controls with springy Bezier motion */
+.nav a{transition:background .35s var(--ease-out), color .3s, transform .35s var(--ease-spring)}
+.nav a:hover{transform:translateY(-1px)}
+.nav a.active{box-shadow:inset 0 1px 0 rgba(255,255,255,.35), 0 10px 24px -10px rgba(110,80,200,.85)}
+.btn{
+  background:var(--glass-hi); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.5);
+  transition:transform .35s var(--ease-spring), box-shadow .35s var(--ease-out), border-color .25s, background .25s;
+}
+.btn:hover{transform:translateY(-2px) scale(1.015)}
+.btn:active{transform:translateY(0) scale(.96); transition-duration:.12s}
+.btn.primary{
+  background:linear-gradient(135deg,var(--primary),var(--accent) 55%,#c690f8); background-size:180% 180%;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.4), 0 16px 30px -14px rgba(110,80,200,.95);
+  animation:btn-sheen 7s var(--ease-inout) infinite alternate;
+}
+@keyframes btn-sheen{from{background-position:0% 50%}to{background-position:100% 50%}}
+.icon-btn{background:var(--glass); transition:transform .4s var(--ease-spring), border-color .25s}
+.icon-btn:hover{transform:rotate(18deg) scale(1.08)}
+.user-chip{background:var(--glass)}
+input[type=text],input[type=password],input[type=number],input[type=search],select,textarea{
+  background:var(--glass-hi); box-shadow:inset 0 1px 2px rgba(60,40,120,.06);
+  transition:border-color .3s var(--ease-out), box-shadow .4s var(--ease-out), transform .3s var(--ease-out);
+}
+input:focus,select:focus,textarea:focus{box-shadow:0 0 0 4px var(--accent-soft), 0 10px 24px -14px rgba(110,80,200,.7); transform:translateY(-1px)}
+tbody tr{transition:background .3s var(--ease-out)}
+.repo-picker a{transition:background .3s var(--ease-out), transform .35s var(--ease-spring), color .2s}
+.repo-picker a:hover{transform:translateX(3px)}
+.badge{backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px)}
+.msg{animation:msg-in .5s var(--ease-spring)}
+@keyframes msg-in{from{opacity:0; transform:translateY(10px) scale(.97)}to{opacity:1; transform:none}}
+.msg.bot{background:var(--glass)}
+.quick button{transition:transform .3s var(--ease-spring), border-color .2s}
+.quick button:hover{transform:translateY(-2px)}
+
+/* entrance choreography */
+.page-head,.page>.card,.page>.grid>*,.page>.stack>*,.page>.alert,.page>.console>*,.page>.row{animation:rise .8s var(--ease-out) both}
+.page>.grid>*:nth-child(2),.page>.console>*:nth-child(2){animation-delay:.07s}
+.page>.grid>*:nth-child(3){animation-delay:.14s}
+.page>.grid>*:nth-child(4){animation-delay:.21s}
+@keyframes rise{from{opacity:0; transform:translateY(22px)}to{opacity:1; transform:none}}
+.auth-card{animation:pop-in .8s var(--ease-spring) both}
+.page-head h1{background:linear-gradient(120deg,var(--text-1) 30%,var(--primary-dk)); -webkit-background-clip:text; background-clip:text; color:transparent}
+
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none !important; transition-duration:.01ms !important}
+}
+@media(max-width:700px){.orb{filter:blur(50px)} .bz-line-3{display:none}}
 "#;
 
 pub const JS: &str = r#"
@@ -674,6 +830,49 @@ pub const JS: &str = r#"
   document.querySelectorAll('[data-filter-table]').forEach(function (c) {
     var id = c.getAttribute('data-filter-table');
     c.addEventListener(c.tagName === 'INPUT' && c.type === 'search' ? 'input' : 'change', function () { apply(id); });
+  });
+})();
+
+// ---- scroll position preservation on form submit / filter / navigation ----
+(function () {
+  function saveScroll() {
+    try {
+      sessionStorage.setItem('sugie_scroll_' + location.pathname, String(window.scrollY || window.pageYOffset));
+    } catch (e) {}
+  }
+
+  try {
+    var saved = sessionStorage.getItem('sugie_scroll_' + location.pathname);
+    if (saved !== null) {
+      var y = parseInt(saved, 10);
+      if (!isNaN(y) && y > 0) {
+        window.scrollTo(0, y);
+        requestAnimationFrame(function () { window.scrollTo(0, y); });
+        setTimeout(function () {
+          window.scrollTo(0, y);
+          sessionStorage.removeItem('sugie_scroll_' + location.pathname);
+        }, 80);
+      } else {
+        sessionStorage.removeItem('sugie_scroll_' + location.pathname);
+      }
+    }
+  } catch (e) {}
+
+  window.addEventListener('beforeunload', saveScroll);
+  document.addEventListener('submit', saveScroll);
+
+  document.querySelectorAll('input[type=date]').forEach(function (inp) {
+    inp.addEventListener('change', saveScroll);
+  });
+
+  document.querySelectorAll('.card a, .page-head a, .tabs a').forEach(function (a) {
+    a.addEventListener('click', saveScroll);
+  });
+
+  document.querySelectorAll('.topbar a').forEach(function (a) {
+    a.addEventListener('click', function () {
+      try { sessionStorage.removeItem('sugie_scroll_' + location.pathname); } catch (e) {}
+    });
   });
 })();
 "#;

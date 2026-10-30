@@ -255,7 +255,10 @@ impl Storage {
         Ok(())
     }
 
-    pub fn list_all_reviewer_workloads(&self, repo: Option<&str>) -> Result<Vec<(String, String, u32)>> {
+    pub fn list_all_reviewer_workloads(
+        &self,
+        repo: Option<&str>,
+    ) -> Result<Vec<(String, String, u32)>> {
         let conn = self.conn.lock().unwrap();
         let mut workloads = Vec::new();
         if let Some(r) = repo {
@@ -272,9 +275,7 @@ impl Storage {
             let mut stmt = conn.prepare(
                 "SELECT username, repo, active_reviews FROM reviewer_workloads ORDER BY active_reviews DESC"
             )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
             for row in rows {
                 workloads.push(row?);
             }

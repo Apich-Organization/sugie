@@ -1,8 +1,6 @@
 use crate::chat::{ChatCommandExecutor, ChatPlatform, InboundChatMessage, InboundSender};
 use crate::server::AppState;
-use aes::cipher::{
-    block_padding::Pkcs7, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit,
-};
+use aes::cipher::{block_padding::Pkcs7, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use axum::{
     body::Bytes,
     extract::State,
@@ -261,10 +259,7 @@ pub fn encrypt_lark_challenge(encrypt_key: &str, challenge: &str) -> anyhow::Res
     encrypt_lark_payload(encrypt_key, &plaintext)
 }
 
-pub async fn lark_chat_handler(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> impl IntoResponse {
+pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let raw_payload: LarkCallbackRequest = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -334,7 +329,10 @@ pub async fn lark_chat_handler(
                     }
                 }
             }
-            info!("Responded to Lark URL verification challenge: {:?}", challenge);
+            info!(
+                "Responded to Lark URL verification challenge: {:?}",
+                challenge
+            );
             return (StatusCode::OK, Json(json!({ "challenge": challenge })));
         }
     }
@@ -434,13 +432,7 @@ pub async fn lark_chat_handler(
 
                 if let Some(lark) = triage.notifier().lark() {
                     match lark
-                        .send_notification(
-                            "🤖 Sugie Bot Response",
-                            &reply,
-                            None,
-                            "blue",
-                            &[],
-                        )
+                        .send_notification("🤖 Sugie Bot Response", &reply, None, "blue", &[])
                         .await
                     {
                         Ok(_) => info!("Successfully dispatched Lark response notification"),
@@ -451,10 +443,7 @@ pub async fn lark_chat_handler(
                 }
             });
 
-            return (
-                StatusCode::OK,
-                Json(json!({ "code": 0, "msg": "success" })),
-            );
+            return (StatusCode::OK, Json(json!({ "code": 0, "msg": "success" })));
         } else {
             info!(
                 "Lark event '{}' processed (no executable message text)",

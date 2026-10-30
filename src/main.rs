@@ -104,8 +104,14 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(async move {
                 info!("Syncing repositories from active GitHub App installations...");
                 match sync_triage.sync_all_repositories().await {
-                    Ok(repos) => info!("Successfully synced {} repositories into database.", repos.len()),
-                    Err(e) => warn!("Auto-syncing repositories from installations skipped/failed: {:?}", e),
+                    Ok(repos) => info!(
+                        "Successfully synced {} repositories into database.",
+                        repos.len()
+                    ),
+                    Err(e) => warn!(
+                        "Auto-syncing repositories from installations skipped/failed: {:?}",
+                        e
+                    ),
                 }
             });
 
@@ -282,12 +288,25 @@ async fn main() -> anyhow::Result<()> {
             let _ = auth.generate_jwt()?;
             println!("✅ Local configuration file and RSA private key are valid!");
 
-            println!("🔄 Testing outbound connection to GitHub API (App ID: {})...", config.github.app_id);
+            println!(
+                "🔄 Testing outbound connection to GitHub API (App ID: {})...",
+                config.github.app_id
+            );
             match auth.get_app_info().await {
                 Ok(app) => {
-                    let name = app.get("name").and_then(|v| v.as_str()).unwrap_or("Unknown");
-                    let slug = app.get("slug").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let owner = app.get("owner").and_then(|o| o.get("login")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let name = app
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown");
+                    let slug = app
+                        .get("slug")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let owner = app
+                        .get("owner")
+                        .and_then(|o| o.get("login"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
                     println!("✅ Successfully authenticated with GitHub API as App '{}' (slug: {}, owner: {})", name, slug, owner);
 
                     match auth.get_installations().await {
@@ -299,9 +318,19 @@ async fn main() -> anyhow::Result<()> {
                                 let storage = Storage::new(&config.db_path).ok();
                                 for inst in installs {
                                     let id = inst.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let acc = inst.get("account").and_then(|a| a.get("login")).and_then(|v| v.as_str()).unwrap_or("unknown");
-                                    let target_type = inst.get("target_type").and_then(|v| v.as_str()).unwrap_or("");
-                                    println!("   • Installation ID: {} (Target: {} [{}])", id, acc, target_type);
+                                    let acc = inst
+                                        .get("account")
+                                        .and_then(|a| a.get("login"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown");
+                                    let target_type = inst
+                                        .get("target_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    println!(
+                                        "   • Installation ID: {} (Target: {} [{}])",
+                                        id, acc, target_type
+                                    );
 
                                     match auth.get_installation_repositories(id).await {
                                         Ok(repos) => {
@@ -327,7 +356,10 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 }
                                 if storage.is_some() {
-                                    println!("💾 Synced active repositories to local database ({}).", config.db_path);
+                                    println!(
+                                        "💾 Synced active repositories to local database ({}).",
+                                        config.db_path
+                                    );
                                 }
                             }
                         }
@@ -352,19 +384,28 @@ async fn main() -> anyhow::Result<()> {
 
             println!("🔔 Notification Channels configured:");
             if let Some(ref d) = config.notifications.discord {
-                println!("   • Discord: ✅ Configured {}", format_repos(d.allowed_repositories.as_ref()));
+                println!(
+                    "   • Discord: ✅ Configured {}",
+                    format_repos(d.allowed_repositories.as_ref())
+                );
             } else {
                 println!("   • Discord: ⚪ Not configured");
             }
 
             if let Some(ref z) = config.notifications.zulip {
-                println!("   • Zulip:   ✅ Configured {}", format_repos(z.allowed_repositories.as_ref()));
+                println!(
+                    "   • Zulip:   ✅ Configured {}",
+                    format_repos(z.allowed_repositories.as_ref())
+                );
             } else {
                 println!("   • Zulip:   ⚪ Not configured");
             }
 
             if let Some(ref l) = config.notifications.lark {
-                println!("   • Lark:    ✅ Configured {}", format_repos(l.allowed_repositories.as_ref()));
+                println!(
+                    "   • Lark:    ✅ Configured {}",
+                    format_repos(l.allowed_repositories.as_ref())
+                );
             } else {
                 println!("   • Lark:    ⚪ Not configured");
             }
@@ -382,7 +423,11 @@ async fn main() -> anyhow::Result<()> {
             if !config.default_rules.commands.restricted_commands.is_empty() {
                 println!(
                     "   • Restricted Commands: /{}",
-                    config.default_rules.commands.restricted_commands.join(", /")
+                    config
+                        .default_rules
+                        .commands
+                        .restricted_commands
+                        .join(", /")
                 );
             } else {
                 println!("   • Restricted Commands: (None - all commands are open)");
@@ -430,7 +475,9 @@ async fn main() -> anyhow::Result<()> {
                         Err(e) => println!("   ❌ Discord notification failed: {:?}", e),
                     }
                 } else if target == "discord" {
-                    println!("   ⚠️ Discord is not configured (missing SUGIE_DISCORD_WEBHOOK_URL).");
+                    println!(
+                        "   ⚠️ Discord is not configured (missing SUGIE_DISCORD_WEBHOOK_URL)."
+                    );
                 }
             }
 
@@ -447,10 +494,7 @@ async fn main() -> anyhow::Result<()> {
                     test_msg.push_str("\n\n* **Channel**: Zulip Stream\n* **Bot Version**: ");
                     test_msg.push_str(env!("CARGO_PKG_VERSION"));
                     match notifier
-                        .send_message(
-                            sugie::notifications::ZulipTopicCategory::Alerts,
-                            &test_msg,
-                        )
+                        .send_message(sugie::notifications::ZulipTopicCategory::Alerts, &test_msg)
                         .await
                     {
                         Ok(_) => println!("   ✅ Zulip notification sent successfully!"),

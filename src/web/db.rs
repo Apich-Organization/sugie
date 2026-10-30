@@ -79,6 +79,69 @@ pub struct AuditRow {
     pub ok: bool,
 }
 
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct AuditFilter {
+    #[serde(default)]
+    pub ts: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub ip: String,
+    #[serde(default)]
+    pub result: String,
+}
+
+impl AuditFilter {
+    pub fn is_empty(&self) -> bool {
+        self.ts.trim().is_empty()
+            && self.username.trim().is_empty()
+            && self.action.trim().is_empty()
+            && self.target.trim().is_empty()
+            && self.detail.trim().is_empty()
+            && self.ip.trim().is_empty()
+            && self.result.trim().is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct SecurityHttpFilter {
+    #[serde(default)]
+    pub ts: String,
+    #[serde(default)]
+    pub direction: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default)]
+    pub ip: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+impl SecurityHttpFilter {
+    pub fn is_empty(&self) -> bool {
+        self.ts.trim().is_empty()
+            && self.direction.trim().is_empty()
+            && self.method.trim().is_empty()
+            && self.target.trim().is_empty()
+            && self.status.trim().is_empty()
+            && self.actor.trim().is_empty()
+            && self.ip.trim().is_empty()
+            && self.detail.trim().is_empty()
+    }
+}
+
 const USER_SELECT_SQL: &str = "
     SELECT u.id, u.username, u.display_name, u.role, u.active, u.created_at, u.last_login,
            u.totp_enabled, u.two_fa_policy,
@@ -346,7 +409,9 @@ impl WebDb {
     pub fn find_user(&self, username: &str) -> Result<Option<UserRow>> {
         let conn = self.conn.lock().unwrap();
         let sql = format!("{USER_SELECT_SQL} WHERE u.username = ?1 COLLATE NOCASE");
-        let row = conn.query_row(&sql, params![username], map_user).optional()?;
+        let row = conn
+            .query_row(&sql, params![username], map_user)
+            .optional()?;
         Ok(row)
     }
 
@@ -416,9 +481,15 @@ impl WebDb {
     pub fn delete_user(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM web_repo_perms WHERE user_id = ?1", params![id])?;
-        conn.execute("DELETE FROM web_command_perms WHERE user_id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM web_command_perms WHERE user_id = ?1",
+            params![id],
+        )?;
         conn.execute("DELETE FROM web_sessions WHERE user_id = ?1", params![id])?;
-        conn.execute("DELETE FROM web_pending_2fa WHERE user_id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM web_pending_2fa WHERE user_id = ?1",
+            params![id],
+        )?;
         conn.execute("DELETE FROM web_passkeys WHERE user_id = ?1", params![id])?;
         conn.execute("DELETE FROM web_users WHERE id = ?1", params![id])?;
         Ok(())
@@ -613,7 +684,9 @@ impl WebDb {
         }
 
         let sql = format!("{USER_SELECT_SQL} WHERE u.id = ?1");
-        let row = conn.query_row(&sql, params![user_id], map_user).optional()?;
+        let row = conn
+            .query_row(&sql, params![user_id], map_user)
+            .optional()?;
         Ok(row.filter(|u| u.active))
     }
 
@@ -629,7 +702,10 @@ impl WebDb {
     pub fn purge_sessions(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
-        conn.execute("DELETE FROM web_sessions WHERE expires_at < ?1", params![now])?;
+        conn.execute(
+            "DELETE FROM web_sessions WHERE expires_at < ?1",
+            params![now],
+        )?;
         conn.execute(
             "DELETE FROM web_pending_2fa WHERE expires_at < ?1",
             params![now],
@@ -697,7 +773,9 @@ impl WebDb {
         }
 
         let sql = format!("{USER_SELECT_SQL} WHERE u.id = ?1");
-        let row = conn.query_row(&sql, params![user_id], map_user).optional()?;
+        let row = conn
+            .query_row(&sql, params![user_id], map_user)
+            .optional()?;
         Ok(row.filter(|u| u.active).map(|u| (u, next_url)))
     }
 
@@ -718,7 +796,10 @@ impl WebDb {
     pub fn set_repo_perms(&self, user_id: i64, repos: &[String]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM web_repo_perms WHERE user_id = ?1", params![user_id])?;
+        tx.execute(
+            "DELETE FROM web_repo_perms WHERE user_id = ?1",
+            params![user_id],
+        )?;
         for repo in repos {
             tx.execute(
                 "INSERT OR IGNORE INTO web_repo_perms (user_id, repo) VALUES (?1, ?2)",
@@ -799,13 +880,72 @@ impl WebDb {
     }
 
     pub fn list_audit(&self, limit: i64, offset: i64) -> Result<Vec<AuditRow>> {
+        self.list_audit_filtered(&AuditFilter::default(), limit, offset)
+    }
+
+    pub fn count_audit(&self) -> Result<i64> {
+        self.count_audit_filtered(&AuditFilter::default())
+    }
+
+    pub fn list_audit_filtered(
+        &self,
+        filter: &AuditFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditRow>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, ts, username, action, target, detail, ip, ok
-             FROM web_audit ORDER BY id DESC LIMIT ?1 OFFSET ?2",
-        )?;
+        let mut sql =
+            "SELECT id, ts, username, action, target, detail, ip, ok FROM web_audit WHERE 1=1"
+                .to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if !filter.ts.trim().is_empty() {
+            sql.push_str(" AND ts LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.ts.trim())));
+        }
+        if !filter.username.trim().is_empty() {
+            sql.push_str(" AND username LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.username.trim())));
+        }
+        if !filter.action.trim().is_empty() {
+            sql.push_str(" AND action LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.action.trim())));
+        }
+        if !filter.target.trim().is_empty() {
+            sql.push_str(" AND target LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.target.trim())));
+        }
+        if !filter.detail.trim().is_empty() {
+            sql.push_str(" AND detail LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.detail.trim())));
+        }
+        if !filter.ip.trim().is_empty() {
+            sql.push_str(" AND ip LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.ip.trim())));
+        }
+        if !filter.result.trim().is_empty() {
+            let res = filter.result.trim().to_ascii_lowercase();
+            if res == "ok" || res == "success" || res == "true" || res == "1" {
+                sql.push_str(" AND ok = 1");
+            } else if res == "fail"
+                || res == "failed"
+                || res == "denied"
+                || res == "false"
+                || res == "0"
+            {
+                sql.push_str(" AND ok = 0");
+            }
+        }
+
+        sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
+        params_vec.push(Box::new(limit));
+        params_vec.push(Box::new(offset));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![limit, offset], |r| {
+            .query_map(&params_refs[..], |r| {
                 Ok(AuditRow {
                     id: r.get(0)?,
                     ts: r.get(1)?,
@@ -821,9 +961,53 @@ impl WebDb {
         Ok(rows)
     }
 
-    pub fn count_audit(&self) -> Result<i64> {
+    pub fn count_audit_filtered(&self, filter: &AuditFilter) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM web_audit", [], |r| r.get(0))?;
+        let mut sql = "SELECT COUNT(*) FROM web_audit WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if !filter.ts.trim().is_empty() {
+            sql.push_str(" AND ts LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.ts.trim())));
+        }
+        if !filter.username.trim().is_empty() {
+            sql.push_str(" AND username LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.username.trim())));
+        }
+        if !filter.action.trim().is_empty() {
+            sql.push_str(" AND action LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.action.trim())));
+        }
+        if !filter.target.trim().is_empty() {
+            sql.push_str(" AND target LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.target.trim())));
+        }
+        if !filter.detail.trim().is_empty() {
+            sql.push_str(" AND detail LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.detail.trim())));
+        }
+        if !filter.ip.trim().is_empty() {
+            sql.push_str(" AND ip LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.ip.trim())));
+        }
+        if !filter.result.trim().is_empty() {
+            let res = filter.result.trim().to_ascii_lowercase();
+            if res == "ok" || res == "success" || res == "true" || res == "1" {
+                sql.push_str(" AND ok = 1");
+            } else if res == "fail"
+                || res == "failed"
+                || res == "denied"
+                || res == "false"
+                || res == "0"
+            {
+                sql.push_str(" AND ok = 0");
+            }
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let n: i64 = stmt.query_row(&params_refs[..], |r| r.get(0))?;
         Ok(n)
     }
 
@@ -833,7 +1017,91 @@ impl WebDb {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<SecurityHttpRow>> {
+        self.list_security_http_logs_filtered(
+            direction,
+            &SecurityHttpFilter::default(),
+            limit,
+            offset,
+        )
+    }
+
+    pub fn count_security_http_logs(&self, direction: Option<&str>) -> Result<i64> {
+        self.count_security_http_logs_filtered(direction, &SecurityHttpFilter::default())
+    }
+
+    pub fn list_security_http_logs_filtered(
+        &self,
+        direction: Option<&str>,
+        filter: &SecurityHttpFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SecurityHttpRow>> {
         let conn = self.conn.lock().unwrap();
+        let mut sql = "SELECT id, ts, direction, method, target, status, duration_ms, ip, actor, detail FROM security_http_logs WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        let eff_dir = direction.or_else(|| {
+            if !filter.direction.trim().is_empty() {
+                Some(filter.direction.trim())
+            } else {
+                None
+            }
+        });
+
+        if let Some(dir) = eff_dir {
+            sql.push_str(" AND direction = ?");
+            params_vec.push(Box::new(dir.to_string()));
+        }
+
+        if !filter.ts.trim().is_empty() {
+            sql.push_str(" AND ts LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.ts.trim())));
+        }
+        if !filter.method.trim().is_empty() {
+            sql.push_str(" AND method LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.method.trim())));
+        }
+        if !filter.target.trim().is_empty() {
+            sql.push_str(" AND target LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.target.trim())));
+        }
+        if !filter.status.trim().is_empty() {
+            let st = filter.status.trim();
+            if st.ends_with("xx") && st.len() == 3 {
+                if let Ok(prefix) = st[0..1].parse::<i64>() {
+                    sql.push_str(" AND status >= ? AND status < ?");
+                    params_vec.push(Box::new(prefix * 100));
+                    params_vec.push(Box::new((prefix + 1) * 100));
+                }
+            } else if let Ok(code) = st.parse::<i64>() {
+                sql.push_str(" AND status = ?");
+                params_vec.push(Box::new(code));
+            } else {
+                sql.push_str(" AND status LIKE ?");
+                params_vec.push(Box::new(format!("%{}%", st)));
+            }
+        }
+        if !filter.actor.trim().is_empty() {
+            sql.push_str(" AND (actor LIKE ? OR ip LIKE ?)");
+            params_vec.push(Box::new(format!("%{}%", filter.actor.trim())));
+            params_vec.push(Box::new(format!("%{}%", filter.actor.trim())));
+        }
+        if !filter.ip.trim().is_empty() {
+            sql.push_str(" AND ip LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.ip.trim())));
+        }
+        if !filter.detail.trim().is_empty() {
+            sql.push_str(" AND detail LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.detail.trim())));
+        }
+
+        sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
+        params_vec.push(Box::new(limit));
+        params_vec.push(Box::new(offset));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
         let map_row = |r: &rusqlite::Row<'_>| {
             Ok(SecurityHttpRow {
                 id: r.get(0)?,
@@ -848,25 +1116,81 @@ impl WebDb {
                 detail: r.get(9)?,
             })
         };
-        if let Some(dir) = direction {
-            let mut stmt = conn.prepare(
-                "SELECT id, ts, direction, method, target, status, duration_ms, ip, actor, detail
-                 FROM security_http_logs WHERE direction = ?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
-            )?;
-            let rows = stmt
-                .query_map(params![dir, limit, offset], map_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT id, ts, direction, method, target, status, duration_ms, ip, actor, detail
-                 FROM security_http_logs ORDER BY id DESC LIMIT ?1 OFFSET ?2",
-            )?;
-            let rows = stmt
-                .query_map(params![limit, offset], map_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+        let rows = stmt
+            .query_map(&params_refs[..], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn count_security_http_logs_filtered(
+        &self,
+        direction: Option<&str>,
+        filter: &SecurityHttpFilter,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = "SELECT COUNT(*) FROM security_http_logs WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        let eff_dir = direction.or_else(|| {
+            if !filter.direction.trim().is_empty() {
+                Some(filter.direction.trim())
+            } else {
+                None
+            }
+        });
+
+        if let Some(dir) = eff_dir {
+            sql.push_str(" AND direction = ?");
+            params_vec.push(Box::new(dir.to_string()));
         }
+
+        if !filter.ts.trim().is_empty() {
+            sql.push_str(" AND ts LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.ts.trim())));
+        }
+        if !filter.method.trim().is_empty() {
+            sql.push_str(" AND method LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.method.trim())));
+        }
+        if !filter.target.trim().is_empty() {
+            sql.push_str(" AND target LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.target.trim())));
+        }
+        if !filter.status.trim().is_empty() {
+            let st = filter.status.trim();
+            if st.ends_with("xx") && st.len() == 3 {
+                if let Ok(prefix) = st[0..1].parse::<i64>() {
+                    sql.push_str(" AND status >= ? AND status < ?");
+                    params_vec.push(Box::new(prefix * 100));
+                    params_vec.push(Box::new((prefix + 1) * 100));
+                }
+            } else if let Ok(code) = st.parse::<i64>() {
+                sql.push_str(" AND status = ?");
+                params_vec.push(Box::new(code));
+            } else {
+                sql.push_str(" AND status LIKE ?");
+                params_vec.push(Box::new(format!("%{}%", st)));
+            }
+        }
+        if !filter.actor.trim().is_empty() {
+            sql.push_str(" AND (actor LIKE ? OR ip LIKE ?)");
+            params_vec.push(Box::new(format!("%{}%", filter.actor.trim())));
+            params_vec.push(Box::new(format!("%{}%", filter.actor.trim())));
+        }
+        if !filter.ip.trim().is_empty() {
+            sql.push_str(" AND ip LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.ip.trim())));
+        }
+        if !filter.detail.trim().is_empty() {
+            sql.push_str(" AND detail LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", filter.detail.trim())));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let n: i64 = stmt.query_row(&params_refs[..], |r| r.get(0))?;
+        Ok(n)
     }
 
     /// Deletes security HTTP log rows older than `days` days; returns the number removed.
@@ -878,21 +1202,6 @@ impl WebDb {
             params![cutoff],
         )?;
         Ok(n)
-    }
-
-    pub fn count_security_http_logs(&self, direction: Option<&str>) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        if let Some(dir) = direction {
-            let n: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM security_http_logs WHERE direction = ?1",
-                params![dir],
-                |r| r.get(0),
-            )?;
-            Ok(n)
-        } else {
-            let n: i64 = conn.query_row("SELECT COUNT(*) FROM security_http_logs", [], |r| r.get(0))?;
-            Ok(n)
-        }
     }
 }
 
@@ -928,7 +1237,9 @@ fn map_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
         created_at: r.get(5)?,
         last_login: r.get(6)?,
         totp_enabled: r.get::<_, i64>(7)? == 1,
-        two_fa_policy: r.get::<_, String>(8).unwrap_or_else(|_| "default".to_string()),
+        two_fa_policy: r
+            .get::<_, String>(8)
+            .unwrap_or_else(|_| "default".to_string()),
         passkey_count: r.get::<_, i64>(9).unwrap_or(0),
     })
 }

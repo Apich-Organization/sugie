@@ -81,20 +81,16 @@ impl PasskeyManager {
                     .unwrap_or_else(|| "localhost".to_string())
             });
 
-        let rp_name = read_env_first(&[
-            "SUGIE_WEBAUTHN_RP_NAME",
-            "WEBAUTHN_RP_NAME",
-            "RP_NAME",
-        ])
-        .unwrap_or_else(|| "Sugie Admin".to_string());
+        let rp_name = read_env_first(&["SUGIE_WEBAUTHN_RP_NAME", "WEBAUTHN_RP_NAME", "RP_NAME"])
+            .unwrap_or_else(|| "Sugie Admin".to_string());
 
         Self::new(&rp_id, &rp_origin, &rp_name, default_port)
     }
 
     pub fn new(rp_id: &str, rp_origin: &str, rp_name: &str, fallback_port: u16) -> Self {
         let build_try = |id: &str, origin_str: &str, name: &str| -> Result<Webauthn, String> {
-            let parsed_origin =
-                Url::parse(origin_str).map_err(|e| format!("Invalid rp_origin {origin_str:?}: {e}"))?;
+            let parsed_origin = Url::parse(origin_str)
+                .map_err(|e| format!("Invalid rp_origin {origin_str:?}: {e}"))?;
             let builder = WebauthnBuilder::new(id, &parsed_origin)
                 .map_err(|e| format!("Invalid WebAuthn RP ({id:?}, {origin_str:?}): {e}"))?
                 .rp_name(name);
@@ -217,7 +213,9 @@ impl PasskeyManager {
                     .map(|(k, _)| k.clone())?;
                 lock.remove(&key)
             })
-            .ok_or_else(|| "No registration ceremony in progress or challenge expired".to_string())?;
+            .ok_or_else(|| {
+                "No registration ceremony in progress or challenge expired".to_string()
+            })?;
 
         if entry.user_id != user_id {
             return Err("User mismatch during passkey registration".to_string());
@@ -289,7 +287,9 @@ impl PasskeyManager {
                 let key = lock.keys().next().cloned()?;
                 lock.remove(&key)
             })
-            .ok_or_else(|| "No authentication ceremony in progress or challenge expired".to_string())?;
+            .ok_or_else(|| {
+                "No authentication ceremony in progress or challenge expired".to_string()
+            })?;
 
         self.webauthn
             .finish_discoverable_authentication(cred, entry.state, discoverable_keys)

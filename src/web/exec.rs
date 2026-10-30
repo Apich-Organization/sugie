@@ -49,7 +49,10 @@ pub struct JobRegistry {
 
 impl JobRegistry {
     pub fn create(&self, username: &str, repo: &str, command: &str) -> String {
-        let id = crate::web::auth::random_token().chars().take(12).collect::<String>();
+        let id = crate::web::auth::random_token()
+            .chars()
+            .take(12)
+            .collect::<String>();
         let job = Job {
             id: id.clone(),
             username: username.to_string(),
@@ -92,7 +95,11 @@ impl JobRegistry {
     pub fn finish(&self, id: &str, ok: bool) {
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(job) = guard.0.get_mut(id) {
-                job.status = if ok { JobStatus::Done } else { JobStatus::Failed };
+                job.status = if ok {
+                    JobStatus::Done
+                } else {
+                    JobStatus::Failed
+                };
                 job.finished_at = Some(clock());
             }
         }
@@ -243,7 +250,10 @@ impl<'a> Ctx<'a> {
     }
 
     fn need_number(&self, args: &[String]) -> Option<u64> {
-        match args.first().and_then(|a| a.trim_start_matches('#').parse::<u64>().ok()) {
+        match args
+            .first()
+            .and_then(|a| a.trim_start_matches('#').parse::<u64>().ok())
+        {
             Some(n) => Some(n),
             None => {
                 self.err("Requires an issue/PR number, e.g. `/label 42 bug`");
@@ -294,7 +304,10 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 repos.len(),
                 human_duration(uptime)
             ));
-            ctx.out(format!("Configuration: {}", ctx.state.files.toml_path.display()));
+            ctx.out(format!(
+                "Configuration: {}",
+                ctx.state.files.toml_path.display()
+            ));
             ctx.out(format!("Database:      {}", ctx.state.config.db_path));
             for (_, name, inst) in repos.iter().take(20) {
                 ctx.out(format!("  · {name}  (installation {inst})"));
@@ -309,8 +322,14 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 ctx.err(e.clone());
             }
             ctx.out(format!("Repository    {}", s.full_name));
-            ctx.out(format!("open issues {} · open PRs {} · 30d commits {} · 30d merged {}", s.open_issues, s.open_prs, s.commits_30d, s.merged_30d));
-            ctx.out(format!("stars {} · forks {} · default branch {}", s.stars, s.forks, s.default_branch));
+            ctx.out(format!(
+                "open issues {} · open PRs {} · 30d commits {} · 30d merged {}",
+                s.open_issues, s.open_prs, s.commits_30d, s.merged_30d
+            ));
+            ctx.out(format!(
+                "stars {} · forks {} · default branch {}",
+                s.stars, s.forks, s.default_branch
+            ));
             s.is_ok()
         }
 
@@ -331,14 +350,22 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 match client.list_repo_issues(owner, repo, "open", 100).await {
                     Ok(list) => {
                         let issues: Vec<_> = list.into_iter().filter(|i| !i.is_pr()).collect();
-                        ctx.ok(format!("{} open issues, showing first {}", issues.len(), limit));
+                        ctx.ok(format!(
+                            "{} open issues, showing first {}",
+                            issues.len(),
+                            limit
+                        ));
                         for i in issues.iter().take(limit) {
                             ctx.out(format!(
                                 "#{:<5} {:<60} @{}  [{}]",
                                 i.number,
                                 truncate(&i.title, 58),
                                 i.user.login,
-                                i.labels.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ")
+                                i.labels
+                                    .iter()
+                                    .map(|l| l.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             ));
                         }
                     }
@@ -371,7 +398,9 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
         }
 
         "label" | "unlabel" => {
-            let Some(num) = ctx.need_number(args) else { return false };
+            let Some(num) = ctx.need_number(args) else {
+                return false;
+            };
             let labels: Vec<String> = args[1..].iter().cloned().collect();
             if labels.is_empty() {
                 ctx.err("Please specify label name(s), e.g. `/label 42 bug`");
@@ -415,8 +444,13 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
         }
 
         "assign" | "unassign" => {
-            let Some(num) = args.first().and_then(|a| a.trim_start_matches('#').parse::<u64>().ok()) else {
-                ctx.err(format!("Usage: /{cmd} <issue/PR-num> <@username...>  (e.g. `/{cmd} 42 @octocat`)"));
+            let Some(num) = args
+                .first()
+                .and_then(|a| a.trim_start_matches('#').parse::<u64>().ok())
+            else {
+                ctx.err(format!(
+                    "Usage: /{cmd} <issue/PR-num> <@username...>  (e.g. `/{cmd} 42 @octocat`)"
+                ));
                 print_user_hints(ctx, owner, repo).await;
                 return false;
             };
@@ -426,7 +460,9 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 .filter(|u| !u.is_empty())
                 .collect();
             if users.is_empty() {
-                ctx.err(format!("Please specify username(s), e.g. `/{cmd} {num} @octocat`"));
+                ctx.err(format!(
+                    "Please specify username(s), e.g. `/{cmd} {num} @octocat`"
+                ));
                 print_user_hints(ctx, owner, repo).await;
                 return false;
             }
@@ -446,7 +482,11 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 Ok(_) => {
                     ctx.ok(format!(
                         "{} {}{} → {}",
-                        if cmd == "assign" { "Assigned" } else { "Unassigned" },
+                        if cmd == "assign" {
+                            "Assigned"
+                        } else {
+                            "Unassigned"
+                        },
                         ctx.repo,
                         format!("#{num}"),
                         users.join(", ")
@@ -460,12 +500,15 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             }
         }
 
-        "users" | "assignees" | "collaborators" | "team" => {
-            run_users(ctx, owner, repo).await
-        }
+        "users" | "assignees" | "collaborators" | "team" => run_users(ctx, owner, repo).await,
 
         "workload" => {
-            match ctx.state.triage.storage().list_all_reviewer_workloads(Some(ctx.repo)) {
+            match ctx
+                .state
+                .triage
+                .storage()
+                .list_all_reviewer_workloads(Some(ctx.repo))
+            {
                 Ok(rows) if rows.is_empty() => {
                     ctx.info(format!("No reviewer workloads tracked for {}", ctx.repo));
                     true
@@ -484,14 +527,15 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             }
         }
 
-        "reviewer" | "reviewers" | "review" | "reassign" | "rereview" | "unreviewer" | "unreviewers" => {
-            run_reviewer(ctx, cmd, args, owner, repo).await
-        }
+        "reviewer" | "reviewers" | "review" | "reassign" | "rereview" | "unreviewer"
+        | "unreviewers" => run_reviewer(ctx, cmd, args, owner, repo).await,
 
         "project" | "move" | "duplicate" => run_issue_command(ctx, cmd, args, owner, repo).await,
 
         "close" | "reopen" => {
-            let Some(num) = ctx.need_number(args) else { return false };
+            let Some(num) = ctx.need_number(args) else {
+                return false;
+            };
             let client = match ctx.state.triage.get_client_for_repo(ctx.repo).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -505,9 +549,13 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                     Some("completed") => Some("completed"),
                     _ => Some("completed"),
                 };
-                client.update_issue_state(owner, repo, num, "closed", reason).await
+                client
+                    .update_issue_state(owner, repo, num, "closed", reason)
+                    .await
             } else {
-                client.update_issue_state(owner, repo, num, "open", Some("reopened")).await
+                client
+                    .update_issue_state(owner, repo, num, "open", Some("reopened"))
+                    .await
             };
             match res {
                 Ok(_) => {
@@ -527,7 +575,9 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
         }
 
         "comment" => {
-            let Some(num) = ctx.need_number(args) else { return false };
+            let Some(num) = ctx.need_number(args) else {
+                return false;
+            };
             let body = args[1..].join(" ");
             if body.trim().is_empty() {
                 ctx.err("Comment body cannot be empty, e.g. `/comment 42 Fixed in v0.2.1`");
@@ -556,7 +606,9 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
         }
 
         "retest" => {
-            let Some(num) = ctx.need_number(args) else { return false };
+            let Some(num) = ctx.need_number(args) else {
+                return false;
+            };
             let client = match ctx.state.triage.get_client_for_repo(ctx.repo).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -582,7 +634,11 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 }
             };
             if suites.is_empty() {
-                ctx.err(format!("No check suites available to re-run on {}{}", ctx.repo, format!("#{num}")));
+                ctx.err(format!(
+                    "No check suites available to re-run on {}{}",
+                    ctx.repo,
+                    format!("#{num}")
+                ));
                 return false;
             }
             let mut rerun = 0;
@@ -594,7 +650,11 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                     rerun += 1;
                 }
             }
-            ctx.ok(format!("Re-triggered {rerun} check suites ({} head {})", ctx.repo, &pr.head.sha[..7.min(pr.head.sha.len())]));
+            ctx.ok(format!(
+                "Re-triggered {rerun} check suites ({} head {})",
+                ctx.repo,
+                &pr.head.sha[..7.min(pr.head.sha.len())]
+            ));
             true
         }
 
@@ -652,7 +712,10 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             let days = if monthly { 30 } else { 7 };
             let label = if monthly { "Monthly" } else { "Weekly" };
             ctx.info(format!("Generating {label} report (past {days} days)…"));
-            match reporter.generate_report(&client, owner, repo, days, label).await {
+            match reporter
+                .generate_report(&client, owner, repo, days, label)
+                .await
+            {
                 Ok(data) => {
                     for line in reporter.format_markdown_report(&data).lines() {
                         ctx.out(line.to_string());
@@ -703,7 +766,12 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match ctx.state.files.validate_toml(&content) {
                     Ok(cfg) => {
-                        ctx.ok(format!("{} validation passed (listen {}:{})", path.display(), cfg.host, cfg.port));
+                        ctx.ok(format!(
+                            "{} validation passed (listen {}:{})",
+                            path.display(),
+                            cfg.host,
+                            cfg.port
+                        ));
                         ctx.info("Note: Running process uses startup configuration. Restart required to apply changes.");
                         true
                     }
@@ -750,12 +818,18 @@ async fn run_issue_command(
     use crate::triage::projects::ProjectsService;
     use crate::triage::reviewers::ReviewerLoadBalancer;
 
-    let Some(num) = ctx.need_number(args) else { return false };
+    let Some(num) = ctx.need_number(args) else {
+        return false;
+    };
     let command = match cmd {
         "project" => match args.get(1) {
             Some(target) => SlashCommand::Project {
                 target: target.clone(),
-                status: if args.len() > 2 { Some(args[2..].join(" ")) } else { None },
+                status: if args.len() > 2 {
+                    Some(args[2..].join(" "))
+                } else {
+                    None
+                },
             },
             None => {
                 ctx.err("Usage: /project <num> <project-number> [status]");
@@ -763,13 +837,18 @@ async fn run_issue_command(
             }
         },
         "move" => match args.get(1) {
-            Some(target) if target.contains('/') => SlashCommand::Move { target_repo: target.clone() },
+            Some(target) if target.contains('/') => SlashCommand::Move {
+                target_repo: target.clone(),
+            },
             _ => {
                 ctx.err("Usage: /move <num> <owner/target-repo>");
                 return false;
             }
         },
-        _ => match args.get(1).and_then(|a| a.trim_start_matches('#').parse::<u64>().ok()) {
+        _ => match args
+            .get(1)
+            .and_then(|a| a.trim_start_matches('#').parse::<u64>().ok())
+        {
             Some(orig) => SlashCommand::Duplicate(orig),
             None => {
                 ctx.err("Usage: /duplicate <num> <#original-number>");
@@ -792,7 +871,11 @@ async fn run_issue_command(
             return false;
         }
     };
-    let repo_config = ctx.state.triage.load_repo_config(&client, owner, repo).await;
+    let repo_config = ctx
+        .state
+        .triage
+        .load_repo_config(&client, owner, repo)
+        .await;
     let projects = ProjectsService::new(repo_config.projects.clone());
     let balancer = ReviewerLoadBalancer::new(
         repo_config.reviewers.clone(),
@@ -814,7 +897,10 @@ async fn run_issue_command(
         id: 0,
         r#type: None,
     };
-    match executor.execute(&command, owner, repo, &issue, &sender).await {
+    match executor
+        .execute(&command, owner, repo, &issue, &sender)
+        .await
+    {
         Ok(()) => {
             ctx.ok(format!("Executed /{cmd} on {}#{num}", ctx.repo));
             true
@@ -840,7 +926,11 @@ async fn collect_repo_users(
         .await
         .map_err(|e| format!("Failed to get installation token: {e}"))?;
 
-    let repo_config = ctx.state.triage.load_repo_config(&client, owner, repo).await;
+    let repo_config = ctx
+        .state
+        .triage
+        .load_repo_config(&client, owner, repo)
+        .await;
     let gh_assignees: Vec<String> = client
         .list_assignees(owner, repo)
         .await
@@ -919,7 +1009,10 @@ async fn run_users(ctx: &Ctx<'_>, owner: &str, repo: &str) -> bool {
     ));
     match collect_repo_users(ctx, owner, repo).await {
         Ok(users) if users.is_empty() => {
-            ctx.info(format!("No assignees or reviewer pool members found for {}", ctx.repo));
+            ctx.info(format!(
+                "No assignees or reviewer pool members found for {}",
+                ctx.repo
+            ));
             true
         }
         Ok(users) => {
@@ -973,8 +1066,13 @@ async fn print_user_hints(ctx: &Ctx<'_>, owner: &str, repo: &str) {
 async fn run_reviewer(ctx: &Ctx<'_>, cmd: &str, args: &[String], owner: &str, repo: &str) -> bool {
     use crate::triage::reviewers::ReviewerLoadBalancer;
 
-    let Some(num) = args.first().and_then(|a| a.trim_start_matches('#').parse::<u64>().ok()) else {
-        ctx.err("Usage: /reviewer <pr-num> [set|+|-] <@username...>  (e.g. `/reviewer 12 set @alice`)");
+    let Some(num) = args
+        .first()
+        .and_then(|a| a.trim_start_matches('#').parse::<u64>().ok())
+    else {
+        ctx.err(
+            "Usage: /reviewer <pr-num> [set|+|-] <@username...>  (e.g. `/reviewer 12 set @alice`)",
+        );
         print_user_hints(ctx, owner, repo).await;
         return false;
     };
@@ -1007,7 +1105,11 @@ async fn run_reviewer(ctx: &Ctx<'_>, cmd: &str, args: &[String], owner: &str, re
         }
     }
 
-    let clean = |s: &str| s.trim_start_matches(|c| c == '+' || c == '-').trim_start_matches('@').to_string();
+    let clean = |s: &str| {
+        s.trim_start_matches(|c| c == '+' || c == '-')
+            .trim_start_matches('@')
+            .to_string()
+    };
     let mut add: Vec<String> = Vec::new();
     let mut remove: Vec<String> = Vec::new();
     for tok in &rest {
@@ -1038,16 +1140,24 @@ async fn run_reviewer(ctx: &Ctx<'_>, cmd: &str, args: &[String], owner: &str, re
     let pr = match client.get_pull_request(owner, repo, num).await {
         Ok(p) => p,
         Err(e) => {
-            ctx.err(format!("#{num} is not a pull request or could not be fetched: {e}"));
+            ctx.err(format!(
+                "#{num} is not a pull request or could not be fetched: {e}"
+            ));
             return false;
         }
     };
-    let current: Vec<String> = pr.requested_reviewers.iter().map(|u| u.login.clone()).collect();
+    let current: Vec<String> = pr
+        .requested_reviewers
+        .iter()
+        .map(|u| u.login.clone())
+        .collect();
 
     // No users given: show the current reviewers and available user hints.
     if add.is_empty() && remove.is_empty() {
         if mode == "set" {
-            ctx.err(format!("Specify the new reviewer(s), e.g. `/reviewer {num} set @alice @bob`"));
+            ctx.err(format!(
+                "Specify the new reviewer(s), e.g. `/reviewer {num} set @alice @bob`"
+            ));
             print_user_hints(ctx, owner, repo).await;
             return false;
         }
@@ -1057,7 +1167,11 @@ async fn run_reviewer(ctx: &Ctx<'_>, cmd: &str, args: &[String], owner: &str, re
             ctx.ok(format!(
                 "{}#{num} requested reviewers: {}",
                 ctx.repo,
-                current.iter().map(|u| format!("@{u}")).collect::<Vec<_>>().join(", ")
+                current
+                    .iter()
+                    .map(|u| format!("@{u}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         print_user_hints(ctx, owner, repo).await;
@@ -1077,7 +1191,11 @@ async fn run_reviewer(ctx: &Ctx<'_>, cmd: &str, args: &[String], owner: &str, re
         return true;
     }
 
-    let repo_config = ctx.state.triage.load_repo_config(&client, owner, repo).await;
+    let repo_config = ctx
+        .state
+        .triage
+        .load_repo_config(&client, owner, repo)
+        .await;
     let balancer = ReviewerLoadBalancer::new(
         repo_config.reviewers.clone(),
         ctx.state.triage.storage().clone(),
@@ -1106,8 +1224,29 @@ async fn run_reviewer(ctx: &Ctx<'_>, cmd: &str, args: &[String], owner: &str, re
     let body = format!(
         "🔄 **Reviewers changed by @{}** (via admin console){}{}",
         ctx.user.username,
-        if remove.is_empty() { String::new() } else { format!("\n- Removed: {}", remove.iter().map(|u| format!("@{u}")).collect::<Vec<_>>().join(", ")) },
-        if add.is_empty() { String::new() } else { format!("\n- Requested: {}", add.iter().map(|u| format!("@{u}")).collect::<Vec<_>>().join(", ")) },
+        if remove.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n- Removed: {}",
+                remove
+                    .iter()
+                    .map(|u| format!("@{u}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+        if add.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n- Requested: {}",
+                add.iter()
+                    .map(|u| format!("@{u}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
     );
     let _ = client.create_comment(owner, repo, num, &body).await;
     true
