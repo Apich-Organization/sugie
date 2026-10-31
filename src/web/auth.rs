@@ -10,7 +10,17 @@ use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
 
 pub const COOKIE_NAME: &str = "sugie_admin";
+/// Preferred name when the request arrives over TLS: the `__Host-` prefix makes
+/// the browser refuse any cookie that was set with a `Domain` attribute, which
+/// blocks session fixation from a compromised sibling subdomain.
+pub const SECURE_COOKIE_NAME: &str = "__Host-sugie_admin";
 const SESSION_TTL_HOURS: i64 = 12;
+
+/// Consecutive failures before an account is temporarily locked.
+const MAX_LOGIN_ATTEMPTS: i64 = 5;
+const LOCKOUT_SECS: i64 = 15 * 60;
+/// Wrong OTP codes tolerated for a single pending 2FA challenge.
+pub const MAX_OTP_ATTEMPTS: i64 = 5;
 
 pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
@@ -48,19 +58,52 @@ pub fn cookie_value(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
     raw.split(';')
         .filter_map(|part| part.trim().split_once('='))
-        .find(|(k, _)| k.trim() == COOKIE_NAME)
+        .find(|(k, _)| {
+            let k = k.trim();
+            k == COOKIE_NAME || k == SECURE_COOKIE_NAME
+        })
         .map(|(_, v)| v.trim().to_string())
 }
 
-pub fn session_cookie(token: &str) -> String {
-    format!(
-        "{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
-        SESSION_TTL_HOURS * 3600
-    )
+/// Whether the console is being served over TLS. Honours an explicit override
+/// (`SUGIE_ADMIN_SECURE_COOKIE=1|0`) so deployments behind a proxy that does not
+/// forward `X-Forwarded-Proto` can still opt in.
+pub fn is_secure_request(headers: &HeaderMap) -> bool {
+    if let Ok(raw) = std::env::var("SUGIE_ADMIN_SECURE_COOKIE") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
 }
 
-pub fn clear_cookie() -> String {
-    format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+pub fn session_cookie(token: &str, secure: bool) -> String {
+    let max_age = SESSION_TTL_HOURS * 3600;
+    if secure {
+        format!(
+            "{SECURE_COOKIE_NAME}={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}"
+        )
+    } else {
+        format!("{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}")
+    }
+}
+
+/// Clear both the secure and the plain cookie so a scheme change cannot leave a
+/// stale session behind.
+pub fn clear_cookie(secure: bool) -> String {
+    let first = if secure {
+        format!("{SECURE_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0")
+    } else {
+        format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+    };
+    format!("{first}, {COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
 }
 
 pub fn client_ip(headers: &HeaderMap) -> String {
@@ -80,11 +123,12 @@ pub fn client_ip(headers: &HeaderMap) -> String {
 
 /// Resolve the caller from the session cookie. Returns `None` when the caller is
 /// anonymous, expired, or disabled.
+///
+/// This runs on every admin request, so session + user + grants are fetched in a
+/// single statement (`WebDb::session_principal`).
 pub fn current_user(db: &WebDb, headers: &HeaderMap) -> Option<CurrentUser> {
     let token = cookie_value(headers)?;
-    let row = db.session_user(&token_hash(&token)).ok().flatten()?;
-    let repos = db.repo_perms(row.id).unwrap_or_default();
-    let commands = db.command_perms(row.id).unwrap_or_default();
+    let (row, repos, commands) = db.session_principal(&token_hash(&token)).ok().flatten()?;
     let global_2fa = db.is_global_2fa_enabled();
     Some(CurrentUser::from_row(row, repos, commands, global_2fa))
 }
@@ -96,6 +140,24 @@ pub enum LoginOutcome {
         user: UserRow,
     },
     Invalid,
+    /// Too many consecutive failures — caller should surface the remaining time.
+    Locked(i64),
+}
+
+/// A throwaway Argon2 hash used to equalise the cost of "user does not exist"
+/// and "wrong password" responses. Computing it once keeps the timing signal flat
+/// without paying the hashing cost on every request.
+fn dummy_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY
+        .get_or_init(|| {
+            hash_password("sugie-timing-equaliser-not-a-real-password").unwrap_or_else(|_| {
+                String::from(
+                    "$argon2id$v=19$m=19456,t=2,p=1$c3VnaWU$00000000000000000000000000000000",
+                )
+            })
+        })
+        .as_str()
 }
 
 /// Mint a full session for a user after authentication (password, passkey, or 2FA).
@@ -115,7 +177,21 @@ pub fn mint_session_for_user(
     )?;
     db.touch_login(user_id)?;
     let _ = db.purge_sessions();
+    // The bootstrap password has served its purpose once the first real session
+    // exists — remove it so it cannot be read off disk later.
+    remove_bootstrap_password_file();
     Ok(token)
+}
+
+fn bootstrap_password_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("data/admin-initial-password.txt")
+}
+
+pub fn remove_bootstrap_password_file() {
+    let path = bootstrap_password_path();
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Verify credentials and either mint a session or return a pending 2FA challenge.
@@ -132,18 +208,33 @@ pub fn login(
     ip: &str,
     user_agent: &str,
 ) -> Result<LoginOutcome> {
+    if let Some(remaining) = db.login_lockout_remaining(username)? {
+        return Ok(LoginOutcome::Locked(remaining));
+    }
+
     let Some(row) = db.find_user(username)? else {
+        // Burn the same amount of CPU as a real verification so response time
+        // does not reveal whether the account exists.
+        let _ = verify_password(password, dummy_hash());
         return Ok(LoginOutcome::Invalid);
     };
     if !row.active {
+        let _ = verify_password(password, dummy_hash());
         return Ok(LoginOutcome::Invalid);
     }
     let Some(hash) = db.password_hash(row.id)? else {
+        let _ = verify_password(password, dummy_hash());
         return Ok(LoginOutcome::Invalid);
     };
     if !verify_password(password, &hash) {
+        let locked_for = db.record_login_failure(username, MAX_LOGIN_ATTEMPTS, LOCKOUT_SECS)?;
+        if let Some(secs) = locked_for {
+            return Ok(LoginOutcome::Locked(secs));
+        }
         return Ok(LoginOutcome::Invalid);
     }
+
+    db.clear_login_failures(row.id)?;
 
     if !row.is_2fa_disabled() && row.has_2fa_enrolled() {
         let pending_token = random_token();
@@ -179,16 +270,30 @@ pub fn bootstrap_admin(db: &WebDb) -> Result<Option<String>> {
     )?;
 
     if generated {
-        // Keep the secret out of shell history / process listings.
-        let path = std::path::Path::new("data/admin-initial-password.txt");
+        // Keep the secret out of shell history / process listings. Create the
+        // file with 0600 from the very first byte so there is no window where it
+        // is world-readable.
+        let path = bootstrap_password_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(path, format!("admin / {password}\n"));
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                let _ = writeln!(f, "admin / {password}");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::write(&path, format!("admin / {password}\n"));
         }
     }
 

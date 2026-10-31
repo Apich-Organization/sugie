@@ -21,7 +21,9 @@ pub const CSS: &str = r#"
   --border:rgba(110,80,200,.18); --border-mid:rgba(120,90,215,.32); --border-hi:rgba(130,100,225,.55);
   --text-1:#ece5ff; --text-2:#b2a4d8; --text-3:#9d91b8;
   --primary:#a87ef2; --primary-dk:#8b68e4; --accent:#b5a3d8; --accent-soft:rgba(110,80,200,.18);
-  --success:#5a9e7e; --warn:#a07040; --danger:#b05068;
+  /* Lightened for >=4.5:1 contrast on --bg-deep; the previous values were
+     ~2.7:1 and made every error message hard to read. */
+  --success:#6fc39a; --warn:#e0a860; --danger:#f08aa4;
   --glow:rgba(110,80,200,.28);
 }
 *{box-sizing:border-box}
@@ -40,6 +42,9 @@ body::before{
     var(--bg);
 }
 a{color:var(--primary-dk); text-decoration:none}
+:where(a,button,[role="button"],summary,input,select,textarea):focus-visible{
+  outline:2px solid var(--primary); outline-offset:2px; border-radius:6px;
+}
 a:hover{color:var(--primary)}
 code,kbd,pre,.mono{font-family:var(--mono)}
 
@@ -64,8 +69,14 @@ code,kbd,pre,.mono{font-family:var(--mono)}
   white-space:nowrap; transition:background .18s var(--ease), color .18s var(--ease);
 }
 .nav a:hover{background:var(--accent-soft); color:var(--text-1)}
-.nav a.active{background:linear-gradient(140deg,var(--primary),var(--accent)); color:#fff; box-shadow:0 8px 20px -10px rgba(110,80,200,.8)}
-.topbar-right{display:flex; align-items:center; gap:10px}
+.nav a.active{background:linear-gradient(140deg,var(--primary-dk),var(--primary)); color:#fff; box-shadow:0 8px 20px -10px rgba(110,80,200,.8)}
+[data-theme="dark"] .nav a.active{background:linear-gradient(140deg,#7a55d8,#9b6ef0)}
+.topbar-right{display:flex; align-items:center; gap:10px; flex-shrink:0}
+@media (max-width:640px){
+  .topbar{height:auto; min-height:var(--nav-h); flex-wrap:wrap; gap:8px; padding:10px 16px}
+  .nav{flex:1 1 100%; order:3; margin:0; padding-bottom:4px}
+  .topbar-right{margin-left:auto}
+}
 .user-chip{
   display:flex; align-items:center; gap:8px; padding:5px 12px 5px 6px; border-radius:999px;
   border:1px solid var(--border); background:var(--surface); font-size:12.5px; color:var(--text-2);
@@ -212,7 +223,7 @@ dialog.modal-dialog::backdrop{
 
 /* ---------------- chat console ---------------- */
 .console{display:grid; grid-template-columns:250px minmax(0,1fr); gap:16px; align-items:start}
-.repo-picker{max-height:calc(100vh - 220px); overflow:auto; padding:8px}
+.repo-picker{max-height:calc(100dvh - 220px); overflow:auto; padding:8px}
 .repo-picker a{
   display:flex; align-items:center; justify-content:space-between; gap:8px; padding:9px 12px;
   border-radius:10px; color:var(--text-2); font-size:12.5px;
@@ -220,7 +231,7 @@ dialog.modal-dialog::backdrop{
 .repo-picker a:hover{background:var(--accent-soft); color:var(--text-1)}
 .repo-picker a.active{background:linear-gradient(140deg,var(--primary),var(--accent)); color:#fff}
 .repo-picker a.active .badge{background:rgba(255,255,255,.22); color:#fff; border-color:transparent}
-.chat{display:flex; flex-direction:column; height:calc(100vh - 220px); min-height:440px; padding:0}
+.chat{display:flex; flex-direction:column; height:calc(100dvh - 220px); min-height:440px; padding:0}
 .chat-head{padding:14px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px}
 .chat-log{flex:1; overflow:auto; padding:18px 20px; display:flex; flex-direction:column; gap:14px}
 .msg{max-width:min(720px,92%); border-radius:16px; padding:12px 14px; font-size:13px}
@@ -538,12 +549,21 @@ pub const JS: &str = r#"
 
       var source = new EventSource('/admin/api/jobs/' + jobId + '/stream');
       var count = 0;
+      function settle(text) {
+        meta.textContent = 'sugie · ' + text;
+        if (count === 0) {
+          body.innerHTML = '';
+          body.appendChild(line('info', '(no output)'));
+        }
+        source.close();
+      }
       source.onmessage = function (ev) {
         try {
           var data = JSON.parse(ev.data);
           if (data.done) {
-            meta.textContent = 'sugie · ' + (data.ok ? 'completed' : 'failed');
-            source.close();
+            // Always replace the placeholder, even for a job that produced no
+            // output — otherwise "Connecting…" stays on screen forever.
+            settle(data.ok ? 'completed' : 'failed');
             return;
           }
           if (count === 0) body.innerHTML = '';
@@ -553,15 +573,34 @@ pub const JS: &str = r#"
           log.scrollTop = log.scrollHeight;
         } catch (e) {}
       };
-      source.onerror = function () { source.close(); };
+      source.onerror = function () { settle('disconnected'); };
+    }
+
+    var sending = false;
+    function showError(msg) {
+      var div = document.createElement('div');
+      div.className = 'msg bot';
+      var meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = 'sugie · error';
+      var body = document.createElement('pre');
+      body.appendChild(line('err', msg));
+      div.appendChild(meta);
+      div.appendChild(body);
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
     }
 
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
+      if (sending) return;
       var command = (input.value || '').trim();
       if (!command) return;
       var repo = repoInput.value;
-      input.value = '';
+      sending = true;
+      var sendBtn = form.querySelector('button[type="submit"]');
+      if (sendBtn) sendBtn.disabled = true;
+      // Keep the text so a failed request does not lose what the user typed.
       fetch('/admin/api/exec', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -569,10 +608,16 @@ pub const JS: &str = r#"
       })
         .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
         .then(function (res) {
-          if (!res.ok) { alert(res.body.error || 'Execution failed'); return; }
+          if (!res.ok) { showError(res.body.error || 'Execution failed'); return; }
+          input.value = '';
           appendJob(command, res.body.job_id);
         })
-        .catch(function () { alert('Network error, please try again'); });
+        .catch(function () { showError('Network error, please try again'); })
+        .finally(function () {
+          sending = false;
+          if (sendBtn) sendBtn.disabled = false;
+          input.focus();
+        });
     });
 
     input.addEventListener('keydown', function (ev) {

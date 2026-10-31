@@ -33,26 +33,32 @@ pub fn is_secret_key(key: &str) -> bool {
         "SECRET",
         "TOKEN",
         "PASSWORD",
+        "PASSWD",
         "API_KEY",
         "PRIVATE_KEY",
         "PEM",
         "SIGNATURE",
+        // A webhook URL embeds its own bearer credential; DATABASE_URL often
+        // carries `user:password@`. Neither matched the original list, so both
+        // were rendered in clear text.
+        "WEBHOOK",
+        "DATABASE_URL",
+        "CONNECTION_STRING",
+        "DSN",
+        "CREDENTIAL",
+        "AUTHORIZATION",
     ]
     .iter()
     .any(|needle| k.contains(needle))
 }
 
 pub fn mask(value: &str) -> String {
-    let chars: Vec<char> = value.chars().collect();
     if value.is_empty() {
         return String::new();
     }
-    if chars.len() <= 8 {
-        return "•".repeat(chars.len().max(4));
-    }
-    let head: String = chars.iter().take(4).collect();
-    let tail: String = chars.iter().skip(chars.len() - 4).collect();
-    format!("{head}••••{tail}")
+    // Never reveal any real character: a 4-character prefix is enough to
+    // confirm a guessed secret. The value length is not leaked either.
+    "•".repeat(10)
 }
 
 impl ConfigFiles {
@@ -210,13 +216,28 @@ impl ConfigFiles {
             return Ok(PathBuf::new());
         }
         std::fs::create_dir_all(&self.backup_dir)?;
-        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        restrict_dir(&self.backup_dir);
+        // Millisecond precision plus a de-duplication suffix: two saves inside
+        // the same second must not silently overwrite each other's backup.
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f");
         let name = file
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "config".to_string());
-        let dest = self.backup_dir.join(format!("{name}.{stamp}.bak"));
+        let mut dest = self.backup_dir.join(format!("{name}.{stamp}.bak"));
+        let mut seq = 1;
+        while dest.exists() {
+            dest = self
+                .backup_dir
+                .join(format!("{name}.{stamp}-{seq}.bak"));
+            seq += 1;
+            if seq > 99 {
+                break;
+            }
+        }
         std::fs::copy(file, &dest)?;
+        // Backups contain plaintext secrets; keep them owner-only.
+        restrict_file(&dest);
         Ok(dest)
     }
 
@@ -325,22 +346,76 @@ fn ensure_path<'a>(doc: &'a mut toml_edit::DocumentMut, segs: &[&str]) -> &'a mu
     cur
 }
 
+/// Write via a unique temp file in the same directory, fsync, then rename. A
+/// unique name means two admins saving at once cannot interleave their bytes into
+/// one temp file, and the fsync makes the rename durable.
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write;
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .map(|e| e.to_string_lossy().to_string())
-            .unwrap_or_default()
+
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config".to_string());
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
+
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+
+    // fsync the directory so the rename itself survives a crash.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    restrict_file(path);
     Ok(())
 }
+
+#[cfg(unix)]
+fn restrict_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) {}
+
+#[cfg(unix)]
+fn restrict_dir(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_path: &Path) {}
 
 fn unquote(v: &str) -> String {
     let v = v.trim();
@@ -354,10 +429,19 @@ fn unquote(v: &str) -> String {
 }
 
 fn quote_if_needed(v: &str) -> String {
-    if v.contains(' ') || v.contains('#') || v.contains('"') {
-        format!("\"{}\"", v.replace('"', "\\\""))
+    // A newline would let a single form field append arbitrary lines to `.env`
+    // (for example a second definition of a secret that shadows the real one).
+    let v = v.replace(['\n', '\r'], " ");
+    if v.contains(' ')
+        || v.contains('#')
+        || v.contains('"')
+        || v.contains('\'')
+        || v.contains('\\')
+        || v.is_empty()
+    {
+        format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
-        v.to_string()
+        v
     }
 }
 

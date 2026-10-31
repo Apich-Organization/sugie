@@ -8,7 +8,11 @@ pub mod pages;
 /// Render a component tree to a complete HTML document.
 pub fn render(view: impl IntoView + 'static) -> String {
     let body = view.into_view().to_html();
-    format!("<!DOCTYPE html>{body}")
+    // One allocation instead of `format!` copying the whole document again.
+    let mut out = String::with_capacity(body.len() + 16);
+    out.push_str("<!DOCTYPE html>");
+    out.push_str(&body);
+    out
 }
 
 fn nav_items(user: &Option<CurrentUser>) -> Vec<(&'static str, &'static str, &'static str)> {
@@ -129,7 +133,8 @@ pub fn Shell(
         .into_iter()
         .map(|(key, href, label)| {
             let cls = if key == active { "active" } else { "" };
-            view! { <a href=href class=cls>{label}</a> }
+            let current = if key == active { Some("page") } else { None };
+            view! { <a href=href class=cls aria-current=current>{label}</a> }
         })
         .collect_view();
 
@@ -141,6 +146,11 @@ pub fn Shell(
                 <title>{full_title}</title>
                 <link rel="icon" type="image/svg+xml" href="/admin/assets/logo.svg"/>
                 <link rel="stylesheet" href="/admin/assets/app.css"/>
+                // Applied before first paint: otherwise dark-mode users see a
+                // flash of the light theme while app.js loads at the end of body.
+                <script>
+                    "try{var t=localStorage.getItem('sugie_theme');if(!t&&window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches){t='dark';}if(t){document.documentElement.setAttribute('data-theme',t);}}catch(e){}"
+                </script>
             </head>
             <body>
                 <script>
@@ -154,7 +164,7 @@ pub fn Shell(
                     </a>
                     <nav class="nav">{nav_views}</nav>
                     <div class="topbar-right">
-                        <button class="icon-btn" data-theme-toggle="" title="Toggle theme">"◐"</button>
+                        <button class="icon-btn" data-theme-toggle="" title="Toggle theme" aria-label="Toggle colour theme">"◐"</button>
                         <div class="user-chip">
                             <span class="avatar">{initials}</span>
                             <span>{display}" · "{role_label}</span>
@@ -208,7 +218,9 @@ pub fn Flash(ok: bool, text: String) -> impl IntoView {
         view! { <span></span> }.into_any()
     } else {
         let cls = if ok { "alert ok" } else { "alert err" };
-        view! { <div class=cls>{text}</div> }.into_any()
+        // role="status" makes redirect flash messages audible to screen readers.
+        let role = if ok { "status" } else { "alert" };
+        view! { <div class=cls role=role aria-live="polite">{text}</div> }.into_any()
     }
 }
 

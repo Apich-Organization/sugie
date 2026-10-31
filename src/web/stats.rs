@@ -4,7 +4,7 @@
 use crate::triage::TriageService;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const TTL: Duration = Duration::from_secs(60);
@@ -41,6 +41,10 @@ impl RepoStats {
 #[derive(Default)]
 pub struct StatsCache {
     inner: Mutex<HashMap<String, (Instant, RepoStats)>>,
+    /// One async mutex per repository: concurrent callers for the same repo wait
+    /// for a single upstream fetch instead of stampeding GitHub when the TTL
+    /// expires (thundering herd).
+    flights: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl StatsCache {
@@ -59,6 +63,17 @@ impl StatsCache {
             guard.insert(stats.full_name.clone(), (Instant::now(), stats));
         }
     }
+
+    fn flight(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut guard = match self.flights.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 pub async fn fetch(
@@ -67,6 +82,16 @@ pub async fn fetch(
     full_name: &str,
     force: bool,
 ) -> RepoStats {
+    if !force {
+        if let Some(hit) = cache.peek(full_name) {
+            return hit;
+        }
+    }
+
+    // Single-flight: only one task fetches per repository; the rest re-check the
+    // cache after the winner has populated it.
+    let gate = cache.flight(full_name);
+    let _permit = gate.lock().await;
     if !force {
         if let Some(hit) = cache.peek(full_name) {
             return hit;
@@ -91,12 +116,18 @@ async fn fetch_uncached(triage: &TriageService, full_name: &str) -> RepoStats {
     };
 
     let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-    let meta_fut = client.get_repo(owner, repo);
-    let issues_fut = client.list_repo_issues(owner, repo, "open", 100);
-    let pulls_fut = client.list_repo_pulls(owner, repo, "open", 100);
-    let commits_fut = client.list_commits(owner, repo, Some(&since), 100);
+    let since_date = (chrono::Utc::now() - chrono::Duration::days(30))
+        .format("%Y-%m-%d")
+        .to_string();
 
-    let (meta, issues, pulls, commits) = tokio::join!(meta_fut, issues_fut, pulls_fut, commits_fut);
+    let meta_fut = client.get_repo(owner, repo);
+    let issues_fut = client.count_open_issues_and_prs(owner, repo);
+    let pulls_fut = client.count_open_pulls(owner, repo);
+    let commits_fut = client.count_commits_since(owner, repo, &since);
+    let merged_fut = client.count_merged_since(owner, repo, &since_date);
+
+    let (meta, issues_total, pulls, commits, merged) =
+        tokio::join!(meta_fut, issues_fut, pulls_fut, commits_fut, merged_fut);
 
     let mut stats = RepoStats {
         full_name: full_name.to_string(),
@@ -120,18 +151,18 @@ async fn fetch_uncached(triage: &TriageService, full_name: &str) -> RepoStats {
         Err(e) => stats.error = Some(format!("Failed to fetch repository metadata: {e}")),
     }
 
-    match issues {
-        Ok(list) => stats.open_issues = list.iter().filter(|i| !i.is_pr()).count() as u64,
-        Err(e) => {
+    // `/issues` counts issues *and* PRs, so subtract the PR total to get issues.
+    match (issues_total, pulls) {
+        (Ok(total), Ok(prs)) => {
+            stats.open_prs = prs;
+            stats.open_issues = total.saturating_sub(prs);
+        }
+        (Err(e), _) => {
             stats
                 .error
                 .get_or_insert(format!("Failed to fetch issue count: {e}"));
         }
-    }
-
-    match pulls {
-        Ok(list) => stats.open_prs = list.len() as u64,
-        Err(e) => {
+        (_, Err(e)) => {
             stats
                 .error
                 .get_or_insert(format!("Failed to fetch PR count: {e}"));
@@ -139,7 +170,7 @@ async fn fetch_uncached(triage: &TriageService, full_name: &str) -> RepoStats {
     }
 
     match commits {
-        Ok(list) => stats.commits_30d = list.len() as u64,
+        Ok(n) => stats.commits_30d = n,
         Err(e) => {
             stats
                 .error
@@ -147,12 +178,13 @@ async fn fetch_uncached(triage: &TriageService, full_name: &str) -> RepoStats {
         }
     }
 
-    if let Ok(closed) = client.list_repo_pulls(owner, repo, "closed", 50).await {
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
-        stats.merged_30d = closed
-            .iter()
-            .filter(|p| p.merged_at.map(|t| t > cutoff).unwrap_or(false))
-            .count() as u64;
+    match merged {
+        Ok(n) => stats.merged_30d = n,
+        Err(e) => {
+            stats
+                .error
+                .get_or_insert(format!("Failed to fetch merged count: {e}"));
+        }
     }
 
     stats

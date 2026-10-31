@@ -15,8 +15,9 @@ pub mod ui;
 use crate::config::SugieConfig;
 use crate::triage::TriageService;
 use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    extract::{Path, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::Next,
     response::{
         sse::{Event, Sse},
         Html, IntoResponse, Json, Redirect, Response,
@@ -61,10 +62,11 @@ impl WebState {
     ) -> anyhow::Result<Self> {
         let db = WebDb::open(&config.db_path)?;
         crate::security_log::init(&config.db_path);
-        if let Some(generated) = auth::bootstrap_admin(&db)? {
+        if auth::bootstrap_admin(&db)?.is_some() {
             tracing::warn!(
-                "Admin console bootstrapped an `admin` account. Generated password: {} (also written to data/admin-initial-password.txt)",
-                generated
+                "Admin console bootstrapped an `admin` account with a generated password. \
+                 It is written to data/admin-initial-password.txt (mode 0600) and deleted on \
+                 the first successful login. Set SUGIE_ADMIN_PASSWORD to choose your own."
             );
         }
         let passkey = passkey::PasskeyManager::from_env(config.port);
@@ -139,7 +141,164 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/assets/logo.svg", get(logo_svg))
         .route("/admin/assets/sugie-mark.svg", get(logo_svg))
         .route("/favicon.ico", get(logo_svg))
+        .layer(axum::middleware::from_fn(require_same_origin))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+
+// ------------------------------------------------------------- middleware
+
+/// CSRF defence. Browsers always attach `Origin` to a cross-site (and to every
+/// non-GET) request, so rejecting a mismatching `Origin` blocks form-based CSRF
+/// without needing a token round-trip. `SameSite=Strict` on the session cookie is
+/// the second layer; this one also covers login CSRF, where no session exists yet.
+///
+/// Requests that carry neither `Origin` nor `Sec-Fetch-Site` come from non-browser
+/// clients (curl, CI, scripts) and are allowed so the JSON API stays usable.
+async fn require_same_origin(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return next.run(req).await;
+    }
+
+    let host = req
+        .headers()
+        .get("x-forwarded-host")
+        .or_else(|| req.headers().get(header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string());
+    let fetch_site = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase());
+
+    if let Some(origin) = origin {
+        if origin == "null" {
+            return forbidden("Cross-origin request blocked");
+        }
+        let scheme = if auth::is_secure_request(req.headers()) {
+            "https"
+        } else {
+            "http"
+        };
+        if !host.is_empty() && origin.eq_ignore_ascii_case(&format!("{scheme}://{host}")) {
+            return next.run(req).await;
+        }
+        // Some proxies terminate TLS but forward plain http upstream.
+        if !host.is_empty() && origin.eq_ignore_ascii_case(&format!("https://{host}")) {
+            return next.run(req).await;
+        }
+        return forbidden("Cross-origin request blocked");
+    }
+
+    match fetch_site.as_deref() {
+        Some("same-origin") | Some("none") => next.run(req).await,
+        Some(_) => forbidden("Cross-site request blocked"),
+        None => next.run(req).await,
+    }
+}
+
+fn forbidden(msg: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Html(format!(
+            "<!DOCTYPE html><html><body style=\"font-family:system-ui;padding:40px\"><h1>403 Forbidden</h1><p>{msg}</p></body></html>"
+        )),
+    )
+        .into_response()
+}
+
+/// Baseline hardening headers for every console response.
+async fn security_headers(req: Request, next: Next) -> Response {
+    let secure = auth::is_secure_request(req.headers());
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    // The UI uses inline style attributes and a few inline handlers, so
+    // 'unsafe-inline' is required for style/script; everything else stays locked
+    // to same-origin.
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+             script-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self'; \
+             frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
+        ),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    if secure {
+        headers.insert(
+            "strict-transport-security",
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    resp
+}
+
+
+/// Parse an optional integer form field, recording a human-readable error when it
+/// is present but out of range or not a number.
+fn parse_int_field(
+    form: &HashMap<String, String>,
+    key: &str,
+    default: i64,
+    min: i64,
+    max: i64,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> i64 {
+    let Some(raw) = form.get(key) else {
+        return default;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return default;
+    }
+    match raw.parse::<i64>() {
+        Ok(v) if (min..=max).contains(&v) => v,
+        Ok(_) => {
+            errors.push(format!("{label} must be between {min} and {max}"));
+            default
+        }
+        Err(_) => {
+            errors.push(format!("{label} must be a whole number"));
+            default
+        }
+    }
+}
+
+fn validate_username(name: &str) -> Result<(), &'static str> {
+    let len = name.chars().count();
+    if len < 3 {
+        return Err("Username must be at least 3 characters");
+    }
+    if len > 32 {
+        return Err("Username must be at most 32 characters");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err("Username may only contain letters, digits, dot, underscore and hyphen");
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ helpers
@@ -242,7 +401,7 @@ async fn login_submit(
                 "/admin".to_string()
             };
             let mut resp = redirect(&next);
-            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&token)) {
+            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&token, auth::is_secure_request(&headers))) {
                 resp.headers_mut().append(header::SET_COOKIE, value);
             }
             resp
@@ -258,6 +417,24 @@ async fn login_submit(
                 has_passkey: user.passkey_count > 0,
             };
             html(pages::login_page(None, form.next, Some(challenge)))
+        }
+        Ok(auth::LoginOutcome::Locked(secs)) => {
+            state.db.audit(
+                &form.username,
+                "login",
+                "-",
+                "Account temporarily locked after repeated failures",
+                &ip,
+                false,
+            );
+            let mins = (secs + 59) / 60;
+            html(pages::login_page(
+                Some(format!(
+                    "Too many failed attempts. Try again in {mins} minute(s)."
+                )),
+                form.next,
+                None,
+            ))
         }
         Ok(auth::LoginOutcome::Invalid) => {
             state.db.audit(
@@ -323,6 +500,10 @@ async fn login_2fa_submit(
     };
 
     if !enabled || !totp::verify_totp(&secret, &form.totp_code) {
+        let attempts = state
+            .db
+            .bump_pending_2fa_attempts(&token_hash)
+            .unwrap_or(auth::MAX_OTP_ATTEMPTS);
         state.db.audit(
             &user.username,
             "login.2fa",
@@ -331,6 +512,16 @@ async fn login_2fa_submit(
             &ip,
             false,
         );
+        if attempts >= auth::MAX_OTP_ATTEMPTS {
+            // An 8-digit code is only 10^8 wide; unlimited guesses behind a
+            // valid password would be brute-forceable. Kill the challenge.
+            let _ = state.db.consume_pending_2fa(&token_hash);
+            return html(pages::login_page(
+                Some("Too many invalid codes. Please sign in again.".to_string()),
+                form.next,
+                None,
+            ));
+        }
         let challenge = pages::LoginChallenge {
             pending_token: form.pending_token,
             username: user.username,
@@ -338,7 +529,10 @@ async fn login_2fa_submit(
             has_passkey: user.passkey_count > 0,
         };
         return html(pages::login_page(
-            Some("Invalid 8-digit authenticator code. Please try again.".to_string()),
+            Some(format!(
+                "Invalid 8-digit authenticator code ({} attempt(s) left).",
+                auth::MAX_OTP_ATTEMPTS - attempts
+            )),
             form.next,
             Some(challenge),
         ));
@@ -362,7 +556,7 @@ async fn login_2fa_submit(
                 "/admin".to_string()
             };
             let mut resp = redirect(&next);
-            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&session_token)) {
+            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&session_token, auth::is_secure_request(&headers))) {
                 resp.headers_mut().append(header::SET_COOKIE, value);
             }
             resp
@@ -383,7 +577,7 @@ async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
         let _ = state.db.delete_session(&auth::token_hash(&token));
     }
     let mut resp = redirect("/admin/login");
-    if let Ok(value) = HeaderValue::from_str(&auth::clear_cookie()) {
+    if let Ok(value) = HeaderValue::from_str(&auth::clear_cookie(auth::is_secure_request(&headers))) {
         resp.headers_mut().append(header::SET_COOKIE, value);
     }
     resp
@@ -1149,7 +1343,7 @@ async fn api_passkey_auth_finish(
                     "/admin".to_string()
                 };
             let mut resp = Json(json!({ "ok": true, "redirect": redirect_url })).into_response();
-            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&session_token)) {
+            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&session_token, auth::is_secure_request(&headers))) {
                 resp.headers_mut().append(header::SET_COOKIE, value);
             }
             resp
@@ -1207,7 +1401,9 @@ async fn audit_page(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let page = query.page.max(0);
+    // Clamp before multiplying: `page * 50` on an attacker-supplied i64 would
+    // overflow (panic in debug builds, negative offset in release).
+    let page = query.page.clamp(0, 100_000);
     let tab = if query.tab.is_empty() {
         "audit".to_string()
     } else {
@@ -1250,7 +1446,7 @@ async fn audit_page(
         };
         let http_rows = state
             .db
-            .list_security_http_logs_filtered(dir_filter, &http_filter, 50, page * 50)
+            .list_security_http_logs_filtered(dir_filter, &http_filter, 50, page.saturating_mul(50))
             .unwrap_or_default()
             .into_iter()
             .map(|r| pages::SecurityHttpCard {
@@ -1285,7 +1481,7 @@ async fn audit_page(
     } else {
         let rows = state
             .db
-            .list_audit_filtered(&audit_filter, 50, page * 50)
+            .list_audit_filtered(&audit_filter, 50, page.saturating_mul(50))
             .unwrap_or_default()
             .into_iter()
             .map(|r| pages::AuditCard {
@@ -1719,9 +1915,26 @@ async fn api_exec(
         }
     };
 
+    if req.command.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Command cannot be empty"})),
+        )
+            .into_response();
+    }
+
     match exec::dispatch(state.clone(), user, req.repo, req.command) {
         Ok(job_id) => Json(json!({ "job_id": job_id })).into_response(),
         Err(msg) => (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+    }
+}
+
+/// Job output can contain repository names, config paths and installation ids,
+/// so only the owner of the job (or an admin) may read it.
+fn job_visible_to(state: &WebState, user: &CurrentUser, id: &str) -> bool {
+    match state.jobs.snapshot(id) {
+        Some(job) => user.is_admin() || job.username.eq_ignore_ascii_case(&user.username),
+        None => false,
     }
 }
 
@@ -1730,10 +1943,21 @@ async fn api_job(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if gate(&state, &headers).is_err() {
+    let user = match gate(&state, &headers) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Unauthorized"})),
+            )
+                .into_response()
+        }
+    };
+    if !job_visible_to(&state, &user, &id) {
+        // 404 rather than 403: do not confirm that the job id exists.
         return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "Unauthorized"})),
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Job not found"})),
         )
             .into_response();
     }
@@ -1752,10 +1976,20 @@ async fn api_job_stream(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if gate(&state, &headers).is_err() {
+    let user = match gate(&state, &headers) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Unauthorized"})),
+            )
+                .into_response()
+        }
+    };
+    if !job_visible_to(&state, &user, &id) {
         return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "Unauthorized"})),
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Job not found"})),
         )
             .into_response();
     }
@@ -1786,7 +2020,15 @@ async fn api_job_stream(
         }
     };
 
-    Sse::new(stream).into_response()
+    // A keep-alive comment every 15s stops proxies from silently dropping an
+    // idle stream (and lets the client detect a dead connection).
+    Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -1800,13 +2042,16 @@ async fn api_stats(
     headers: HeaderMap,
     Query(query): Query<StatsQuery>,
 ) -> Response {
-    if gate(&state, &headers).is_err() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "Unauthorized"})),
-        )
-            .into_response();
-    }
+    let user = match gate(&state, &headers) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Unauthorized"})),
+            )
+                .into_response()
+        }
+    };
     if query.repo.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1814,7 +2059,16 @@ async fn api_stats(
         )
             .into_response();
     }
-    let stats = stats::fetch(&state.triage, &state.stats, &query.repo, true).await;
+    if !user.can_access_repo(&query.repo) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "No access to repository"})),
+        )
+            .into_response();
+    }
+    // Serve from the TTL cache: a polling dashboard must not translate into a
+    // fresh burst of GitHub API calls every second.
+    let stats = stats::fetch(&state.triage, &state.stats, &query.repo, false).await;
     Json(stats).into_response()
 }
 
@@ -1841,11 +2095,25 @@ async fn save_structured(
             })
             .unwrap_or_default()
     };
-    let int_or = |k: &str, default: i64| -> i64 {
-        form.get(k)
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .unwrap_or(default)
-    };
+    // Numeric fields are validated, not silently replaced with a default: typing
+    // `abc` into "port" must be an error, not a quiet write of 8800.
+    let mut errors: Vec<String> = Vec::new();
+    let port = parse_int_field(&form, "port", 8800, 1, 65535, "Port", &mut errors);
+    let stale_days = parse_int_field(&form, "stale_days", 60, 1, 3650, "Stale after (days)", &mut errors);
+    let stale_interval = parse_int_field(
+        &form,
+        "stale_interval",
+        24,
+        1,
+        720,
+        "Stale check interval (hours)",
+        &mut errors,
+    );
+    let reviewers_per_pr =
+        parse_int_field(&form, "reviewers_per_pr", 1, 1, 20, "Reviewers per PR", &mut errors);
+    if !errors.is_empty() {
+        return config_flash(false, &errors.join("; "));
+    }
 
     let text = match state.files.read_toml() {
         Ok(t) => t,
@@ -1856,7 +2124,7 @@ async fn save_structured(
         ("host".into(), config_store::Patch::Str(get("host"))),
         (
             "port".into(),
-            config_store::Patch::Int(int_or("port", 8800)),
+            config_store::Patch::Int(port),
         ),
         ("db_path".into(), config_store::Patch::Str(get("db_path"))),
         (
@@ -1873,11 +2141,11 @@ async fn save_structured(
         ),
         (
             "default_rules.stale.warn_days".into(),
-            config_store::Patch::Int(int_or("stale_days", 60)),
+            config_store::Patch::Int(stale_days),
         ),
         (
             "default_rules.stale.check_interval_hours".into(),
-            config_store::Patch::Int(int_or("stale_interval", 24)),
+            config_store::Patch::Int(stale_interval),
         ),
         (
             "default_rules.reviewers.enabled".into(),
@@ -1885,7 +2153,7 @@ async fn save_structured(
         ),
         (
             "default_rules.reviewers.reviewers_per_pr".into(),
-            config_store::Patch::Int(int_or("reviewers_per_pr", 1)),
+            config_store::Patch::Int(reviewers_per_pr),
         ),
         (
             "default_rules.labels.enabled".into(),
@@ -2123,6 +2391,10 @@ fn all_repos(state: &WebState) -> Vec<String> {
 }
 
 fn build_user_cards(state: &WebState) -> Vec<pages::UserCard> {
+    // Two bulk queries instead of 2N per-user queries (the previous shape cost
+    // 2N+1 round-trips and 2N+1 mutex acquisitions for N users).
+    let mut repo_map = state.db.repo_perms_all().unwrap_or_default();
+    let mut cmd_map = state.db.command_perms_all().unwrap_or_default();
     state
         .db
         .list_users()
@@ -2130,8 +2402,8 @@ fn build_user_cards(state: &WebState) -> Vec<pages::UserCard> {
         .into_iter()
         .map(|u| pages::UserCard {
             role_label: perms::Role::parse(&u.role).label().to_string(),
-            repos: state.db.repo_perms(u.id).unwrap_or_default(),
-            commands: state.db.command_perms(u.id).unwrap_or_default(),
+            repos: repo_map.remove(&u.id).unwrap_or_default(),
+            commands: cmd_map.remove(&u.id).unwrap_or_default(),
             last_login: u
                 .last_login
                 .map(|t| t.replace('T', " ").chars().take(16).collect())
@@ -2162,23 +2434,31 @@ async fn create_user(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     let password = form.get("password").cloned().unwrap_or_default();
-    let role = form.get("role").cloned().unwrap_or_else(|| "viewer".into());
+    // Parse to the enum *before* comparing: a raw string compare on "owner"
+    // would let `role=Owner` (or " owner") slip past the guard and then be
+    // persisted verbatim, silently promoting an admin to owner.
+    let role = perms::Role::parse(form.get("role").map(String::as_str).unwrap_or("viewer"));
     let display = form.get("display_name").cloned().unwrap_or_default();
     let two_fa_policy = if actor.is_owner() {
-        form.get("two_fa_policy")
-            .cloned()
-            .unwrap_or_else(|| "default".into())
+        db::normalize_policy(
+            form.get("two_fa_policy")
+                .map(String::as_str)
+                .unwrap_or("default"),
+        )
     } else {
-        "default".into()
+        "default"
     };
 
-    if username.len() < 3 {
-        return users_flash(false, "Username must be at least 3 characters");
+    if let Err(msg) = validate_username(&username) {
+        return users_flash(false, msg);
     }
     if password.len() < 8 {
         return users_flash(false, "Password must be at least 8 characters");
     }
-    if role == "owner" && !actor.is_owner() {
+    if password.len() > 256 {
+        return users_flash(false, "Password must be at most 256 characters");
+    }
+    if role == perms::Role::Owner && !actor.is_owner() {
         return users_flash(false, "Only owners can create owner accounts");
     }
 
@@ -2187,7 +2467,7 @@ async fn create_user(
         Err(e) => return users_flash(false, &format!("Password processing failed: {e}")),
     };
 
-    match state.db.create_user(&username, &hash, &role, &display) {
+    match state.db.create_user(&username, &hash, role.as_str(), &display) {
         Ok(id) => {
             if actor.is_owner() && two_fa_policy != "default" {
                 let _ = state.db.set_user_two_fa_policy(id, &two_fa_policy);
@@ -2208,7 +2488,7 @@ async fn create_user(
                 &actor.username,
                 "user.create",
                 &username,
-                &format!("role={role} 2fa_policy={two_fa_policy}"),
+                &format!("role={} 2fa_policy={two_fa_policy}", role.as_str()),
                 &auth::client_ip(&headers),
                 true,
             );
@@ -2233,15 +2513,17 @@ async fn update_user(
     let Some(target) = state.db.get_user(id).ok().flatten() else {
         return users_flash(false, "User not found");
     };
-    if target.role == "owner" && !actor.is_owner() {
+    if perms::Role::parse(&target.role) == perms::Role::Owner && !actor.is_owner() {
         return users_flash(false, "Only owners can modify owner accounts");
     }
 
-    let role = form
-        .get("role")
-        .cloned()
-        .unwrap_or_else(|| target.role.clone());
-    if role == "owner" && !actor.is_owner() {
+    let target_role = perms::Role::parse(&target.role);
+    let role = perms::Role::parse(
+        form.get("role")
+            .map(String::as_str)
+            .unwrap_or(target.role.as_str()),
+    );
+    if role == perms::Role::Owner && !actor.is_owner() {
         return users_flash(false, "Only owners can grant owner role");
     }
     let display = form
@@ -2250,13 +2532,36 @@ async fn update_user(
         .unwrap_or_else(|| target.display_name.clone());
     let active = form.contains_key("active");
 
-    if let Err(e) = state.db.update_user_profile(id, &role, &display, active) {
+    // Guard rails against locking the console out of its own administration.
+    if id == actor.id && role != target_role {
+        return users_flash(false, "You cannot change your own role");
+    }
+    if id == actor.id && !active {
+        return users_flash(false, "You cannot deactivate your own account");
+    }
+    if target_role == perms::Role::Owner && role != perms::Role::Owner {
+        if !actor.is_owner() {
+            return users_flash(false, "Only owners can demote an owner");
+        }
+        if state.db.count_owners().unwrap_or(0) <= 1 {
+            return users_flash(false, "Cannot demote the last active owner");
+        }
+    }
+
+    let role_changed = role != target_role || active != target.active;
+    if let Err(e) = state.db.update_user_profile(id, role.as_str(), &display, active) {
         return users_flash(false, &format!("Failed to update user: {e}"));
+    }
+    if role_changed {
+        // A demotion or deactivation must not leave a privileged session alive
+        // for the remaining 12 hours of its TTL.
+        let _ = state.db.delete_user_sessions(id);
     }
 
     if actor.is_owner() {
         if let Some(policy) = form.get("two_fa_policy") {
-            let _ = state.db.set_user_two_fa_policy(id, policy);
+            let _ = state.db
+                .set_user_two_fa_policy(id, db::normalize_policy(policy));
         }
     }
 
@@ -2294,7 +2599,7 @@ async fn update_user(
         &actor.username,
         "user.update",
         &target.username,
-        &format!("role={role} active={active}"),
+        &format!("role={} active={active}", role.as_str()),
         &auth::client_ip(&headers),
         true,
     );
@@ -2355,7 +2660,7 @@ async fn reset_user_2fa(
     let Some(target) = state.db.get_user(id).ok().flatten() else {
         return users_flash(false, "User not found");
     };
-    if target.role == "owner" && !actor.is_owner() {
+    if perms::Role::parse(&target.role) == perms::Role::Owner && !actor.is_owner() {
         return users_flash(false, "Only owners can reset 2FA for owner accounts");
     }
 
@@ -2396,7 +2701,7 @@ async fn delete_user(
     let Some(target) = state.db.get_user(id).ok().flatten() else {
         return users_flash(false, "User not found");
     };
-    if target.role == "owner" && !actor.is_owner() {
+    if perms::Role::parse(&target.role) == perms::Role::Owner && !actor.is_owner() {
         return users_flash(false, "Only owners can delete owner accounts");
     }
 

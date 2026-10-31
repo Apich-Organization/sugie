@@ -204,18 +204,12 @@ impl PasskeyManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         lock.retain(|_, v| v.created_at.elapsed() < Duration::from_secs(300));
 
-        let entry = lock
-            .remove(&challenge_str)
-            .or_else(|| {
-                let key = lock
-                    .iter()
-                    .find(|(_, v)| v.user_id == user_id)
-                    .map(|(k, _)| k.clone())?;
-                lock.remove(&key)
-            })
-            .ok_or_else(|| {
-                "No registration ceremony in progress or challenge expired".to_string()
-            })?;
+        // Match strictly on the challenge the client signed. A fallback such as
+        // "take any pending challenge for this user" would let one browser tab
+        // consume another tab's (or another session's) ceremony.
+        let entry = lock.remove(&challenge_str).ok_or_else(|| {
+            "No registration ceremony in progress or challenge expired".to_string()
+        })?;
 
         if entry.user_id != user_id {
             return Err("User mismatch during passkey registration".to_string());
@@ -281,15 +275,9 @@ impl PasskeyManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         lock.retain(|_, v| v.created_at.elapsed() < Duration::from_secs(300));
 
-        let entry = lock
-            .remove(&challenge_str)
-            .or_else(|| {
-                let key = lock.keys().next().cloned()?;
-                lock.remove(&key)
-            })
-            .ok_or_else(|| {
-                "No authentication ceremony in progress or challenge expired".to_string()
-            })?;
+        let entry = lock.remove(&challenge_str).ok_or_else(|| {
+            "No authentication ceremony in progress or challenge expired".to_string()
+        })?;
 
         self.webauthn
             .finish_discoverable_authentication(cred, entry.state, discoverable_keys)

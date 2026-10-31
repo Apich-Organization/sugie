@@ -14,6 +14,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 const MAX_JOBS: usize = 120;
+/// Hard cap on retained output per job. A chatty command (a full `/stale` sweep)
+/// could otherwise grow without bound and eventually exhaust memory.
+const MAX_LINES: usize = 5000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -83,6 +86,17 @@ impl JobRegistry {
     pub fn log(&self, id: &str, level: &str, text: impl Into<String>) {
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(job) = guard.0.get_mut(id) {
+                if job.lines.len() >= MAX_LINES {
+                    // Append the notice exactly once, then drop further lines.
+                    if job.lines.len() == MAX_LINES {
+                        job.lines.push(LogLine {
+                            level: "err".to_string(),
+                            text: format!("… output truncated at {MAX_LINES} lines"),
+                            ts: clock(),
+                        });
+                    }
+                    return;
+                }
                 job.lines.push(LogLine {
                     level: level.to_string(),
                     text: text.into(),
@@ -153,7 +167,17 @@ pub fn dispatch(
     if raw.is_empty() {
         return Err("Command cannot be empty".to_string());
     }
-    let (cmd, args) = split_command(&raw);
+    let (raw_cmd, args) = split_command(&raw);
+    // Honour `[default_rules.commands.aliases]` from sugie.toml so the console
+    // behaves like the bot (`/l 42 bug` → `/label 42 bug`).
+    let cmd = state
+        .config
+        .default_rules
+        .commands
+        .aliases
+        .get(&raw_cmd)
+        .map(|v| v.trim_start_matches('/').to_ascii_lowercase())
+        .unwrap_or(raw_cmd);
     let spec = command_spec(&cmd)
         .ok_or_else(|| format!("Unknown command `/{cmd}`, run /help to see supported commands"))?;
 
@@ -401,11 +425,32 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             let Some(num) = ctx.need_number(args) else {
                 return false;
             };
-            let labels: Vec<String> = args[1..].iter().cloned().collect();
-            if labels.is_empty() {
+            if args.len() < 2 {
+                ctx.err(
+                    "Please specify label name(s), e.g. `/label 42 bug` or `/label 42 +bug -wip`",
+                );
+                return false;
+            }
+            // Same `+add` / `-remove` syntax as the bot's issue-comment commands.
+            // Multi-word labels must be quoted: `/label 42 "good first issue"`.
+            let mut add: Vec<String> = Vec::new();
+            let mut remove: Vec<String> = Vec::new();
+            for tok in &args[1..] {
+                if let Some(rest) = tok.strip_prefix('-').filter(|r| !r.is_empty()) {
+                    remove.push(rest.to_string());
+                } else if let Some(rest) = tok.strip_prefix('+').filter(|r| !r.is_empty()) {
+                    add.push(rest.to_string());
+                } else if cmd == "unlabel" {
+                    remove.push(tok.clone());
+                } else {
+                    add.push(tok.clone());
+                }
+            }
+            if add.is_empty() && remove.is_empty() {
                 ctx.err("Please specify label name(s), e.g. `/label 42 bug`");
                 return false;
             }
+
             let client = match ctx.state.triage.get_client_for_repo(ctx.repo).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -413,34 +458,36 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                     return false;
                 }
             };
-            let res = if cmd == "label" {
-                client.add_labels(owner, repo, num, &labels).await
-            } else {
-                let mut r = Ok(());
-                for l in &labels {
-                    r = client.remove_label(owner, repo, num, l).await;
-                    if r.is_err() {
-                        break;
-                    }
-                }
-                r
-            };
-            match res {
-                Ok(_) => {
-                    ctx.ok(format!(
-                        "{} labels on {}{}: {}",
-                        if cmd == "label" { "Added" } else { "Removed" },
+
+            let mut ok = true;
+            if !add.is_empty() {
+                match client.add_labels(owner, repo, num, &add).await {
+                    Ok(_) => ctx.ok(format!(
+                        "Added labels on {}{}: {}",
                         ctx.repo,
                         format!("#{num}"),
-                        labels.join(", ")
-                    ));
-                    true
-                }
-                Err(e) => {
-                    ctx.err(format!("Operation failed: {e}"));
-                    false
+                        add.join(", ")
+                    )),
+                    Err(e) => {
+                        ctx.err(format!("Failed to add labels {}: {e}", add.join(", ")));
+                        ok = false;
+                    }
                 }
             }
+            for l in &remove {
+                match client.remove_label(owner, repo, num, l).await {
+                    Ok(_) => ctx.ok(format!(
+                        "Removed label `{l}` on {}{}",
+                        ctx.repo,
+                        format!("#{num}")
+                    )),
+                    Err(e) => {
+                        ctx.err(format!("Failed to remove label `{l}`: {e}"));
+                        ok = false;
+                    }
+                }
+            }
+            ok
         }
 
         "assign" | "unassign" => {
@@ -544,13 +591,24 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 }
             };
             let res = if cmd == "close" {
-                let reason = match args.get(1).map(|s| s.as_str()) {
-                    Some("not_planned") => Some("not_planned"),
-                    Some("completed") => Some("completed"),
-                    _ => Some("completed"),
+                // GitHub accepts exactly `completed` and `not_planned`. Anything
+                // else is a user mistake and should be reported, not silently
+                // downgraded to `completed`.
+                let raw = args[1..].join(" ").trim().to_ascii_lowercase();
+                let reason = match raw.replace('-', " ").as_str() {
+                    "" | "completed" | "complete" | "done" | "fixed" => "completed",
+                    "not planned" | "notplanned" | "wontfix" | "invalid" | "duplicate" => {
+                        "not_planned"
+                    }
+                    _ => {
+                        ctx.err(format!(
+                            "Unknown close reason `{raw}`. Use `completed` or `not planned`."
+                        ));
+                        return false;
+                    }
                 };
                 client
-                    .update_issue_state(owner, repo, num, "closed", reason)
+                    .update_issue_state(owner, repo, num, "closed", Some(reason))
                     .await
             } else {
                 client
@@ -641,19 +699,55 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 ));
                 return false;
             }
+            let failed: Vec<&serde_json::Value> = suites
+                .iter()
+                .filter(|suite| {
+                    matches!(
+                        suite.get("conclusion").and_then(|v| v.as_str()),
+                        Some("failure") | Some("timed_out") | Some("cancelled") | Some("action_required")
+                    )
+                })
+                .collect();
+            if failed.is_empty() {
+                ctx.info(format!(
+                    "All {} check suite(s) on {}{} already passed — nothing to re-run",
+                    suites.len(),
+                    ctx.repo,
+                    format!("#{num}")
+                ));
+                return true;
+            }
             let mut rerun = 0;
-            for suite in &suites {
+            let mut errors = 0;
+            for suite in &failed {
                 let Some(id) = suite.get("id").and_then(|v| v.as_u64()) else {
                     continue;
                 };
-                if client.rerequest_check_suite(owner, repo, id).await.is_ok() {
-                    rerun += 1;
+                match client.rerequest_check_suite(owner, repo, id).await {
+                    Ok(_) => rerun += 1,
+                    Err(e) => {
+                        errors += 1;
+                        ctx.err(format!("Failed to re-run suite {id}: {e}"));
+                    }
                 }
             }
+            if rerun == 0 {
+                ctx.err(format!(
+                    "Could not re-trigger any of the {} failed check suite(s)",
+                    failed.len()
+                ));
+                return false;
+            }
             ctx.ok(format!(
-                "Re-triggered {rerun} check suites ({} head {})",
+                "Re-triggered {rerun}/{} failed check suite(s) ({} head {}){}",
+                failed.len(),
                 ctx.repo,
-                &pr.head.sha[..7.min(pr.head.sha.len())]
+                &pr.head.sha[..7.min(pr.head.sha.len())],
+                if errors > 0 {
+                    format!(", {errors} failed")
+                } else {
+                    String::new()
+                }
             ));
             true
         }
@@ -837,9 +931,17 @@ async fn run_issue_command(
             }
         },
         "move" => match args.get(1) {
-            Some(target) if target.contains('/') => SlashCommand::Move {
-                target_repo: target.clone(),
-            },
+            Some(target) if target.contains('/') => {
+                // Moving an issue *into* a repository is a write to that repo, so
+                // it needs a grant for the destination, not just the source.
+                if !ctx.user.can_access_repo(target) {
+                    ctx.err(format!("No access to target repository {target}"));
+                    return false;
+                }
+                SlashCommand::Move {
+                    target_repo: target.clone(),
+                }
+            }
             _ => {
                 ctx.err("Usage: /move <num> <owner/target-repo>");
                 return false;
@@ -881,6 +983,18 @@ async fn run_issue_command(
         repo_config.reviewers.clone(),
         ctx.state.triage.storage().clone(),
     );
+    // The global restricted list and the per-user command grants were already
+    // checked in `dispatch`, but a repository can narrow them further in its own
+    // `.github/sugie.toml`. Honour that too instead of clearing it.
+    if !ctx
+        .user
+        .can_run(cmd, &repo_config.commands.restricted_commands)
+    {
+        ctx.err(format!(
+            "/{cmd} is restricted in this repository (see .github/sugie.toml)"
+        ));
+        return false;
+    }
     // Console permission was already enforced (role + per-user grants), so lift the
     // super-user restriction that applies to GitHub-comment invocations.
     let mut commands_cfg = repo_config.commands.clone();

@@ -4,6 +4,23 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT}
 use serde::Deserialize;
 use serde_json::json;
 
+
+/// Percent-encode a single path segment. Values such as label names are free-form
+/// user text; without this a `/` or `..` in a label would rewrite the request path
+/// while still carrying the installation token.
+fn seg(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct GitHubClient {
     http: reqwest::Client,
@@ -22,13 +39,41 @@ struct ContentFileResponse {
     encoding: String,
 }
 
+/// One process-wide HTTP client. Building a `reqwest::Client` per call creates a
+/// fresh connection pool, so every GitHub request would pay a new TLS handshake
+/// and nothing would ever be reused — which also risks secondary rate limits.
+/// The auth header is therefore attached per request instead of via
+/// `default_headers`.
+fn shared_http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(20))
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
 impl GitHubClient {
     pub fn new(token: String, base_url: Option<String>) -> Self {
+        Self {
+            http: shared_http().clone(),
+            base_url: base_url.unwrap_or_else(|| "https://api.github.com".to_string()),
+            token,
+        }
+    }
+
+    /// Headers that used to live on the client; now applied per request so the
+    /// connection pool can be shared across installations.
+    fn auth_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        let auth_val = format!("Bearer {}", token);
-        let mut auth_header = HeaderValue::from_str(&auth_val).unwrap();
-        auth_header.set_sensitive(true);
-        headers.insert(AUTHORIZATION, auth_header);
+        if let Ok(mut auth_header) = HeaderValue::from_str(&format!("Bearer {}", self.token)) {
+            auth_header.set_sensitive(true);
+            headers.insert(AUTHORIZATION, auth_header);
+        }
         headers.insert(
             ACCEPT,
             HeaderValue::from_static("application/vnd.github+json"),
@@ -38,17 +83,7 @@ impl GitHubClient {
             "X-GitHub-Api-Version",
             HeaderValue::from_static("2022-11-28"),
         );
-
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .unwrap_or_default();
-
-        Self {
-            http,
-            base_url: base_url.unwrap_or_else(|| "https://api.github.com".to_string()),
-            token,
-        }
+        headers
     }
 
     pub fn token(&self) -> &str {
@@ -63,7 +98,10 @@ impl GitHubClient {
     ) -> Result<reqwest::Response> {
         let start = std::time::Instant::now();
         let detail = payload.map(|p| p.to_string()).unwrap_or_default();
-        let mut req = self.http.request(method.clone(), url);
+        let mut req = self
+            .http
+            .request(method.clone(), url)
+            .headers(self.auth_headers());
         if let Some(body) = payload {
             req = req.json(body);
         }
@@ -242,10 +280,92 @@ impl GitHubClient {
     ) -> Result<()> {
         let url = format!(
             "{}/repos/{}/{}/issues/{}/labels/{}",
-            self.base_url, owner, repo, issue_number, label
+            self.base_url,
+            seg(owner),
+            seg(repo),
+            issue_number,
+            seg(label)
         );
         let _ = self.send_logged(reqwest::Method::DELETE, &url, None).await;
         Ok(())
+    }
+
+    // --- Exact counters (avoid the 100-item page ceiling) ---
+
+    /// Follow the `Link: rel="last"` header of a `per_page=1` request to obtain
+    /// the true number of items. Listing 100 items and counting them saturates at
+    /// 100 and silently under-reports busy repositories.
+    async fn total_count(&self, path_and_query: &str) -> Result<u64> {
+        let url = format!("{}{}", self.base_url, path_and_query);
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
+        let link = resp
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+        if let Some(page) = link.as_deref().and_then(last_page) {
+            return Ok(page);
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(body.as_array().map(|a| a.len() as u64).unwrap_or(0))
+    }
+
+    /// Open issues **and** PRs — the issues endpoint returns both.
+    pub async fn count_open_issues_and_prs(&self, owner: &str, repo: &str) -> Result<u64> {
+        self.total_count(&format!(
+            "/repos/{}/{}/issues?state=open&per_page=1",
+            seg(owner),
+            seg(repo)
+        ))
+        .await
+    }
+
+    pub async fn count_open_pulls(&self, owner: &str, repo: &str) -> Result<u64> {
+        self.total_count(&format!(
+            "/repos/{}/{}/pulls?state=open&per_page=1",
+            seg(owner),
+            seg(repo)
+        ))
+        .await
+    }
+
+    pub async fn count_commits_since(
+        &self,
+        owner: &str,
+        repo: &str,
+        since: &str,
+    ) -> Result<u64> {
+        self.total_count(&format!(
+            "/repos/{}/{}/commits?since={}&per_page=1",
+            seg(owner),
+            seg(repo),
+            seg(since)
+        ))
+        .await
+    }
+
+    /// Merged PRs since `since_date` (`YYYY-MM-DD`) via the search API, which
+    /// returns an exact `total_count` instead of a truncated list.
+    pub async fn count_merged_since(
+        &self,
+        owner: &str,
+        repo: &str,
+        since_date: &str,
+    ) -> Result<u64> {
+        let q = format!(
+            "repo:{}/{}+is:pr+is:merged+merged:>={}",
+            owner, repo, since_date
+        );
+        let url = format!("{}/search/issues?q={}&per_page=1", self.base_url, q);
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
+        let body: serde_json::Value = resp.json().await?;
+        Ok(body.get("total_count").and_then(|v| v.as_u64()).unwrap_or(0))
     }
 
     pub async fn add_assignees(
@@ -668,4 +788,13 @@ struct GraphQLResponse<T> {
 #[derive(Deserialize)]
 struct GraphQLError {
     message: String,
+}
+
+/// Extract the page number from a `Link` header's `rel="last"` entry.
+fn last_page(link: &str) -> Option<u64> {
+    link.split(',')
+        .find(|part| part.contains("rel=\"last\""))
+        .and_then(|part| part.split("page=").nth(1))
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse::<u64>().ok())
 }

@@ -8,6 +8,7 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -16,6 +17,9 @@ pub const KEY_GLOBAL_2FA_ENABLED: &str = "global_2fa_enabled";
 #[derive(Clone)]
 pub struct WebDb {
     conn: Arc<Mutex<Connection>>,
+    /// Cached copy of `web_settings.global_2fa_enabled` so resolving a principal
+    /// does not need a second round-trip on every request.
+    global_2fa: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,8 +164,10 @@ impl WebDb {
         let conn = Connection::open(path)?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            global_2fa: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         db.init()?;
+        db.refresh_global_2fa();
         Ok(db)
     }
 
@@ -169,16 +175,48 @@ impl WebDb {
         let conn = Connection::open_in_memory()?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            global_2fa: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         db.init()?;
+        db.refresh_global_2fa();
         Ok(db)
     }
 
+    /// Take the connection lock without propagating mutex poisoning: a panic in
+    /// one handler must not permanently brick every later request.
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn refresh_global_2fa(&self) {
+        let enabled = self.read_global_2fa();
+        self.global_2fa
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn read_global_2fa(&self) -> bool {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT value FROM web_settings WHERE key = ?1",
+            params![KEY_GLOBAL_2FA_ENABLED],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(true)
+    }
+
     fn init(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
+            PRAGMA synchronous = NORMAL;
 
             CREATE TABLE IF NOT EXISTS web_users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,7 +229,9 @@ impl WebDb {
                 last_login TEXT,
                 totp_secret TEXT NOT NULL DEFAULT '',
                 totp_enabled INTEGER NOT NULL DEFAULT 0,
-                two_fa_policy TEXT NOT NULL DEFAULT 'default'
+                two_fa_policy TEXT NOT NULL DEFAULT 'default',
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                locked_until TEXT
             );
 
             CREATE TABLE IF NOT EXISTS web_sessions (
@@ -210,7 +250,8 @@ impl WebDb {
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 ip TEXT NOT NULL DEFAULT '',
-                user_agent TEXT NOT NULL DEFAULT ''
+                user_agent TEXT NOT NULL DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS web_passkeys (
@@ -287,6 +328,32 @@ impl WebDb {
             "ALTER TABLE web_users ADD COLUMN two_fa_policy TEXT NOT NULL DEFAULT 'default'",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE web_users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE web_users ADD COLUMN locked_until TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE web_pending_2fa ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
+        // Usernames are looked up with COLLATE NOCASE, so the uniqueness
+        // constraint must be case-insensitive too — otherwise `Admin` and
+        // `admin` can coexist and login picks whichever row SQLite returns first.
+        let _ = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_web_users_username_nocase
+             ON web_users(username COLLATE NOCASE)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sec_http_logs_ts_asc ON security_http_logs (ts)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_web_audit_action ON web_audit(action, id DESC)",
+            [],
+        );
 
         // Seed default global 2FA policy (enabled by default so first-time logins prompt 2FA setup)
         let _ = conn.execute(
@@ -310,21 +377,11 @@ impl WebDb {
     // ------------------------------------------------------------- settings
 
     pub fn is_global_2fa_enabled(&self) -> bool {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT value FROM web_settings WHERE key = ?1",
-            params![KEY_GLOBAL_2FA_ENABLED],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(true)
+        self.global_2fa.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn set_global_2fa_enabled(&self, enabled: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO web_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -334,11 +391,13 @@ impl WebDb {
                 Utc::now().to_rfc3339()
             ],
         )?;
+        self.global_2fa
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     pub fn get_security_log_settings(&self) -> crate::security_log::SecurityLogSettings {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.query_row(
             "SELECT value FROM web_settings WHERE key = ?1",
             params![crate::security_log::KEY_SECURITY_LOG_SETTINGS],
@@ -356,7 +415,7 @@ impl WebDb {
         settings: &crate::security_log::SecurityLogSettings,
     ) -> Result<()> {
         let json_str = serde_json::to_string(settings)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO web_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -373,7 +432,7 @@ impl WebDb {
     // ---------------------------------------------------------------- users
 
     pub fn count_users(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM web_users", [], |r| r.get(0))?;
         Ok(n)
     }
@@ -397,7 +456,7 @@ impl WebDb {
         two_fa_policy: &str,
     ) -> Result<i64> {
         let policy = normalize_policy(two_fa_policy);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO web_users (username, password_hash, role, display_name, active, created_at, two_fa_policy)
              VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
@@ -407,7 +466,7 @@ impl WebDb {
     }
 
     pub fn find_user(&self, username: &str) -> Result<Option<UserRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let sql = format!("{USER_SELECT_SQL} WHERE u.username = ?1 COLLATE NOCASE");
         let row = conn
             .query_row(&sql, params![username], map_user)
@@ -416,14 +475,14 @@ impl WebDb {
     }
 
     pub fn get_user(&self, id: i64) -> Result<Option<UserRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let sql = format!("{USER_SELECT_SQL} WHERE u.id = ?1");
         let row = conn.query_row(&sql, params![id], map_user).optional()?;
         Ok(row)
     }
 
     pub fn password_hash(&self, user_id: i64) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let hash = conn
             .query_row(
                 "SELECT password_hash FROM web_users WHERE id = ?1",
@@ -435,7 +494,7 @@ impl WebDb {
     }
 
     pub fn list_users(&self) -> Result<Vec<UserRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let sql = format!("{USER_SELECT_SQL} ORDER BY u.id ASC");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
@@ -451,7 +510,7 @@ impl WebDb {
         display_name: &str,
         active: bool,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "UPDATE web_users SET role = ?2, display_name = ?3, active = ?4 WHERE id = ?1",
             params![id, role, display_name, active as i64],
@@ -461,7 +520,7 @@ impl WebDb {
 
     pub fn set_user_two_fa_policy(&self, id: i64, policy: &str) -> Result<()> {
         let p = normalize_policy(policy);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "UPDATE web_users SET two_fa_policy = ?2 WHERE id = ?1",
             params![id, p],
@@ -470,33 +529,47 @@ impl WebDb {
     }
 
     pub fn set_password(&self, id: i64, hash: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE web_users SET password_hash = ?2 WHERE id = ?1",
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE web_users SET password_hash = ?2, failed_attempts = 0, locked_until = NULL WHERE id = ?1",
             params![id, hash],
         )?;
+        // A password rotation must invalidate every other session, otherwise a
+        // stolen cookie keeps working after the user "secures" the account.
+        tx.execute(
+            "DELETE FROM web_sessions WHERE user_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM web_pending_2fa WHERE user_id = ?1",
+            params![id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_user(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM web_repo_perms WHERE user_id = ?1", params![id])?;
-        conn.execute(
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM web_repo_perms WHERE user_id = ?1", params![id])?;
+        tx.execute(
             "DELETE FROM web_command_perms WHERE user_id = ?1",
             params![id],
         )?;
-        conn.execute("DELETE FROM web_sessions WHERE user_id = ?1", params![id])?;
-        conn.execute(
+        tx.execute("DELETE FROM web_sessions WHERE user_id = ?1", params![id])?;
+        tx.execute(
             "DELETE FROM web_pending_2fa WHERE user_id = ?1",
             params![id],
         )?;
-        conn.execute("DELETE FROM web_passkeys WHERE user_id = ?1", params![id])?;
-        conn.execute("DELETE FROM web_users WHERE id = ?1", params![id])?;
+        tx.execute("DELETE FROM web_passkeys WHERE user_id = ?1", params![id])?;
+        tx.execute("DELETE FROM web_users WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn touch_login(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "UPDATE web_users SET last_login = ?2 WHERE id = ?1",
             params![id, Utc::now().to_rfc3339()],
@@ -504,10 +577,207 @@ impl WebDb {
         Ok(())
     }
 
+    /// Drop every live session for a user. Called whenever credentials, role or
+    /// 2FA enrolment change so a stolen cookie cannot outlive the change.
+    pub fn delete_user_sessions(&self, user_id: i64) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "DELETE FROM web_sessions WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM web_pending_2fa WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_owners(&self) -> Result<i64> {
+        let conn = self.lock_conn();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM web_users WHERE role = 'owner' AND active = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    // ------------------------------------------------------ login throttling
+
+    /// Seconds until the account may try again, or `None` when it is not locked.
+    pub fn login_lockout_remaining(&self, username: &str) -> Result<Option<i64>> {
+        let conn = self.lock_conn();
+        let locked: Option<Option<String>> = conn
+            .query_row(
+                "SELECT locked_until FROM web_users WHERE username = ?1 COLLATE NOCASE",
+                params![username],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(Some(raw)) = locked else {
+            return Ok(None);
+        };
+        let until = chrono::DateTime::parse_from_rfc3339(&raw)
+            .map(|d| d.with_timezone(&Utc))
+            .ok();
+        match until {
+            Some(t) if t > Utc::now() => Ok(Some((t - Utc::now()).num_seconds().max(1))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Increment the failure counter and lock the account once `threshold` is
+    /// reached. Returns the lock duration in seconds when the account just got
+    /// locked.
+    pub fn record_login_failure(
+        &self,
+        username: &str,
+        threshold: i64,
+        lock_secs: i64,
+    ) -> Result<Option<i64>> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE web_users SET failed_attempts = failed_attempts + 1
+             WHERE username = ?1 COLLATE NOCASE",
+            params![username],
+        )?;
+        let attempts: Option<i64> = conn
+            .query_row(
+                "SELECT failed_attempts FROM web_users WHERE username = ?1 COLLATE NOCASE",
+                params![username],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if attempts.unwrap_or(0) >= threshold {
+            let until = Utc::now() + chrono::Duration::seconds(lock_secs);
+            conn.execute(
+                "UPDATE web_users SET locked_until = ?2, failed_attempts = 0
+                 WHERE username = ?1 COLLATE NOCASE",
+                params![username, until.to_rfc3339()],
+            )?;
+            return Ok(Some(lock_secs));
+        }
+        Ok(None)
+    }
+
+    pub fn clear_login_failures(&self, user_id: i64) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE web_users SET failed_attempts = 0, locked_until = NULL WHERE id = ?1",
+            params![user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count a wrong OTP for a pending challenge. Returns the running total so
+    /// the caller can invalidate the challenge after `max` attempts.
+    pub fn bump_pending_2fa_attempts(&self, token_hash: &str) -> Result<i64> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE web_pending_2fa SET attempts = attempts + 1 WHERE token_hash = ?1",
+            params![token_hash],
+        )?;
+        let n: Option<i64> = conn
+            .query_row(
+                "SELECT attempts FROM web_pending_2fa WHERE token_hash = ?1",
+                params![token_hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(n.unwrap_or(0))
+    }
+
+    /// Resolve session → user → grants in a single round-trip. This is the hot
+    /// path for every admin request, so it must not fan out into four queries.
+    pub fn session_principal(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(UserRow, Vec<String>, Vec<String>)>> {
+        let conn = self.lock_conn();
+        let row = conn
+            .query_row(
+                "SELECT u.id, u.username, u.display_name, u.role, u.active, u.created_at,
+                        u.last_login, u.totp_enabled, u.two_fa_policy,
+                        (SELECT COUNT(*) FROM web_passkeys p WHERE p.user_id = u.id),
+                        (SELECT GROUP_CONCAT(repo, char(31)) FROM web_repo_perms r WHERE r.user_id = u.id),
+                        (SELECT GROUP_CONCAT(command, char(31)) FROM web_command_perms c WHERE c.user_id = u.id),
+                        s.expires_at
+                 FROM web_sessions s JOIN web_users u ON u.id = s.user_id
+                 WHERE s.token_hash = ?1",
+                params![token_hash],
+                |r| {
+                    let user = UserRow {
+                        id: r.get(0)?,
+                        username: r.get(1)?,
+                        display_name: r.get(2)?,
+                        role: r.get(3)?,
+                        active: r.get::<_, i64>(4)? == 1,
+                        created_at: r.get(5)?,
+                        last_login: r.get(6)?,
+                        totp_enabled: r.get::<_, i64>(7)? == 1,
+                        two_fa_policy: r.get(8)?,
+                        passkey_count: r.get(9)?,
+                    };
+                    let repos: Option<String> = r.get(10)?;
+                    let commands: Option<String> = r.get(11)?;
+                    let expires_at: String = r.get(12)?;
+                    Ok((user, split_grants(repos), split_grants(commands), expires_at))
+                },
+            )
+            .optional()?;
+
+        let Some((user, repos, commands, expires_at)) = row else {
+            return Ok(None);
+        };
+
+        let expired = chrono::DateTime::parse_from_rfc3339(&expires_at)
+            .map(|d| d.with_timezone(&Utc) < Utc::now())
+            .unwrap_or(true);
+        if expired {
+            conn.execute(
+                "DELETE FROM web_sessions WHERE token_hash = ?1",
+                params![token_hash],
+            )?;
+            return Ok(None);
+        }
+        if !user.active {
+            return Ok(None);
+        }
+        Ok(Some((user, repos, commands)))
+    }
+
+    /// All repo grants in one query, keyed by user id — avoids the N+1 on the
+    /// users page.
+    pub fn repo_perms_all(&self) -> Result<HashMap<i64, Vec<String>>> {
+        let conn = self.lock_conn();
+        let mut stmt =
+            conn.prepare("SELECT user_id, repo FROM web_repo_perms ORDER BY user_id, repo")?;
+        let mut map: HashMap<i64, Vec<String>> = HashMap::new();
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (uid, repo) = row?;
+            map.entry(uid).or_default().push(repo);
+        }
+        Ok(map)
+    }
+
+    pub fn command_perms_all(&self) -> Result<HashMap<i64, Vec<String>>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare("SELECT user_id, command FROM web_command_perms ORDER BY user_id, command")?;
+        let mut map: HashMap<i64, Vec<String>> = HashMap::new();
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (uid, cmd) = row?;
+            map.entry(uid).or_default().push(cmd);
+        }
+        Ok(map)
+    }
+
     // --------------------------------------------------------- 2FA: TOTP
 
     pub fn get_totp_secret(&self, user_id: i64) -> Result<Option<(String, bool)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let row = conn
             .query_row(
                 "SELECT totp_secret, totp_enabled FROM web_users WHERE id = ?1",
@@ -519,7 +789,7 @@ impl WebDb {
     }
 
     pub fn activate_totp(&self, user_id: i64, secret: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "UPDATE web_users SET totp_secret = ?2, totp_enabled = 1 WHERE id = ?1",
             params![user_id, secret],
@@ -528,7 +798,7 @@ impl WebDb {
     }
 
     pub fn disable_totp(&self, user_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "UPDATE web_users SET totp_secret = '', totp_enabled = 0 WHERE id = ?1",
             params![user_id],
@@ -537,22 +807,30 @@ impl WebDb {
     }
 
     pub fn reset_user_2fa(&self, user_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE web_users SET totp_secret = '', totp_enabled = 0 WHERE id = ?1",
             params![user_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM web_passkeys WHERE user_id = ?1",
             params![user_id],
         )?;
+        // Reset means "the old factor is gone" — force a fresh login so a
+        // session created with the removed factor cannot linger.
+        tx.execute(
+            "DELETE FROM web_sessions WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
     // --------------------------------------------------------- 2FA: Passkeys
 
     pub fn list_user_passkeys(&self, user_id: i64) -> Result<Vec<PasskeyRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT id, user_id, credential_id, device_name, passkey_json, counter, created_at, last_used_at
              FROM web_passkeys WHERE user_id = ?1 ORDER BY id DESC",
@@ -564,7 +842,7 @@ impl WebDb {
     }
 
     pub fn list_all_passkeys(&self) -> Result<Vec<PasskeyRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT id, user_id, credential_id, device_name, passkey_json, counter, created_at, last_used_at
              FROM web_passkeys ORDER BY id DESC",
@@ -583,7 +861,7 @@ impl WebDb {
         passkey_json: &str,
         counter: i64,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO web_passkeys (user_id, credential_id, device_name, passkey_json, counter, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -605,7 +883,7 @@ impl WebDb {
         counter: i64,
         passkey_json: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "UPDATE web_passkeys SET counter = ?2, passkey_json = ?3, last_used_at = ?4
              WHERE credential_id = ?1",
@@ -620,7 +898,7 @@ impl WebDb {
     }
 
     pub fn delete_passkey(&self, id: i64, user_id: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let affected = conn.execute(
             "DELETE FROM web_passkeys WHERE id = ?1 AND user_id = ?2",
             params![id, user_id],
@@ -638,7 +916,7 @@ impl WebDb {
         ip: &str,
         user_agent: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let now = Utc::now();
         let expires = now + chrono::Duration::hours(ttl_hours);
         conn.execute(
@@ -658,7 +936,7 @@ impl WebDb {
 
     /// Returns the user for a live session token hash, purging it when expired.
     pub fn session_user(&self, token_hash: &str) -> Result<Option<UserRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let found: Option<(String, i64)> = conn
             .query_row(
                 "SELECT expires_at, user_id FROM web_sessions WHERE token_hash = ?1",
@@ -691,7 +969,7 @@ impl WebDb {
     }
 
     pub fn delete_session(&self, token_hash: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "DELETE FROM web_sessions WHERE token_hash = ?1",
             params![token_hash],
@@ -700,7 +978,7 @@ impl WebDb {
     }
 
     pub fn purge_sessions(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "DELETE FROM web_sessions WHERE expires_at < ?1",
@@ -723,7 +1001,7 @@ impl WebDb {
         ip: &str,
         user_agent: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let now = Utc::now();
         let expires = now + chrono::Duration::minutes(5);
         conn.execute(
@@ -747,7 +1025,7 @@ impl WebDb {
     }
 
     pub fn get_pending_2fa(&self, token_hash: &str) -> Result<Option<(UserRow, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let found: Option<(String, i64, String)> = conn
             .query_row(
                 "SELECT expires_at, user_id, next_url FROM web_pending_2fa WHERE token_hash = ?1",
@@ -782,7 +1060,7 @@ impl WebDb {
     pub fn consume_pending_2fa(&self, token_hash: &str) -> Result<Option<(UserRow, String)>> {
         let res = self.get_pending_2fa(token_hash)?;
         if res.is_some() {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.lock_conn();
             let _ = conn.execute(
                 "DELETE FROM web_pending_2fa WHERE token_hash = ?1",
                 params![token_hash],
@@ -794,7 +1072,7 @@ impl WebDb {
     // --------------------------------------------------------------- perms
 
     pub fn set_repo_perms(&self, user_id: i64, repos: &[String]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM web_repo_perms WHERE user_id = ?1",
@@ -811,7 +1089,7 @@ impl WebDb {
     }
 
     pub fn repo_perms(&self, user_id: i64) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt =
             conn.prepare("SELECT repo FROM web_repo_perms WHERE user_id = ?1 ORDER BY repo")?;
         let rows = stmt
@@ -821,7 +1099,7 @@ impl WebDb {
     }
 
     pub fn set_command_perms(&self, user_id: i64, commands: &[String]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM web_command_perms WHERE user_id = ?1",
@@ -838,7 +1116,7 @@ impl WebDb {
     }
 
     pub fn command_perms(&self, user_id: i64) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn
             .prepare("SELECT command FROM web_command_perms WHERE user_id = ?1 ORDER BY command")?;
         let rows = stmt
@@ -858,12 +1136,18 @@ impl WebDb {
         ip: &str,
         ok: bool,
     ) {
-        if action != "security.log_settings" && !crate::security_log::current_settings().admin_audit
-        {
+        // Authentication and privilege changes are always recorded: letting the
+        // toggle silence them would be an anti-forensics switch for an attacker
+        // who already holds an admin account.
+        let always = action.starts_with("login")
+            || action.starts_with("2fa.")
+            || action.starts_with("user.")
+            || action.starts_with("security.");
+        if !always && !crate::security_log::current_settings().admin_audit {
             return;
         }
         // Audit must never take down a request path.
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let _ = conn.execute(
             "INSERT INTO web_audit (ts, username, action, target, detail, ip, ok)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -893,7 +1177,7 @@ impl WebDb {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<AuditRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut sql =
             "SELECT id, ts, username, action, target, detail, ip, ok FROM web_audit WHERE 1=1"
                 .to_string();
@@ -962,7 +1246,7 @@ impl WebDb {
     }
 
     pub fn count_audit_filtered(&self, filter: &AuditFilter) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut sql = "SELECT COUNT(*) FROM web_audit WHERE 1=1".to_string();
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -1036,7 +1320,7 @@ impl WebDb {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<SecurityHttpRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut sql = "SELECT id, ts, direction, method, target, status, duration_ms, ip, actor, detail FROM security_http_logs WHERE 1=1".to_string();
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -1127,7 +1411,7 @@ impl WebDb {
         direction: Option<&str>,
         filter: &SecurityHttpFilter,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut sql = "SELECT COUNT(*) FROM security_http_logs WHERE 1=1".to_string();
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -1196,7 +1480,7 @@ impl WebDb {
     /// Deletes security HTTP log rows older than `days` days; returns the number removed.
     pub fn purge_security_http_logs(&self, days: i64) -> Result<usize> {
         let cutoff = (Utc::now() - chrono::Duration::days(days.max(0))).to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let n = conn.execute(
             "DELETE FROM security_http_logs WHERE ts < ?1",
             params![cutoff],
@@ -1225,6 +1509,16 @@ pub fn normalize_policy(raw: &str) -> &'static str {
         "disabled" | "exempt" | "false" | "0" => "disabled",
         _ => "default",
     }
+}
+
+fn split_grants(raw: Option<String>) -> Vec<String> {
+    raw.map(|s| {
+        s.split('\u{1f}')
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn map_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
