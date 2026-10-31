@@ -15,7 +15,7 @@ pub mod ui;
 use crate::config::SugieConfig;
 use crate::triage::TriageService;
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{ConnectInfo, Extension, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{
@@ -49,6 +49,9 @@ pub struct WebState {
     pub jobs: Arc<JobRegistry>,
     pub stats: Arc<StatsCache>,
     pub passkey: passkey::PasskeyManager,
+    /// Bounds concurrent Argon2 verifications so a login flood cannot exhaust the
+    /// blocking pool (and with it webhook ingestion).
+    pub login_permits: Arc<tokio::sync::Semaphore>,
     pub shutdown: Arc<tokio::sync::Notify>,
     pub started_at: DateTime<Utc>,
 }
@@ -78,6 +81,7 @@ impl WebState {
             jobs: Arc::new(JobRegistry::default()),
             stats: Arc::new(StatsCache::default()),
             passkey,
+            login_permits: Arc::new(tokio::sync::Semaphore::new(4)),
             shutdown,
             started_at: Utc::now(),
         })
@@ -106,6 +110,7 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/security/totp/activate", post(totp_activate))
         .route("/admin/security/totp/disable", post(totp_disable))
         .route("/admin/security/passkey/delete", post(passkey_delete))
+        .route("/admin/security/password", post(change_password))
         .route(
             "/admin/api/passkey/register/start",
             post(api_passkey_register_start),
@@ -125,6 +130,7 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/api/exec", post(api_exec))
         .route("/admin/api/jobs/{id}", get(api_job))
         .route("/admin/api/jobs/{id}/stream", get(api_job_stream))
+        .route("/admin/api/jobs/{id}/cancel", post(api_job_cancel))
         .route("/admin/api/stats", get(api_stats))
         .route("/admin/config/structured", post(save_structured))
         .route("/admin/config/toml", post(save_toml))
@@ -145,7 +151,6 @@ pub fn router(state: WebState) -> Router {
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
-
 
 // ------------------------------------------------------------- middleware
 
@@ -252,7 +257,6 @@ async fn security_headers(req: Request, next: Next) -> Response {
     resp
 }
 
-
 /// Parse an optional integer form field, recording a human-readable error when it
 /// is present but out of range or not a number.
 fn parse_int_field(
@@ -309,6 +313,26 @@ fn html(view: impl IntoView + 'static) -> Response {
 
 fn redirect(to: &str) -> Response {
     Redirect::to(to).into_response()
+}
+
+/// Constrain a post-login redirect to an in-console path.
+///
+/// A prefix test alone is not enough: `/admin/../x` passes `starts_with("/admin")`
+/// and the browser then normalises it to `/x`. That stays same-origin, so it is
+/// not an open redirect, but it does silently drop the visitor outside the
+/// console — so reject any `..` segment, any backslash and any control character.
+fn safe_next(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let allowed = trimmed.starts_with("/admin")
+        && !trimmed.starts_with("/admin/login")
+        && !trimmed.contains("..")
+        && !trimmed.contains('\\')
+        && !trimmed.chars().any(char::is_control);
+    if allowed {
+        trimmed.to_string()
+    } else {
+        "/admin".to_string()
+    }
 }
 
 /// Resolves the signed-in user even when first-login 2FA enrollment is pending.
@@ -380,7 +404,41 @@ async fn login_submit(
         .unwrap_or("")
         .to_string();
 
-    match auth::login(&state.db, form.username.trim(), &form.password, &ip, &ua) {
+    // Argon2id runs on the blocking pool: inline it would stall every other task
+    // (webhook ingestion included) for the tens of ms each verification takes.
+    let db = state.db.clone();
+    let username = form.username.trim().to_string();
+    let password = form.password.clone();
+    let ip_task = ip.clone();
+    let ua_task = ua.clone();
+    let permit = match state.login_permits.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return html(pages::login_page(
+                Some("Login is temporarily unavailable, please retry".to_string()),
+                form.next,
+                None,
+            ))
+        }
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        auth::login(&db, &username, &password, &ip_task, &ua_task)
+    })
+    .await;
+    let outcome = match outcome {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("admin login task failed: {e}");
+            return html(pages::login_page(
+                Some("Login failed, please try again".to_string()),
+                form.next,
+                None,
+            ));
+        }
+    };
+
+    match outcome {
         Ok(auth::LoginOutcome::Session(token)) => {
             state
                 .db
@@ -395,13 +453,14 @@ async fn login_submit(
                 .unwrap_or(false);
             let next = if needs_setup {
                 "/admin/security?setup=1".to_string()
-            } else if form.next.starts_with("/admin") && !form.next.starts_with("/admin/login") {
-                form.next
             } else {
-                "/admin".to_string()
+                safe_next(&form.next)
             };
             let mut resp = redirect(&next);
-            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&token, auth::is_secure_request(&headers))) {
+            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(
+                &token,
+                auth::is_secure_request(&headers),
+            )) {
                 resp.headers_mut().append(header::SET_COOKIE, value);
             }
             resp
@@ -549,14 +608,12 @@ async fn login_2fa_submit(
                 &ip,
                 true,
             );
-            let next = if form.next.starts_with("/admin") && !form.next.starts_with("/admin/login")
-            {
-                form.next
-            } else {
-                "/admin".to_string()
-            };
+            let next = safe_next(&form.next);
             let mut resp = redirect(&next);
-            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&session_token, auth::is_secure_request(&headers))) {
+            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(
+                &session_token,
+                auth::is_secure_request(&headers),
+            )) {
                 resp.headers_mut().append(header::SET_COOKIE, value);
             }
             resp
@@ -573,42 +630,68 @@ async fn login_2fa_submit(
 }
 
 async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
-    if let Some(token) = auth::cookie_value(&headers) {
+    // Delete every session token presented, not just the first: a request can
+    // carry both cookie names, and both sessions must die.
+    for token in auth::cookie_tokens(&headers) {
         let _ = state.db.delete_session(&auth::token_hash(&token));
     }
     let mut resp = redirect("/admin/login");
-    if let Ok(value) = HeaderValue::from_str(&auth::clear_cookie(auth::is_secure_request(&headers))) {
-        resp.headers_mut().append(header::SET_COOKIE, value);
+    for cookie in auth::clear_cookie(auth::is_secure_request(&headers)) {
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(header::SET_COOKIE, value);
+        }
     }
     resp
 }
 
-async fn dashboard(State(state): State<WebState>, headers: HeaderMap) -> Response {
-    let user = match gate(&state, &headers) {
-        Ok(u) => u,
-        Err(r) => return r,
-    };
-    let mut repos = state
-        .triage
-        .storage()
-        .list_repositories()
-        .unwrap_or_default();
-    if repos.is_empty() {
-        if let Ok(synced) = state.triage.sync_all_repositories().await {
-            repos = synced;
-        }
-    }
-    if let Some(ref allowed) = state.config.notifications.allowed_repositories {
-        for r in allowed {
-            if !repos
-                .iter()
-                .any(|(_, name, _)| name.eq_ignore_ascii_case(r))
-            {
-                repos.push((0, r.clone(), 0));
-            }
-        }
-    }
+#[derive(Deserialize, Default)]
+struct RefreshQuery {
+    #[serde(default)]
+    refresh: String,
+    /// Flash payload written by `flash_to` (same `?msg=…&ok=0|1` convention).
+    #[serde(default)]
+    msg: Option<String>,
+    #[serde(default)]
+    ok: Option<String>,
+}
 
+/// Builds repository cards from the stats cache without awaiting GitHub, and
+/// spawns a background refresh for every entry that is missing or older than
+/// `stats::TTL` so the next page view is already warm.
+fn cached_cards(state: &WebState, repos: &[(u64, String, u64)]) -> Vec<pages::RepoCard> {
+    let mut cards = Vec::with_capacity(repos.len());
+    for (_, name, inst) in repos.iter() {
+        let cached = state.stats.get_any(name);
+        let stale = match &cached {
+            Some((_, age)) => *age >= stats::TTL,
+            None => true,
+        };
+        if stale && state.stats.claim_refresh(name) {
+            let triage = state.triage.clone();
+            let cache = state.stats.clone();
+            let name = name.clone();
+            tokio::spawn(async move {
+                let _claim = stats::RefreshClaim::new(cache.clone(), &name);
+                stats::fetch(&triage, &cache, &name, false).await;
+            });
+        }
+        cards.push(pages::RepoCard {
+            full_name: name.clone(),
+            installation_id: *inst,
+            stats: cached.map(|(s, _)| s),
+        });
+    }
+    cards.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    cards
+}
+
+/// Blocking variant used by the explicit `?refresh=1` action: awaits every
+/// repository's stats (in parallel) before the page is rendered.
+async fn fetch_cards(
+    state: &WebState,
+    repos: &[(u64, String, u64)],
+    force: bool,
+) -> Vec<pages::RepoCard> {
     let mut set = tokio::task::JoinSet::new();
     for (_, name, inst) in repos.iter() {
         let triage = state.triage.clone();
@@ -616,7 +699,7 @@ async fn dashboard(State(state): State<WebState>, headers: HeaderMap) -> Respons
         let name = name.clone();
         let inst = *inst;
         set.spawn(async move {
-            let stats = stats::fetch(&triage, &cache, &name, false).await;
+            let stats = stats::fetch(&triage, &cache, &name, force).await;
             pages::RepoCard {
                 full_name: name,
                 installation_id: inst,
@@ -624,7 +707,6 @@ async fn dashboard(State(state): State<WebState>, headers: HeaderMap) -> Respons
             }
         });
     }
-
     let mut cards = Vec::new();
     while let Some(res) = set.join_next().await {
         if let Ok(card) = res {
@@ -632,6 +714,36 @@ async fn dashboard(State(state): State<WebState>, headers: HeaderMap) -> Respons
         }
     }
     cards.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    cards
+}
+
+async fn dashboard(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<RefreshQuery>,
+) -> Response {
+    let user = match gate(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let mut repos = all_repo_rows(&state);
+    // Only an admin may trigger a global sync: a maintainer with no grants must
+    // not burn the App's API quota just by loading an empty dashboard.
+    if repos.is_empty() && user.is_admin() {
+        if let Ok(synced) = state.triage.sync_all_repositories().await {
+            repos = synced;
+        }
+    }
+    let repos = filter_repo_rows(&user, repos);
+
+    // `?refresh=1` is the explicit refresh action, so blocking is correct there.
+    // Every other load renders whatever the cache holds and warms it in the
+    // background, so a cold cache never delays the landing page.
+    let cards = if query.refresh == "1" && user.is_admin() {
+        fetch_cards(&state, &repos, true).await
+    } else {
+        cached_cards(&state, &repos)
+    };
 
     let totals = pages::Totals {
         repos: repos.len(),
@@ -650,67 +762,71 @@ async fn dashboard(State(state): State<WebState>, headers: HeaderMap) -> Respons
             .filter_map(|c| c.stats.as_ref())
             .map(|s| s.commits_30d)
             .sum(),
+        failed: cards
+            .iter()
+            .filter_map(|c| c.stats.as_ref())
+            .filter(|s| !s.is_ok())
+            .count(),
     };
 
     let summary = ConfigSummary::from_config(&state.config);
-    html(pages::dashboard_page(user, cards, totals, summary, None))
+    // Nudge rather than redirect: a fresh install defaults to 2FA off so the
+    // first owner can actually use the console, but it must be visible that the
+    // installation is unprotected.
+    let security_notice = if user.can_manage() && !state.db.is_global_2fa_enabled() {
+        Some(
+            "Two-factor authentication is not required for this installation. \
+             Enable it in Security to protect admin accounts."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    html(pages::dashboard_page(
+        user,
+        cards,
+        totals,
+        summary,
+        None,
+        security_notice,
+    ))
 }
 
-async fn repos_page(State(state): State<WebState>, headers: HeaderMap) -> Response {
+async fn repos_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<RefreshQuery>,
+) -> Response {
     let user = match gate(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
-    let mut repos = state
-        .triage
-        .storage()
-        .list_repositories()
-        .unwrap_or_default();
-    if repos.is_empty() {
+    let mut repos = all_repo_rows(&state);
+    if repos.is_empty() && user.is_admin() {
         if let Ok(synced) = state.triage.sync_all_repositories().await {
             repos = synced;
         }
     }
-    if let Some(ref allowed) = state.config.notifications.allowed_repositories {
-        for r in allowed {
-            if !repos
-                .iter()
-                .any(|(_, name, _)| name.eq_ignore_ascii_case(r))
-            {
-                repos.push((0, r.clone(), 0));
-            }
-        }
-    }
+    let repos = filter_repo_rows(&user, repos);
 
-    let mut set = tokio::task::JoinSet::new();
-    // Show all connected repositories without truncation
-    for (_, name, inst) in repos.iter() {
-        let triage = state.triage.clone();
-        let cache = state.stats.clone();
-        let name = name.clone();
-        let inst = *inst;
-        set.spawn(async move {
-            let stats = stats::fetch(&triage, &cache, &name, false).await;
-            pages::RepoCard {
-                full_name: name,
-                installation_id: inst,
-                stats: Some(stats),
-            }
-        });
-    }
-    let mut cards = Vec::new();
-    while let Some(res) = set.join_next().await {
-        if let Ok(card) = res {
-            cards.push(card);
-        }
-    }
-    cards.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    let cards = if query.refresh == "1" && user.is_admin() {
+        fetch_cards(&state, &repos, true).await
+    } else {
+        cached_cards(&state, &repos)
+    };
 
-    html(pages::repos_page(user, cards))
+    let flash = query
+        .msg
+        .as_ref()
+        .map(|m| (query.ok.as_deref().unwrap_or("1") == "1", m.clone()));
+
+    html(pages::repos_page(user, cards, flash))
 }
 
 async fn sync_repos(State(state): State<WebState>, headers: HeaderMap) -> Response {
-    let user = match gate(&state, &headers) {
+    // A global sync writes to the DB and spends the App's API quota — read-only
+    // accounts must not trigger it.
+    let user = match gate_admin(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
@@ -728,6 +844,11 @@ async fn sync_repos(State(state): State<WebState>, headers: HeaderMap) -> Respon
                 &ip,
                 true,
             );
+            flash_to(
+                "/admin/repos",
+                true,
+                &format!("Synced {} repositories from GitHub", synced.len()),
+            )
         }
         Err(e) => {
             state.db.audit(
@@ -738,15 +859,21 @@ async fn sync_repos(State(state): State<WebState>, headers: HeaderMap) -> Respon
                 &ip,
                 false,
             );
+            flash_to(
+                "/admin/repos",
+                false,
+                &format!("Repository sync failed: {e}"),
+            )
         }
     }
-    redirect("/admin/repos")
 }
 
 #[derive(Deserialize, Default)]
 struct ChatQuery {
     #[serde(default)]
     repo: String,
+    #[serde(default)]
+    refresh: String,
 }
 
 async fn chat_page(
@@ -758,16 +885,44 @@ async fn chat_page(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let repos = all_repos(&state);
+    let repos = user.visible_repos(&all_repos(&state));
 
+    // Never default to a repository the caller cannot see; fall back to the first
+    // visible one, or to an empty state when they have no grants at all.
     let selected = if query.repo.is_empty() {
         repos.first().cloned().unwrap_or_default()
-    } else {
+    } else if repos.iter().any(|r| r.eq_ignore_ascii_case(&query.repo)) {
         query.repo
+    } else {
+        repos.first().cloned().unwrap_or_default()
+    };
+
+    // Stats strip: same cache-first pattern as the dashboard, so the chat never
+    // waits on GitHub unless the user explicitly asks for a refresh.
+    let stats = if selected.is_empty() {
+        None
+    } else if query.refresh == "1" && user.is_admin() {
+        Some(stats::fetch(&state.triage, &state.stats, &selected, true).await)
+    } else {
+        let cached = state.stats.get_any(&selected);
+        let stale = match &cached {
+            Some((_, age)) => *age >= stats::TTL,
+            None => true,
+        };
+        if stale && state.stats.claim_refresh(&selected) {
+            let triage = state.triage.clone();
+            let cache = state.stats.clone();
+            let name = selected.clone();
+            tokio::spawn(async move {
+                let _claim = stats::RefreshClaim::new(cache.clone(), &name);
+                stats::fetch(&triage, &cache, &name, false).await;
+            });
+        }
+        cached.map(|(s, _)| s)
     };
 
     let history = state.jobs.recent_for(&user.username, 20);
-    html(pages::chat_page(user, repos, selected, history))
+    html(pages::chat_page(user, repos, selected, history, stats))
 }
 
 async fn config_page(
@@ -923,6 +1078,113 @@ struct TotpActivateForm {
     code: String,
 }
 
+#[derive(Deserialize)]
+struct ChangePasswordForm {
+    current: String,
+    new_password: String,
+    confirm: String,
+}
+
+/// Self-service password change.
+///
+/// An admin-set password is known to the admin, so the account holder must be
+/// able to rotate it without asking anyone. Rotating the session as well means a
+/// cookie stolen before the change stops working.
+async fn change_password(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<ChangePasswordForm>,
+) -> Response {
+    // `gate_allow_setup`: a user still being forced through 2FA enrolment must
+    // be able to change a password that an admin handed them.
+    let user = match gate_allow_setup(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let ip = auth::client_ip(&headers);
+
+    let Some(stored) = state.db.password_hash(user.id).ok().flatten() else {
+        return security_flash(false, "Password login is not configured for this account");
+    };
+
+    if !auth::verify_password_async(form.current.clone(), stored).await {
+        state.db.audit(
+            &user.username,
+            "security.password",
+            "-",
+            "Password change rejected: current password incorrect",
+            &ip,
+            false,
+        );
+        return security_flash(false, "Current password is incorrect");
+    }
+
+    let new_password = form.new_password;
+    // Count characters, not bytes: six CJK characters are 18 bytes but only six
+    // characters, and an all-whitespace password is no password at all.
+    if new_password.chars().count() < 10 {
+        return security_flash(false, "New password must be at least 10 characters");
+    }
+    if new_password.trim().is_empty() {
+        return security_flash(false, "New password cannot be blank");
+    }
+    if new_password != form.confirm {
+        return security_flash(false, "New password and confirmation do not match");
+    }
+    if new_password
+        .trim()
+        .eq_ignore_ascii_case(user.username.trim())
+    {
+        return security_flash(false, "Password must not be your username");
+    }
+
+    let hash = match auth::hash_password_async(new_password).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("password change hashing failed: {e}");
+            return security_flash(false, "Could not update the password");
+        }
+    };
+
+    if let Err(e) = state.db.set_password(user.id, &hash) {
+        tracing::error!("password change failed: {e}");
+        return security_flash(false, "Could not update the password");
+    }
+
+    // Every session for this account dies, including the caller's; a fresh one
+    // is minted below so the user stays signed in on this device only.
+    let _ = state.db.delete_user_sessions(user.id);
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    state.db.audit(
+        &user.username,
+        "security.password",
+        "-",
+        "Password changed by the account holder",
+        &ip,
+        true,
+    );
+
+    let mut resp = security_flash(true, "Password updated. Other sessions were signed out.");
+    match auth::mint_session_for_user(&state.db, user.id, &ip, &ua) {
+        Ok(token) => {
+            let secure = auth::is_secure_request(&headers);
+            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&token, secure)) {
+                resp.headers_mut().append(header::SET_COOKIE, value);
+            }
+        }
+        Err(e) => {
+            tracing::error!("re-minting session after password change failed: {e}");
+            return redirect("/admin/login");
+        }
+    }
+    resp
+}
+
 async fn totp_activate(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -989,7 +1251,7 @@ async fn totp_disable(
     let Some(hash) = state.db.password_hash(user.id).ok().flatten() else {
         return security_flash(false, "Unable to verify account password");
     };
-    if !auth::verify_password(&form.password, &hash) {
+    if !auth::verify_password_async(form.password, hash).await {
         state.db.audit(
             &user.username,
             "2fa.totp.disable",
@@ -1179,8 +1441,26 @@ struct PasskeyAuthStartReq {
 
 async fn api_passkey_auth_start(
     State(state): State<WebState>,
+    // axum 0.8 has no optional `ConnectInfo` extractor; `Option<Extension<_>>`
+    // reads the same value but leaves the handler working when it is absent.
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
     Json(_req): Json<PasskeyAuthStartReq>,
 ) -> Response {
+    // Unauthenticated endpoint: throttle per source address so it cannot be used
+    // to flood the challenge map. The socket peer cannot be spoofed, so a
+    // forwarded header is only trusted when a local reverse proxy fronts us.
+    let source = match peer {
+        Some(Extension(ConnectInfo(addr))) if !addr.ip().is_loopback() => addr.ip().to_string(),
+        _ => auth::client_ip(&headers),
+    };
+    if !passkey::auth_start_allowed(&source) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many passkey attempts, please retry shortly" })),
+        )
+            .into_response();
+    }
     match state.passkey.start_discoverable_authentication() {
         Ok(rcr) => Json(json!({ "options": rcr })).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
@@ -1343,7 +1623,10 @@ async fn api_passkey_auth_finish(
                     "/admin".to_string()
                 };
             let mut resp = Json(json!({ "ok": true, "redirect": redirect_url })).into_response();
-            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&session_token, auth::is_secure_request(&headers))) {
+            if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(
+                &session_token,
+                auth::is_secure_request(&headers),
+            )) {
                 resp.headers_mut().append(header::SET_COOKIE, value);
             }
             resp
@@ -1520,6 +1803,10 @@ async fn save_audit_settings(
         Ok(u) => u,
         Err(r) => return r,
     };
+    // The audited admin must not be able to switch collection off.
+    if !user.is_owner() {
+        return forbidden("Only owners can change audit log collection settings");
+    }
     let tab = form
         .get("tab")
         .cloned()
@@ -1733,6 +2020,10 @@ async fn purge_audit_logs(
         Ok(u) => u,
         Err(r) => return r,
     };
+    // Purging is the audited admin's own trail — owners only.
+    if !user.is_owner() {
+        return forbidden("Only owners can purge the audit log");
+    }
     let tab = form
         .get("tab")
         .cloned()
@@ -1741,13 +2032,15 @@ async fn purge_audit_logs(
         .get("days")
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(-1);
-    if days < 0 {
+    if days < 1 {
         return redirect(&format!(
             "/admin/audit?tab={}&ok=0&msg={}",
             urlencode(&tab),
-            urlencode("Please enter a valid number of days (0 or more)")
+            urlencode("Please enter a retention of at least 1 day (maximum 3650)")
         ));
     }
+    // `days=0` would wipe the whole trail; cap the window too.
+    let days = days.min(3650);
     match state.db.purge_security_http_logs(days) {
         Ok(n) => {
             state.db.audit(
@@ -1923,10 +2216,36 @@ async fn api_exec(
             .into_response();
     }
 
-    match exec::dispatch(state.clone(), user, req.repo, req.command) {
+    let ip = auth::client_ip(&headers);
+    match exec::dispatch(state.clone(), user, req.repo, req.command, &ip) {
         Ok(job_id) => Json(json!({ "job_id": job_id })).into_response(),
-        Err(msg) => (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response(),
+        Err(msg) => {
+            // Only genuine authorisation failures are 403; unknown commands and
+            // other bad input are 400.
+            let status = if is_permission_error(&msg) {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(json!({ "error": msg }))).into_response()
+        }
     }
+}
+
+/// `exec::dispatch` reports denials as prose; classify them so the API can answer
+/// 403 instead of blaming the client's request.
+fn is_permission_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    [
+        "permission",
+        "not allowed",
+        "forbidden",
+        "denied",
+        "no access",
+        "restricted to admin",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Job output can contain repository names, config paths and installation ids,
@@ -1971,6 +2290,52 @@ async fn api_job(
     }
 }
 
+/// Stop a running job. Dropping the task at its next await point is the
+/// cooperative stop, so no command needs its own cancellation plumbing.
+async fn api_job_cancel(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let user = match gate(&state, &headers) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Unauthorized"})),
+            )
+                .into_response()
+        }
+    };
+    if !job_visible_to(&state, &user, &id) {
+        // 404 rather than 403: do not confirm that the job id exists.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Job not found"})),
+        )
+            .into_response();
+    }
+    match state.jobs.cancel(&id) {
+        Some((owner, repo, command)) => {
+            let ip = auth::client_ip(&headers);
+            state.db.audit(
+                &user.username,
+                "command_cancel",
+                &repo,
+                &format!("{command} (job {id}, owner {owner})"),
+                &ip,
+                true,
+            );
+            Json(json!({"ok": true, "status": "cancelled"})).into_response()
+        }
+        None => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "Job is not running"})),
+        )
+            .into_response(),
+    }
+}
+
 async fn api_job_stream(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -2005,7 +2370,11 @@ async fn api_job_stream(
                         yield Ok::<Event, Infallible>(Event::default().data(payload.to_string()));
                     }
                     if status != JobStatus::Running {
-                        let payload = json!({"done": true, "ok": status == JobStatus::Done});
+                        let payload = json!({
+                            "done": true,
+                            "ok": status == JobStatus::Done,
+                            "cancelled": status == JobStatus::Cancelled,
+                        });
                         yield Ok(Event::default().data(payload.to_string()));
                         break;
                     }
@@ -2099,7 +2468,15 @@ async fn save_structured(
     // `abc` into "port" must be an error, not a quiet write of 8800.
     let mut errors: Vec<String> = Vec::new();
     let port = parse_int_field(&form, "port", 8800, 1, 65535, "Port", &mut errors);
-    let stale_days = parse_int_field(&form, "stale_days", 60, 1, 3650, "Stale after (days)", &mut errors);
+    let stale_days = parse_int_field(
+        &form,
+        "stale_days",
+        60,
+        1,
+        3650,
+        "Stale after (days)",
+        &mut errors,
+    );
     let stale_interval = parse_int_field(
         &form,
         "stale_interval",
@@ -2109,8 +2486,15 @@ async fn save_structured(
         "Stale check interval (hours)",
         &mut errors,
     );
-    let reviewers_per_pr =
-        parse_int_field(&form, "reviewers_per_pr", 1, 1, 20, "Reviewers per PR", &mut errors);
+    let reviewers_per_pr = parse_int_field(
+        &form,
+        "reviewers_per_pr",
+        1,
+        1,
+        20,
+        "Reviewers per PR",
+        &mut errors,
+    );
     if !errors.is_empty() {
         return config_flash(false, &errors.join("; "));
     }
@@ -2122,10 +2506,7 @@ async fn save_structured(
 
     let mut patches: Vec<(String, config_store::Patch)> = vec![
         ("host".into(), config_store::Patch::Str(get("host"))),
-        (
-            "port".into(),
-            config_store::Patch::Int(port),
-        ),
+        ("port".into(), config_store::Patch::Int(port)),
         ("db_path".into(), config_store::Patch::Str(get("db_path"))),
         (
             "default_rules.commands.super_users".into(),
@@ -2367,25 +2748,42 @@ async fn restore_backup(
 
 // --------------------------------------------------------------- api: users
 
-fn all_repos(state: &WebState) -> Vec<String> {
-    let mut repos: Vec<String> = state
+/// Storage repositories unioned with `notifications.allowed_repositories`, with
+/// the installation id preserved so the dashboard can build cards.
+fn all_repo_rows(state: &WebState) -> Vec<(u64, String, u64)> {
+    let mut repos = state
         .triage
         .storage()
         .list_repositories()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(_, name, _)| name)
-        .collect();
+        .unwrap_or_default();
     if let Some(ref allowed) = state.config.notifications.allowed_repositories {
         for r in allowed {
             if !repos
                 .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(r))
+                .any(|(_, name, _)| name.eq_ignore_ascii_case(r))
             {
-                repos.push(r.clone());
+                repos.push((0, r.clone(), 0));
             }
         }
     }
+    repos
+}
+
+/// Drop every repository the caller is not granted (admins keep all of them).
+fn filter_repo_rows(user: &CurrentUser, repos: Vec<(u64, String, u64)>) -> Vec<(u64, String, u64)> {
+    let names: Vec<String> = repos.iter().map(|(_, name, _)| name.clone()).collect();
+    let visible = user.visible_repos(&names);
+    repos
+        .into_iter()
+        .filter(|(_, name, _)| visible.iter().any(|v| v.eq_ignore_ascii_case(name)))
+        .collect()
+}
+
+fn all_repos(state: &WebState) -> Vec<String> {
+    let mut repos: Vec<String> = all_repo_rows(state)
+        .into_iter()
+        .map(|(_, name, _)| name)
+        .collect();
     repos.sort();
     repos
 }
@@ -2462,12 +2860,15 @@ async fn create_user(
         return users_flash(false, "Only owners can create owner accounts");
     }
 
-    let hash = match auth::hash_password(&password) {
+    let hash = match auth::hash_password_async(password).await {
         Ok(h) => h,
         Err(e) => return users_flash(false, &format!("Password processing failed: {e}")),
     };
 
-    match state.db.create_user(&username, &hash, role.as_str(), &display) {
+    match state
+        .db
+        .create_user(&username, &hash, role.as_str(), &display)
+    {
         Ok(id) => {
             if actor.is_owner() && two_fa_policy != "default" {
                 let _ = state.db.set_user_two_fa_policy(id, &two_fa_policy);
@@ -2513,11 +2914,13 @@ async fn update_user(
     let Some(target) = state.db.get_user(id).ok().flatten() else {
         return users_flash(false, "User not found");
     };
-    if perms::Role::parse(&target.role) == perms::Role::Owner && !actor.is_owner() {
-        return users_flash(false, "Only owners can modify owner accounts");
+    let target_role = perms::Role::parse(&target.role);
+    // An admin must not be able to take over a peer admin (or an owner) by
+    // resetting their password or clearing their second factor.
+    if target_role >= perms::Role::Admin && !actor.is_owner() {
+        return forbidden("Only owners can modify admin or owner accounts");
     }
 
-    let target_role = perms::Role::parse(&target.role);
     let role = perms::Role::parse(
         form.get("role")
             .map(String::as_str)
@@ -2548,8 +2951,19 @@ async fn update_user(
         }
     }
 
+    // Validate the new password before anything is committed: a rejected value
+    // must not leave role / ACL / session changes applied.
+    if let Some(pw) = form.get("password") {
+        if !pw.is_empty() && pw.len() < 8 {
+            return users_flash(false, "Password must be at least 8 characters");
+        }
+    }
+
     let role_changed = role != target_role || active != target.active;
-    if let Err(e) = state.db.update_user_profile(id, role.as_str(), &display, active) {
+    if let Err(e) = state
+        .db
+        .update_user_profile(id, role.as_str(), &display, active)
+    {
         return users_flash(false, &format!("Failed to update user: {e}"));
     }
     if role_changed {
@@ -2560,7 +2974,8 @@ async fn update_user(
 
     if actor.is_owner() {
         if let Some(policy) = form.get("two_fa_policy") {
-            let _ = state.db
+            let _ = state
+                .db
                 .set_user_two_fa_policy(id, db::normalize_policy(policy));
         }
     }
@@ -2583,12 +2998,14 @@ async fn update_user(
     }
     if let Some(pw) = form.get("password") {
         if !pw.is_empty() {
-            if pw.len() < 8 {
-                return users_flash(false, "Password must be at least 8 characters");
-            }
-            match auth::hash_password(pw) {
+            match auth::hash_password_async(pw.clone()).await {
                 Ok(h) => {
                     let _ = state.db.set_password(id, &h);
+                    // Resetting someone else's password must not leave their old
+                    // sessions (or an attacker's) alive.
+                    if id != actor.id {
+                        let _ = state.db.delete_user_sessions(id);
+                    }
                 }
                 Err(e) => return users_flash(false, &format!("Password processing failed: {e}")),
             }
@@ -2660,8 +3077,10 @@ async fn reset_user_2fa(
     let Some(target) = state.db.get_user(id).ok().flatten() else {
         return users_flash(false, "User not found");
     };
-    if perms::Role::parse(&target.role) == perms::Role::Owner && !actor.is_owner() {
-        return users_flash(false, "Only owners can reset 2FA for owner accounts");
+    // Clearing 2FA on an admin (or owner) account is an account-takeover vector
+    // for a peer admin, so it stays owner-only.
+    if perms::Role::parse(&target.role) >= perms::Role::Admin && !actor.is_owner() {
+        return forbidden("Only owners can reset 2FA for admin or owner accounts");
     }
 
     match state.db.reset_user_2fa(id) {
@@ -2701,8 +3120,10 @@ async fn delete_user(
     let Some(target) = state.db.get_user(id).ok().flatten() else {
         return users_flash(false, "User not found");
     };
-    if perms::Role::parse(&target.role) == perms::Role::Owner && !actor.is_owner() {
-        return users_flash(false, "Only owners can delete owner accounts");
+    // Same rule as update_user / reset_user_2fa: an admin must not be able to
+    // remove a peer admin (or an owner).
+    if perms::Role::parse(&target.role) >= perms::Role::Admin && !actor.is_owner() {
+        return users_flash(false, "Only owners can delete admin or owner accounts");
     }
 
     match state.db.delete_user(id) {
@@ -2802,4 +3223,37 @@ async fn logo_svg() -> Response {
         assets::LOGO_SVG,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_next;
+
+    #[test]
+    fn safe_next_keeps_console_paths_and_rejects_the_rest() {
+        // Ordinary in-console targets survive untouched, query string included.
+        assert_eq!(safe_next("/admin/repos"), "/admin/repos");
+        assert_eq!(
+            safe_next("/admin/audit?tab=inbound"),
+            "/admin/audit?tab=inbound"
+        );
+        assert_eq!(safe_next("  /admin/users  "), "/admin/users");
+
+        // Off-site, protocol-relative and backslash forms all fall back.
+        assert_eq!(safe_next("https://evil.example/admin"), "/admin");
+        assert_eq!(safe_next("//evil.example"), "/admin");
+        assert_eq!(safe_next("/admin\\..\\evil"), "/admin");
+        assert_eq!(safe_next(""), "/admin");
+
+        // Regression for A4: the prefix test alone let this through, and the
+        // browser normalised it to `/x` — outside the console.
+        assert_eq!(safe_next("/admin/../x"), "/admin");
+        assert_eq!(safe_next("/admin/..%2f..%2fx"), "/admin");
+
+        // Re-authenticating must not bounce back to the login page.
+        assert_eq!(safe_next("/admin/login"), "/admin");
+
+        // Header-injection attempts are refused rather than reflected.
+        assert_eq!(safe_next("/admin/x\r\nSet-Cookie: a=b"), "/admin");
+    }
 }

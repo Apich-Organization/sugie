@@ -22,6 +22,13 @@ pub enum SlashCommand {
     Close(Option<String>),
     Reopen,
     Retest,
+    /// Rename the issue or PR (mirrors the console's `/title`).
+    Title(String),
+    /// Set the milestone by title or number, or clear it with `None`.
+    Milestone(Option<String>),
+    /// Lock the conversation, optionally with a GitHub lock reason.
+    Lock(Option<String>),
+    Unlock,
     Project {
         target: String,
         status: Option<String>,
@@ -49,6 +56,10 @@ impl SlashCommand {
             SlashCommand::Close(_) => "close",
             SlashCommand::Reopen => "reopen",
             SlashCommand::Retest => "retest",
+            SlashCommand::Title(_) => "title",
+            SlashCommand::Milestone(_) => "milestone",
+            SlashCommand::Lock(_) => "lock",
+            SlashCommand::Unlock => "unlock",
             SlashCommand::Project { .. } => "project",
             SlashCommand::Move { .. } => "move",
             SlashCommand::Duplicate(_) => "duplicate",
@@ -167,6 +178,43 @@ impl CommandParser {
                 }
                 "retest" => {
                     commands.push(SlashCommand::Retest);
+                }
+                "title" => {
+                    // The whole remainder is the new title, spaces included.
+                    let title = args.join(" ");
+                    let title = title.trim();
+                    if !title.is_empty() {
+                        commands.push(SlashCommand::Title(title.to_string()));
+                    }
+                }
+                "milestone" => {
+                    // Milestone titles can contain spaces ("v1.4 RC"), so take
+                    // everything; `none`/`clear`/`-` clears it. No argument at
+                    // all is a no-op rather than a silent clear.
+                    let raw = args.join(" ");
+                    let raw = raw.trim();
+                    if !raw.is_empty() {
+                        if matches!(
+                            raw.to_ascii_lowercase().as_str(),
+                            "none" | "clear" | "-" | "null"
+                        ) {
+                            commands.push(SlashCommand::Milestone(None));
+                        } else {
+                            commands.push(SlashCommand::Milestone(Some(raw.to_string())));
+                        }
+                    }
+                }
+                "lock" => {
+                    let reason = args.join(" ");
+                    let reason = reason.trim();
+                    commands.push(SlashCommand::Lock(if reason.is_empty() {
+                        None
+                    } else {
+                        Some(reason.to_string())
+                    }));
+                }
+                "unlock" => {
+                    commands.push(SlashCommand::Unlock);
                 }
                 "project" => {
                     if !args.is_empty() {
@@ -524,6 +572,150 @@ impl<'a> CommandExecutor<'a> {
                     )
                     .await?;
                 info!("Reopened {}#{}", repo_full_name, issue.number);
+            }
+            SlashCommand::Title(new_title) => {
+                let new_title = new_title.trim();
+                if new_title.is_empty() {
+                    return Ok(());
+                }
+                if new_title.chars().count() > 256 {
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            "⚠️ Titles are limited to 256 characters; nothing was changed.",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                self.client
+                    .set_issue_title(owner, repo, issue.number, new_title)
+                    .await?;
+                self.client
+                    .create_comment(
+                        owner,
+                        repo,
+                        issue.number,
+                        &format!(
+                            "✏️ Renamed by @{}: “{}” → “{}”.",
+                            sender.login, issue.title, new_title
+                        ),
+                    )
+                    .await?;
+                info!(
+                    "Renamed {}#{} to {:?}",
+                    repo_full_name, issue.number, new_title
+                );
+            }
+            SlashCommand::Milestone(target) => {
+                let Some(wanted) = target else {
+                    self.client
+                        .set_issue_milestone(owner, repo, issue.number, None)
+                        .await?;
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            &format!("🗓️ Milestone cleared by @{}.", sender.login),
+                        )
+                        .await?;
+                    info!("Cleared milestone on {}#{}", repo_full_name, issue.number);
+                    return Ok(());
+                };
+
+                let milestones = self.client.list_milestones(owner, repo).await?;
+                // Accept the title (case-insensitive) or the milestone number.
+                let found = milestones
+                    .iter()
+                    .find(|m| m.title.eq_ignore_ascii_case(wanted))
+                    .or_else(|| {
+                        wanted
+                            .trim_start_matches('#')
+                            .parse::<u64>()
+                            .ok()
+                            .and_then(|n| milestones.iter().find(|m| m.number == n))
+                    });
+
+                let Some(m) = found else {
+                    let mut body = format!(
+                        "⚠️ No open milestone matches “{}”. Nothing was changed.",
+                        wanted
+                    );
+                    if milestones.is_empty() {
+                        body.push_str("\n\nThis repository has no open milestones.");
+                    } else {
+                        body.push_str("\n\nAvailable milestones:");
+                        for m in milestones.iter().take(20) {
+                            body.push_str(&format!("\n- `#{}` {}", m.number, m.title));
+                        }
+                    }
+                    self.client
+                        .create_comment(owner, repo, issue.number, &body)
+                        .await?;
+                    return Ok(());
+                };
+
+                self.client
+                    .set_issue_milestone(owner, repo, issue.number, Some(m.number))
+                    .await?;
+                self.client
+                    .create_comment(
+                        owner,
+                        repo,
+                        issue.number,
+                        &format!("🗓️ Milestone set to “{}” by @{}.", m.title, sender.login),
+                    )
+                    .await?;
+                info!(
+                    "Set milestone {:?} on {}#{}",
+                    m.title, repo_full_name, issue.number
+                );
+            }
+            SlashCommand::Lock(reason) => {
+                let reason = match normalize_lock_reason(reason.as_deref()) {
+                    Ok(r) => r,
+                    Err(msg) => {
+                        self.client
+                            .create_comment(
+                                owner,
+                                repo,
+                                issue.number,
+                                &format!("⚠️ {} Nothing was changed.", msg),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                self.client
+                    .lock_issue(owner, repo, issue.number, reason)
+                    .await?;
+                self.client
+                    .create_comment(
+                        owner,
+                        repo,
+                        issue.number,
+                        &format!(
+                            "🔒 Conversation locked by @{}{}.",
+                            sender.login,
+                            reason.map(|r| format!(" ({r})")).unwrap_or_default()
+                        ),
+                    )
+                    .await?;
+                info!("Locked {}#{}", repo_full_name, issue.number);
+            }
+            SlashCommand::Unlock => {
+                self.client.unlock_issue(owner, repo, issue.number).await?;
+                self.client
+                    .create_comment(
+                        owner,
+                        repo,
+                        issue.number,
+                        &format!("🔓 Conversation unlocked by @{}.", sender.login),
+                    )
+                    .await?;
+                info!("Unlocked {}#{}", repo_full_name, issue.number);
             }
             SlashCommand::Retest => {
                 if issue.is_pr() {
@@ -1010,6 +1202,10 @@ You can trigger commands either with a slash (`/command`) or by mentioning the b
 | `/close [reason]` | `/close completed` | Closes issue or PR |
 | `/reopen` | `/reopen` | Reopens issue or PR |
 | `/retest` | `/retest` | Retests failed CI checks (PRs only) |
+| `/title <text>` | `/title Fix crash on Safari` | Renames the issue or PR (max 256 chars) |
+| `/milestone <name\|#num\|none>` | `/milestone v1.4` or `/milestone none` | Sets or clears the milestone |
+| `/lock [reason]` | `/lock too heated` | Locks the conversation (`off-topic`, `too heated`, `resolved`, `spam`) |
+| `/unlock` | `/unlock` | Unlocks the conversation |
 | `/project <num> [status]` | `/project 1 Triage` | Adds to GitHub Project v2 board |
 | `/move <target_repo>` | `/move org/new-repo` | Migrates issue across repositories |
 | `/duplicate <#num>` | `/duplicate #123` | Closes issue as duplicate of #123 |
@@ -1067,6 +1263,26 @@ You can trigger commands either with a slash (`/command`) or by mentioning the b
                 .or_else(|| r.pull_request.map(|p| p.id))
         });
         Ok(node_id)
+    }
+}
+
+/// Map a human-typed lock reason onto the values the GitHub API accepts.
+/// `Ok(None)` means "no reason given"; `Err` carries a message to show back to
+/// the commenter so a typo never costs a failed API call.
+fn normalize_lock_reason(raw: Option<&str>) -> std::result::Result<Option<&'static str>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "off-topic" | "offtopic" | "off topic" => Ok(Some("off-topic")),
+        "too heated" | "heated" | "too-heated" | "toohated" => Ok(Some("too heated")),
+        "resolved" => Ok(Some("resolved")),
+        "spam" => Ok(Some("spam")),
+        other => Err(format!(
+            "Unknown lock reason `{}`. Use `off-topic`, `too heated`, `resolved` or `spam`.",
+            other
+        )),
     }
 }
 
@@ -1174,5 +1390,56 @@ mod tests {
         );
         assert_eq!(cmds[2], SlashCommand::ReviewerSet(vec![]));
         assert_eq!(cmds[0].name(), "reviewer");
+    }
+
+    #[test]
+    fn test_issue_edit_command_parsing() {
+        let config = CommandsConfig::default();
+        let cmds = CommandParser::parse_comment(
+            "/title Fix login crash on Safari\n\
+             /milestone v1.4 RC\n\
+             /milestone none\n\
+             /milestone\n\
+             /lock too heated\n\
+             /unlock",
+            &config,
+        );
+        // `/milestone` with no argument is a no-op, not a silent clear.
+        assert_eq!(cmds.len(), 5);
+        assert_eq!(
+            cmds[0],
+            SlashCommand::Title("Fix login crash on Safari".to_string())
+        );
+        assert_eq!(
+            cmds[1],
+            SlashCommand::Milestone(Some("v1.4 RC".to_string()))
+        );
+        assert_eq!(cmds[2], SlashCommand::Milestone(None));
+        assert_eq!(cmds[3], SlashCommand::Lock(Some("too heated".to_string())));
+        assert_eq!(cmds[4], SlashCommand::Unlock);
+        assert_eq!(cmds[0].name(), "title");
+        assert_eq!(cmds[1].name(), "milestone");
+        assert_eq!(cmds[3].name(), "lock");
+        assert_eq!(cmds[4].name(), "unlock");
+    }
+
+    #[test]
+    fn test_lock_reason_normalization() {
+        assert_eq!(normalize_lock_reason(None), Ok(None));
+        assert_eq!(normalize_lock_reason(Some("  ")), Ok(None));
+        assert_eq!(
+            normalize_lock_reason(Some("offtopic")),
+            Ok(Some("off-topic"))
+        );
+        assert_eq!(
+            normalize_lock_reason(Some("Too Heated")),
+            Ok(Some("too heated"))
+        );
+        assert_eq!(
+            normalize_lock_reason(Some("resolved")),
+            Ok(Some("resolved"))
+        );
+        assert_eq!(normalize_lock_reason(Some("spam")), Ok(Some("spam")));
+        assert!(normalize_lock_reason(Some("because")).is_err());
     }
 }

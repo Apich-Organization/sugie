@@ -127,14 +127,21 @@ impl CurrentUser {
             .any(|c| c.trim_start_matches('/').eq_ignore_ascii_case(command))
     }
 
-    /// Repositories visible in the UI.
+    /// Repositories visible in the UI: everything for admins, only granted
+    /// repositories for everyone else. Input order is preserved and the result is
+    /// deduped case-insensitively.
     pub fn visible_repos(&self, all: &[String]) -> Vec<String> {
-        if self.is_admin() || self.repos.is_empty() && self.role == Role::Maintainer {
-            // A maintainer with no explicit grant sees nothing actionable, but the
-            // repository list itself is public information for logged-in users.
-            return all.to_vec();
+        let mut out: Vec<String> = Vec::with_capacity(all.len());
+        for repo in all {
+            if !self.can_access_repo(repo) {
+                continue;
+            }
+            if out.iter().any(|seen| seen.eq_ignore_ascii_case(repo)) {
+                continue;
+            }
+            out.push(repo.clone());
         }
-        all.to_vec()
+        out
     }
 }
 
@@ -171,15 +178,50 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "issues",
-        usage: "/issues [n]",
-        help: "List recent open issues (default 10)",
+        usage: "/issues [count] [page]",
+        help: "List open issues (default 10, max 100 per page)",
         restricted: false,
         admin_only: false,
     },
     CommandSpec {
         name: "prs",
-        usage: "/prs [n]",
-        help: "List recent open PRs (default 10)",
+        usage: "/prs [count] [page]",
+        help: "List open PRs (default 10, max 100 per page)",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "issue",
+        usage: "/issue <num>",
+        help: "Show one issue or PR in detail (state, labels, reviewers, checks)",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "checks",
+        usage: "/checks <num>",
+        help: "CI check-suite status for a pull request",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "labels",
+        usage: "/labels",
+        help: "List repository labels",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "milestones",
+        usage: "/milestones",
+        help: "List open milestones",
+        restricted: false,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "rate",
+        usage: "/rate",
+        help: "Remaining GitHub API quota for this installation",
         restricted: false,
         admin_only: false,
     },
@@ -278,6 +320,34 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "comment",
         usage: "/comment <num> <text>",
         help: "Post a comment on an issue or PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "title",
+        usage: "/title <num> <new title>",
+        help: "Rename an issue or PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "milestone",
+        usage: "/milestone <num> <name|none>",
+        help: "Set or clear the milestone of an issue or PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "lock",
+        usage: "/lock <num> [off-topic|too heated|resolved|spam]",
+        help: "Lock the conversation on an issue or PR",
+        restricted: true,
+        admin_only: false,
+    },
+    CommandSpec {
+        name: "unlock",
+        usage: "/unlock <num>",
+        help: "Unlock the conversation on an issue or PR",
         restricted: true,
         admin_only: false,
     },

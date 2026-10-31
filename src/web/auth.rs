@@ -39,6 +39,22 @@ pub fn verify_password(password: &str, stored_hash: &str) -> bool {
     }
 }
 
+/// `hash_password` off the async runtime: Argon2id needs ~19 MiB and tens of
+/// milliseconds, which would otherwise stall every other task on the worker.
+pub async fn hash_password_async(password: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| anyhow!("hash password task: {e}"))?
+}
+
+/// `verify_password` off the async runtime. A failed join is treated as a
+/// non-match rather than an error.
+pub async fn verify_password_async(password: String, hash: String) -> bool {
+    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+        .await
+        .unwrap_or(false)
+}
+
 /// 32 random bytes, hex encoded — used as the opaque session token.
 pub fn random_token() -> String {
     let mut buf = [0u8; 32];
@@ -54,15 +70,75 @@ pub fn token_hash(token: &str) -> String {
     sha256_hex(&format!("sugie-admin-session:{token}"))
 }
 
-pub fn cookie_value(headers: &HeaderMap) -> Option<String> {
+/// Normalise a cookie value: RFC 6265 allows a quoted value, and an empty one is
+/// treated as absent so it cannot shadow a valid cookie under the other name.
+fn normalize_cookie_value(raw: &str) -> Option<String> {
+    let mut v = raw.trim();
+    if let Some(rest) = v.strip_prefix('"') {
+        v = rest;
+    }
+    if let Some(rest) = v.strip_suffix('"') {
+        v = rest;
+    }
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// Read the session cookie, honouring the `__Host-` prefix rules: the plain name
+/// is only trusted on a non-TLS request, otherwise a sibling subdomain could
+/// plant it and pin the victim to an attacker-controlled session.
+pub fn cookie_value_for(headers: &HeaderMap, secure: bool) -> Option<String> {
     let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    raw.split(';')
-        .filter_map(|part| part.trim().split_once('='))
-        .find(|(k, _)| {
-            let k = k.trim();
-            k == COOKIE_NAME || k == SECURE_COOKIE_NAME
-        })
-        .map(|(_, v)| v.trim().to_string())
+    let mut plain = None;
+    let mut prefixed = None;
+    for part in raw.split(';') {
+        let Some((k, v)) = part.trim().split_once('=') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        let Some(v) = normalize_cookie_value(v) else {
+            continue;
+        };
+        if k == SECURE_COOKIE_NAME {
+            prefixed.get_or_insert(v);
+        } else if k == COOKIE_NAME && !secure {
+            plain.get_or_insert(v);
+        }
+    }
+    // Prefer the `__Host-` value when both are present.
+    prefixed.or(plain)
+}
+
+pub fn cookie_value(headers: &HeaderMap) -> Option<String> {
+    cookie_value_for(headers, is_secure_request(headers))
+}
+
+/// Every distinct session token presented in the request, under either cookie
+/// name. Used by logout so a request carrying both cookies kills both sessions.
+pub fn cookie_tokens(headers: &HeaderMap) -> Vec<String> {
+    let Some(raw) = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(';') {
+        let Some((k, v)) = part.trim().split_once('=') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        let Some(v) = normalize_cookie_value(v) else {
+            continue;
+        };
+        if (k == COOKIE_NAME || k == SECURE_COOKIE_NAME) && !out.iter().any(|seen| seen == &v) {
+            out.push(v);
+        }
+    }
+    out
 }
 
 /// Whether the console is being served over TLS. Honours an explicit override
@@ -96,14 +172,17 @@ pub fn session_cookie(token: &str, secure: bool) -> String {
 }
 
 /// Clear both the secure and the plain cookie so a scheme change cannot leave a
-/// stale session behind.
-pub fn clear_cookie(secure: bool) -> String {
-    let first = if secure {
-        format!("{SECURE_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0")
+/// stale session behind. Each deletion is a separate header value: browsers do
+/// not split a single `Set-Cookie` on commas, so a combined value clears neither.
+pub fn clear_cookie(secure: bool) -> Vec<String> {
+    let plain = format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    let prefixed =
+        format!("{SECURE_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0");
+    if secure {
+        vec![prefixed, plain]
     } else {
-        format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
-    };
-    format!("{first}, {COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+        vec![plain, prefixed]
+    }
 }
 
 pub fn client_ip(headers: &HeaderMap) -> String {
@@ -121,16 +200,68 @@ pub fn client_ip(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+/// A principal resolved once per request by the audit middleware.
+///
+/// The raw cookie token is kept alongside the user so a cached principal can
+/// only ever be returned for the *same* cookie: a stale task-local scope can
+/// never leak one request's identity into another.
+#[derive(Clone)]
+pub struct RequestPrincipal {
+    token: Option<String>,
+    pub user: Option<CurrentUser>,
+}
+
+impl RequestPrincipal {
+    pub fn username(&self) -> Option<&str> {
+        self.user.as_ref().map(|u| u.username.as_str())
+    }
+}
+
+tokio::task_local! {
+    /// Set by the HTTP audit middleware around the rest of the request. Reading
+    /// it turns two `session_principal` queries per admin page into one.
+    static REQUEST_PRINCIPAL: RequestPrincipal;
+}
+
+fn lookup(db: &WebDb, token: &str) -> Option<CurrentUser> {
+    let (row, repos, commands) = db.session_principal(&token_hash(token)).ok().flatten()?;
+    let global_2fa = db.is_global_2fa_enabled();
+    Some(CurrentUser::from_row(row, repos, commands, global_2fa))
+}
+
+/// Resolve the caller for a request up front (once), so the audit log and the
+/// page handlers can share the result.
+pub fn resolve_principal(db: &WebDb, headers: &HeaderMap) -> RequestPrincipal {
+    let token = cookie_value(headers);
+    let user = token.as_deref().and_then(|t| lookup(db, t));
+    RequestPrincipal { token, user }
+}
+
+/// Run `fut` with `principal` visible to [`current_user`]. The handler runs
+/// inside this future, so no request state has to be threaded through 39
+/// handler signatures.
+pub async fn scope_principal<F>(principal: RequestPrincipal, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    REQUEST_PRINCIPAL.scope(principal, fut).await
+}
+
 /// Resolve the caller from the session cookie. Returns `None` when the caller is
 /// anonymous, expired, or disabled.
 ///
-/// This runs on every admin request, so session + user + grants are fetched in a
-/// single statement (`WebDb::session_principal`).
+/// The audit middleware already resolved this request's principal; reuse it when
+/// the presented cookie matches. Otherwise (handler reached without the
+/// middleware, or a different cookie) fall back to a real lookup, so behaviour
+/// never depends on the middleware being installed.
 pub fn current_user(db: &WebDb, headers: &HeaderMap) -> Option<CurrentUser> {
-    let token = cookie_value(headers)?;
-    let (row, repos, commands) = db.session_principal(&token_hash(&token)).ok().flatten()?;
-    let global_2fa = db.is_global_2fa_enabled();
-    Some(CurrentUser::from_row(row, repos, commands, global_2fa))
+    let token = cookie_value(headers);
+    if let Ok(cached) = REQUEST_PRINCIPAL.try_with(|p| p.clone()) {
+        if cached.token == token {
+            return cached.user;
+        }
+    }
+    token.as_deref().and_then(|t| lookup(db, t))
 }
 
 pub enum LoginOutcome {
@@ -298,4 +429,71 @@ pub fn bootstrap_admin(db: &WebDb) -> Result<Option<String>> {
     }
 
     Ok(generated.then_some(password))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{header, HeaderValue};
+
+    fn fake_user(name: &str) -> CurrentUser {
+        CurrentUser {
+            id: 1,
+            username: name.to_string(),
+            display_name: name.to_string(),
+            role: Role::parse("admin"),
+            repos: Vec::new(),
+            commands: Vec::new(),
+            totp_enabled: false,
+            two_fa_policy: "disabled".to_string(),
+            passkey_count: 0,
+            needs_2fa_setup: false,
+        }
+    }
+
+    fn cookie_header(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{COOKIE_NAME}={token}")).expect("cookie header"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn cached_principal_avoids_a_second_lookup() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        let headers = cookie_header("cached-token");
+        // The database holds no session for this token: only the request-scoped
+        // principal can answer, which is exactly the single-lookup path.
+        let principal = RequestPrincipal {
+            token: Some("cached-token".to_string()),
+            user: Some(fake_user("alice")),
+        };
+        let seen = scope_principal(principal, async { current_user(&db, &headers) }).await;
+        assert_eq!(seen.map(|u| u.username), Some("alice".to_string()));
+    }
+
+    #[tokio::test]
+    async fn another_cookie_is_never_served_from_the_cache() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        let headers = cookie_header("attacker-token");
+        let principal = RequestPrincipal {
+            token: Some("cached-token".to_string()),
+            user: Some(fake_user("alice")),
+        };
+        let seen = scope_principal(principal, async { current_user(&db, &headers) }).await;
+        assert!(
+            seen.is_none(),
+            "a cached principal must not answer for a different cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_request_resolves_to_no_principal() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        let principal = resolve_principal(&db, &HeaderMap::new());
+        assert!(principal.user.is_none());
+        assert!(principal.username().is_none());
+    }
 }

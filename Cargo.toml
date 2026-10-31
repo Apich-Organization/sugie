@@ -41,12 +41,16 @@ async-stream = "0.3"
 totp-rs = { version = "6.0", features = ["qr", "gen_secret", "otpauth"] }
 qrcodegen-image = "1.5"
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
-# `webauthn-rs-core` links OpenSSL unconditionally (attestation parsing). Building
-# it vendored keeps `cargo build` working on machines without OpenSSL 3 headers
-# and produces a self-contained binary for containers.
-openssl = { version = "0.10", features = ["vendored"] }
+# `webauthn-rs-core` links OpenSSL for attestation parsing. By default we use the
+# system OpenSSL 3 (fast, no build-script compile). `--features vendored-openssl`
+# builds a self-contained binary for images that ship no OpenSSL headers.
+openssl = "0.10"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[features]
+default = []
+vendored-openssl = ["openssl/vendored"]
 
 [dev-dependencies]
 tempfile = "3.13"

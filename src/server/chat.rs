@@ -642,10 +642,49 @@ pub struct GenericCommandRequest {
     pub sender: Option<String>,
 }
 
+/// Compare a presented secret with the configured one without leaking the
+/// answer through timing. Both sides are hashed first so the loop always runs
+/// over the same number of bytes, whatever the caller sent.
+fn secret_matches(provided: &str, expected: &str) -> bool {
+    let a = Sha256::digest(provided.as_bytes());
+    let b = Sha256::digest(expected.as_bytes());
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub async fn generic_chat_command_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<GenericCommandRequest>,
 ) -> impl IntoResponse {
+    // This endpoint can run `/comment`, `/assign`, `/close` and the rest of the
+    // chat command surface, so it must not stay open when a secret is
+    // configured. When none is configured the historical behaviour is kept and
+    // startup logs a warning.
+    if let Some(expected) = state.chat_api_token.as_deref() {
+        let provided = headers
+            .get("x-sugie-chat-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !secret_matches(provided, expected) {
+            // `{:?}` escapes control characters and the value is truncated, so a
+            // caller cannot forge or flood log lines through the sender field.
+            let claimed: Option<String> = payload
+                .sender
+                .as_deref()
+                .map(|s| s.chars().take(64).collect());
+            warn!("Rejected unauthenticated /api/chat/command call (sender={claimed:?})");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Missing or invalid X-Sugie-Chat-Token"})),
+            )
+                .into_response();
+        }
+    }
+
     let sender_name = payload.sender.unwrap_or_else(|| "api_user".to_string());
     let inbound = InboundChatMessage {
         platform: ChatPlatform::Api,
@@ -669,11 +708,23 @@ pub async fn generic_chat_command_handler(
             "response": reply
         })),
     )
+        .into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_api_secret_comparison() {
+        assert!(secret_matches("abc123", "abc123"));
+        assert!(!secret_matches("abc124", "abc123"));
+        assert!(!secret_matches("abc12", "abc123"));
+        assert!(!secret_matches("", "abc123"));
+        // A long random token is what the docs recommend; make sure it round-trips.
+        let long = "9f2c1d7e4b6a8c0f3e5d7b9a1c2e4f60718293a4b5c6d7e8f90a1b2c3d4e5f60";
+        assert!(secret_matches(long, long));
+    }
 
     #[test]
     fn test_lark_encryption_and_decryption_cycle() {

@@ -174,18 +174,100 @@ async fn main() -> anyhow::Result<()> {
                 listen_host, listen_port
             );
 
+            // Shared secret for the generic chat-command endpoint. Empty or
+            // unset keeps the historical open behaviour, with a warning.
+            let chat_api_token: Option<Arc<str>> = std::env::var("SUGIE_CHAT_API_TOKEN")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(|v| Arc::from(v.as_str()));
+            match chat_api_token.as_deref() {
+                None => warn!(
+                    "POST /api/chat/command is unauthenticated — anyone who can reach this port can run chat commands. Set SUGIE_CHAT_API_TOKEN to require a shared secret."
+                ),
+                Some(t) if t.chars().count() < 16 => warn!(
+                    "SUGIE_CHAT_API_TOKEN is shorter than 16 characters; use a long random value (e.g. `openssl rand -hex 32`)."
+                ),
+                Some(_) => {}
+            }
+
+            // The platform webhooks authenticate with their own credentials, not
+            // with SUGIE_CHAT_API_TOKEN. Each one silently stops verifying when
+            // its secret is unset, so say so at boot rather than at incident time.
+            if config.github.webhook_secret.trim().is_empty() {
+                warn!(
+                    "SUGIE_GITHUB_WEBHOOK_SECRET is not set — /webhook rejects every delivery \
+                     (it cannot authenticate them). Set it to the same value as the GitHub App's webhook secret."
+                );
+            }
+            if config
+                .chat
+                .zulip_token
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                warn!(
+                    "SUGIE_ZULIP_OUTGOING_TOKEN is not set — POST /api/chat/zulip accepts unverified requests."
+                );
+            }
+            if config
+                .chat
+                .lark_verification_token
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                warn!(
+                    "SUGIE_LARK_VERIFICATION_TOKEN is not set — POST /api/chat/lark accepts unverified requests."
+                );
+            }
+            if config
+                .chat
+                .lark_encrypt_key
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                info!(
+                    "SUGIE_LARK_ENCRYPT_KEY is not set — encrypted Lark callbacks will be rejected; \
+                     only configure this if the app uses an Encrypt Key."
+                );
+            }
+            if config
+                .chat
+                .discord_public_key
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                warn!(
+                    "SUGIE_DISCORD_PUBLIC_KEY is not set — POST /api/chat/discord accepts unverified requests."
+                );
+            }
+
             let state = AppState {
                 config: config.clone(),
                 triage,
+                chat_api_token,
             };
 
             let app = sugie::server::create_router_with_web(state, Some(web_state));
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             info!("Sugie Webhook Server listening on http://{}", addr);
 
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal(shutdown))
-                .await?;
+            // Connect info exposes the real peer address, so the unauthenticated
+            // passkey throttle cannot be keyed on a caller-controlled header.
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal(shutdown))
+            .await?;
 
             info!("Sugie Bot shut down gracefully.");
         }

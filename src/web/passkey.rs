@@ -48,6 +48,34 @@ struct AuthEntry {
     created_at: Instant,
 }
 
+/// Upper bound on pending authentication ceremonies. The auth-start endpoint is
+/// unauthenticated, so the map is otherwise only bounded by the 300 s TTL.
+const MAX_AUTH_CHALLENGES: usize = 4096;
+/// Passkey auth-start requests allowed per source address per minute.
+const AUTH_STARTS_PER_MINUTE: u32 = 20;
+
+/// Coarse in-memory per-IP throttle for the unauthenticated auth-start endpoint.
+pub fn auth_start_allowed(ip: &str) -> bool {
+    static HITS: std::sync::OnceLock<Mutex<HashMap<String, (Instant, u32)>>> =
+        std::sync::OnceLock::new();
+    let hits = HITS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = hits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    // Opportunistic sweep so a spray across many source addresses cannot grow
+    // the map without bound.
+    if guard.len() > 4096 {
+        guard.retain(|_, (since, _)| now.duration_since(*since) < Duration::from_secs(60));
+    }
+    let entry = guard.entry(ip.to_string()).or_insert((now, 0));
+    if now.duration_since(entry.0) >= Duration::from_secs(60) {
+        *entry = (now, 0);
+    }
+    entry.1 += 1;
+    entry.1 <= AUTH_STARTS_PER_MINUTE
+}
+
 /// Manager for WebAuthn/FIDO2 passkey registration and assertion ceremonies.
 #[derive(Clone)]
 pub struct PasskeyManager {
@@ -235,6 +263,19 @@ impl PasskeyManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         lock.retain(|_, v| v.created_at.elapsed() < Duration::from_secs(300));
+        // Evict the oldest ceremonies before inserting so a caller hammering this
+        // endpoint cannot grow the map past the cap.
+        if lock.len() >= MAX_AUTH_CHALLENGES {
+            let mut oldest: Vec<(Instant, String)> = lock
+                .iter()
+                .map(|(k, v)| (v.created_at, k.clone()))
+                .collect();
+            oldest.sort_by(|a, b| a.0.cmp(&b.0));
+            let excess = lock.len() + 1 - MAX_AUTH_CHALLENGES;
+            for (_, key) in oldest.into_iter().take(excess) {
+                lock.remove(&key);
+            }
+        }
         lock.insert(
             challenge_id,
             AuthEntry {

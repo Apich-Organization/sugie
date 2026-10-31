@@ -21,6 +21,9 @@ pub mod chat;
 pub struct AppState {
     pub config: Arc<SugieConfig>,
     pub triage: TriageService,
+    /// Shared secret for `POST /api/chat/command`. `None` keeps the endpoint
+    /// open (the historical behaviour) and is warned about at startup.
+    pub chat_api_token: Option<Arc<str>>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -89,6 +92,12 @@ async fn security_http_log_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // One session lookup for the whole request: the audit log needs the actor
+    // and the page handlers need the principal.
+    let principal = web_db
+        .as_ref()
+        .map(|db| crate::web::auth::resolve_principal(db, headers));
+
     let actor = if gh_event.is_some() {
         "github-webhook".to_string()
     } else if path.starts_with("/api/chat/discord") {
@@ -97,10 +106,12 @@ async fn security_http_log_middleware(
         "lark-webhook".to_string()
     } else if path.starts_with("/api/chat/zulip") {
         "zulip-webhook".to_string()
-    } else if let Some(ref db) = web_db {
-        crate::web::auth::current_user(db, headers)
-            .map(|u| u.username)
-            .unwrap_or_else(|| "anonymous".to_string())
+    } else if web_db.is_some() {
+        principal
+            .as_ref()
+            .and_then(|p| p.username())
+            .unwrap_or("anonymous")
+            .to_string()
     } else {
         "anonymous".to_string()
     };
@@ -118,7 +129,13 @@ async fn security_http_log_middleware(
     let detail = detail_parts.join(" ");
 
     let start = std::time::Instant::now();
-    let resp = next.run(req).await;
+    // Resolve the session once and hand it to the inner router through a
+    // task-local, so page handlers do not repeat the lookup. Anonymous and
+    // non-admin routes skip the scope entirely.
+    let resp = match principal {
+        Some(p) => crate::web::auth::scope_principal(p, next.run(req)).await,
+        None => next.run(req).await,
+    };
     if !skip_log {
         let status = resp.status().as_u16();
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -152,14 +169,17 @@ async fn status_check(State(state): State<AppState>) -> impl IntoResponse {
         .storage()
         .list_repositories()
         .unwrap_or_default();
+    // This route is unauthenticated, so it reports only liveness and a count.
+    // Listing the repository names handed anyone who could reach the port an
+    // inventory of a private org; the console shows the full list to signed-in
+    // users who are allowed to see it.
     (
         StatusCode::OK,
         Json(json!({
             "status": "running",
             "bot": "sugie",
             "version": env!("CARGO_PKG_VERSION"),
-            "onboarded_repositories_count": repos.len(),
-            "repositories": repos.into_iter().map(|(_, name, _)| name).collect::<Vec<_>>()
+            "onboarded_repositories_count": repos.len()
         })),
     )
 }
@@ -183,6 +203,20 @@ async fn github_webhook_handler(
     let signature = headers
         .get("X-Hub-Signature-256")
         .and_then(|v| v.to_str().ok());
+
+    // A missing secret used to leave this endpoint forgeable: HMAC accepts an
+    // empty key, so `sha256=HMAC(key="", body)` would verify. Refuse outright
+    // and say why, instead of logging it as an ordinary signature failure.
+    if state.config.github.webhook_secret.is_empty() {
+        warn!(
+            "Rejected GitHub webhook: SUGIE_GITHUB_WEBHOOK_SECRET is not configured, \
+             so deliveries cannot be authenticated"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Webhook secret is not configured" })),
+        );
+    }
 
     // Verify HMAC-SHA256 signature
     if !verify_signature(&state.config.github.webhook_secret, signature, &body) {

@@ -3,7 +3,7 @@
 
 use crate::triage::TriageService;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,11 +45,17 @@ pub struct StatsCache {
     /// for a single upstream fetch instead of stampeding GitHub when the TTL
     /// expires (thundering herd).
     flights: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Repositories with a background refresh already in flight.
+    refreshing: Mutex<HashSet<String>>,
 }
 
 impl StatsCache {
     pub fn peek(&self, key: &str) -> Option<RepoStats> {
-        let guard = self.inner.lock().ok()?;
+        // Poison-safe: a panic elsewhere must not disable the cache forever.
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (at, stats) = guard.get(key)?;
         if at.elapsed() < TTL {
             Some(stats.clone())
@@ -58,21 +64,98 @@ impl StatsCache {
         }
     }
 
+    /// Cached stats for `key` with their age, even when stale. Used to render a page
+    /// without blocking on GitHub; the caller kicks off a background refresh.
+    pub fn get_any(&self, key: &str) -> Option<(RepoStats, Duration)> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (at, stats) = guard.get(key)?;
+        Some((stats.clone(), at.elapsed()))
+    }
+
     pub fn put(&self, stats: RepoStats) {
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.insert(stats.full_name.clone(), (Instant::now(), stats));
-        }
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(stats.full_name.clone(), (Instant::now(), stats));
     }
 
     fn flight(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut guard = match self.flights.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut guard = self
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard
             .entry(key.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Returns true when the caller should spawn a refresh: at most one background
+    /// refresh per repository is in flight at a time.
+    pub fn claim_refresh(&self, key: &str) -> bool {
+        let mut guard = self
+            .refreshing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(key.to_string())
+    }
+
+    fn release_refresh(&self, key: &str) {
+        let mut guard = self
+            .refreshing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.remove(key);
+    }
+}
+
+/// Holds a background-refresh claim and releases it on drop, so a panicking task
+/// cannot leave the repository permanently unrefreshable.
+pub struct RefreshClaim {
+    cache: Arc<StatsCache>,
+    key: String,
+}
+
+impl RefreshClaim {
+    pub fn new(cache: Arc<StatsCache>, key: &str) -> Self {
+        Self {
+            cache,
+            key: key.to_string(),
+        }
+    }
+}
+
+impl Drop for RefreshClaim {
+    fn drop(&mut self) {
+        self.cache.release_refresh(&self.key);
+    }
+}
+
+/// Releases a single-flight gate and drops its map entry once nobody else is
+/// waiting, so the map cannot grow with arbitrary repository names.
+struct FlightGuard<'a> {
+    cache: &'a StatsCache,
+    key: String,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut flights = self
+            .cache
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Two strong refs means "map entry + this guard": no other waiter is
+        // holding a clone. Checked under the lock so a new caller cannot slip in
+        // between the count and the removal.
+        if Arc::strong_count(&self.gate) == 2 {
+            flights.remove(&self.key);
+        }
     }
 }
 
@@ -90,8 +173,12 @@ pub async fn fetch(
 
     // Single-flight: only one task fetches per repository; the rest re-check the
     // cache after the winner has populated it.
-    let gate = cache.flight(full_name);
-    let _permit = gate.lock().await;
+    let flight = FlightGuard {
+        cache,
+        key: full_name.to_string(),
+        gate: cache.flight(full_name),
+    };
+    let _permit = flight.gate.lock().await;
     if !force {
         if let Some(hit) = cache.peek(full_name) {
             return hit;

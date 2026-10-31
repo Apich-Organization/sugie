@@ -21,6 +21,8 @@ pub struct Totals {
     pub issues: u64,
     pub prs: u64,
     pub commits: u64,
+    /// Cards whose stats were fetched but reported an error.
+    pub failed: usize,
 }
 
 #[derive(Clone, Default)]
@@ -138,6 +140,7 @@ pub fn login_page(
                                 inputmode="numeric"
                                 pattern="[0-9]{6,8}"
                                 maxlength="8"
+                                data-autosubmit="8"
                                 placeholder="00000000"
                                 autocomplete="one-time-code"
                                 autofocus=""
@@ -147,6 +150,9 @@ pub fn login_page(
                             />
                         </label>
                         <button class="btn primary" type="submit" style="width:100%">"Verify OTP Code"</button>
+                        <div class="hint" style="margin-top:8px;text-align:center">
+                            "Verifies automatically once all 8 digits are entered."
+                        </div>
                     </form>
                 }
                 .into_any()
@@ -264,6 +270,7 @@ pub fn dashboard_page(
     totals: Totals,
     summary: crate::web::config_store::ConfigSummary,
     flash: Option<(bool, String)>,
+    security_notice: Option<String>,
 ) -> impl IntoView {
     let rows = cards
         .iter()
@@ -361,6 +368,29 @@ pub fn dashboard_page(
         summary.allowed_repositories.join(", ")
     };
 
+    let failed_note = if totals.failed > 0 {
+        view! {
+            <div class="warn-line">{format!(
+                "{} repositories failed to load — see the Repositories page",
+                totals.failed,
+            )}</div>
+        }
+        .into_any()
+    } else {
+        view! { <span></span> }.into_any()
+    };
+
+    let notice_view = match security_notice {
+        Some(text) => view! {
+            <div class="alert warn notice-row" role="status">
+                <span>{text}</span>
+                <a class="btn sm ghost" href="/admin/security">"Open Security"</a>
+            </div>
+        }
+        .into_any(),
+        None => view! { <span></span> }.into_any(),
+    };
+
     view! {
         <Shell title="Dashboard".to_string() active="dashboard".to_string() user=Some(user.clone())>
             <div class="page-head">
@@ -375,12 +405,14 @@ pub fn dashboard_page(
                 </div>
             </div>
             {flash_view}
+            {notice_view}
             <div class="grid cols-4" style="margin-bottom:16px">
                 <StatCard label="Repositories".to_string() value=number(totals.repos as u64) sub="GitHub App installations".to_string() accent=true/>
                 <StatCard label="Open Issues".to_string() value=number(totals.issues) sub="Unresolved issues".to_string() accent=false/>
                 <StatCard label="Open PRs".to_string() value=number(totals.prs) sub="Pending pull requests".to_string() accent=false/>
                 <StatCard label="30d Commits".to_string() value=number(totals.commits) sub="Commits on default branch".to_string() accent=false/>
             </div>
+            {failed_note}
             <div class="grid split-19">
                 <div class="card tight">
                     <div class="card-head" style="padding:18px 20px 0">
@@ -388,7 +420,7 @@ pub fn dashboard_page(
                         <span class="hint">{format!("{} repositories", cards.len())}</span>
                     </div>
                     <div class="toolbar">
-                        <input type="search" placeholder="Search repositories…" data-filter-table="dash-table" data-filter-kind="text" />
+                        <span class="cf"><input type="search" placeholder="Search repositories…" data-filter-table="dash-table" data-filter-kind="text" aria-label="Search repositories"/><button type="button" class="cf-x" hidden aria-label="Clear repository search" title="Clear">"×"</button></span>
                         <label class="pill-check"><input type="checkbox" data-filter-table="dash-table" data-filter-kind="errors" /><span>"Show only errors"</span></label>
                     </div>
                     <table id="dash-table" style="margin-top:10px">
@@ -431,7 +463,16 @@ pub fn dashboard_page(
 
 // --------------------------------------------------------------------- repos
 
-pub fn repos_page(user: CurrentUser, cards: Vec<RepoCard>) -> impl IntoView {
+pub fn repos_page(
+    user: CurrentUser,
+    cards: Vec<RepoCard>,
+    flash: Option<(bool, String)>,
+) -> impl IntoView {
+    let flash_view = match flash {
+        Some((ok, text)) => view! { <Flash ok=ok text=text/> }.into_any(),
+        None => view! { <span></span> }.into_any(),
+    };
+
     let rows = cards
         .iter()
         .map(|card| {
@@ -520,9 +561,10 @@ pub fn repos_page(user: CurrentUser, cards: Vec<RepoCard>) -> impl IntoView {
                     <a class="btn primary" href="/admin/chat">"Open Console"</a>
                 </div>
             </div>
+            {flash_view}
             <div class="card tight">
                 <div class="toolbar">
-                    <input type="search" placeholder="Search repositories or installation id…" data-filter-table="repos-table" data-filter-kind="text" />
+                    <span class="cf"><input type="search" placeholder="Search repositories or installation id…" data-filter-table="repos-table" data-filter-kind="text" aria-label="Search repositories"/><button type="button" class="cf-x" hidden aria-label="Clear repository search" title="Clear">"×"</button></span>
                     <select data-filter-table="repos-table" data-filter-kind="status">
                         <option value="">"All statuses"</option>
                         <option value="ok">"Healthy"</option>
@@ -551,6 +593,7 @@ pub fn chat_page(
     repos: Vec<String>,
     selected: String,
     history: Vec<Job>,
+    stats: Option<RepoStats>,
 ) -> impl IntoView {
     let repo_links = repos
         .iter()
@@ -562,6 +605,50 @@ pub fn chat_page(
         .collect_view();
 
     let has_repo = !selected.is_empty();
+    let no_repos = repos.is_empty();
+    let refresh_href = format!("/admin/chat?repo={}&refresh=1", urlencode(&selected));
+
+    // Compact statistics strip above the chat log. Rendered from the cache, so
+    // it never holds the page open on a GitHub round-trip.
+    let stats_strip = if !has_repo {
+        view! { <span></span> }.into_any()
+    } else {
+        match &stats {
+            Some(s) if s.is_ok() => view! {
+                <div class="repo-stats">
+                    <span class="rs-item rs-repo">{s.full_name.clone()}</span>
+                    <span class="rs-item"><span class="rs-label">"Open issues"</span><span class="rs-value">{number(s.open_issues)}</span></span>
+                    <span class="rs-item"><span class="rs-label">"Open PRs"</span><span class="rs-value">{number(s.open_prs)}</span></span>
+                    <span class="rs-item"><span class="rs-label">"Commits 30d"</span><span class="rs-value">{number(s.commits_30d)}</span></span>
+                    <span class="rs-item"><span class="rs-label">"Merged 30d"</span><span class="rs-value">{number(s.merged_30d)}</span></span>
+                    <span class="rs-item"><span class="rs-label">"Stars"</span><span class="rs-value">{number(s.stars)}</span></span>
+                    <span class="rs-item"><span class="rs-label">"as of"</span><span class="rs-value mono">{s.fetched_at.clone()}</span></span>
+                    <a class="rs-refresh" href=refresh_href.clone()>"Refresh"</a>
+                </div>
+            }
+            .into_any(),
+            Some(s) => view! {
+                <div class="repo-stats">
+                    <span class="rs-item rs-repo">{s.full_name.clone()}</span>
+                    <span class="rs-error">{s
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Failed to load repository statistics".to_string())}</span>
+                    <a class="rs-refresh" href=refresh_href.clone()>"Refresh"</a>
+                </div>
+            }
+            .into_any(),
+            None => view! {
+                <div class="repo-stats">
+                    <span class="rs-item rs-repo">{selected.clone()}</span>
+                    <span class="rs-muted">"loading statistics…"</span>
+                    <a class="rs-refresh" href=refresh_href.clone()>"Refresh"</a>
+                </div>
+            }
+            .into_any(),
+        }
+    };
+
     let head_badge = if has_repo {
         selected.clone()
     } else {
@@ -584,8 +671,16 @@ pub fn chat_page(
                 crate::web::exec::JobStatus::Running => "running",
                 crate::web::exec::JobStatus::Done => "done",
                 crate::web::exec::JobStatus::Failed => "failed",
+                crate::web::exec::JobStatus::Cancelled => "cancelled",
             };
             let bot_meta = format!("sugie · {} · {}", job.repo, status);
+            // Failed jobs must not look like an empty successful run; a cancelled
+            // one is a deliberate stop and gets its own neutral style.
+            let bot_cls = match job.status {
+                crate::web::exec::JobStatus::Failed => "msg bot failed",
+                crate::web::exec::JobStatus::Cancelled => "msg bot cancelled",
+                _ => "msg bot",
+            };
             let lines = job
                 .lines
                 .iter()
@@ -596,13 +691,25 @@ pub fn chat_page(
                     view! { <span class=cls>{text}</span> }
                 })
                 .collect_view();
+            // A job still running after a page reload keeps a working Stop
+            // button; the stream that created it is gone, but the job is not.
+            let stop_btn = if job.status == crate::web::exec::JobStatus::Running {
+                let id = job.id.clone();
+                view! {
+                    <button type="button" class="btn sm ghost stop-btn" data-job-id=id
+                        aria-label="Stop this command">"Stop"</button>
+                }
+                .into_any()
+            } else {
+                view! { <span></span> }.into_any()
+            };
             view! {
                 <div class="msg user">
                     <div class="meta">{meta}</div>
                     <pre>{cmd}</pre>
                 </div>
-                <div class="msg bot">
-                    <div class="meta">{bot_meta}</div>
+                <div class=bot_cls>
+                    <div class="meta">{bot_meta}{stop_btn}</div>
                     <pre>{lines}</pre>
                 </div>
             }
@@ -631,12 +738,19 @@ pub fn chat_page(
             <div class="console">
                 <div class="card tight">
                     <div class="card-head" style="padding:14px 16px 8px;margin:0"><h2>"Repositories"</h2></div>
+                    <div class="repo-filter-wrap">
+                        <span class="cf">
+                            <input type="search" class="repo-filter" placeholder="Filter repositories…" aria-label="Filter repositories"/>
+                            <button type="button" class="cf-x" hidden aria-label="Clear repository filter" title="Clear">"×"</button>
+                        </span>
+                    </div>
                     <div class="repo-picker">
-                        {if repos.is_empty() {
+                        {if no_repos {
                             view! { <div class="empty">"No repositories"</div> }.into_any()
                         } else {
                             repo_links.into_any()
                         }}
+                        <div class="empty repo-filter-empty" style="display:none">"No repositories match"</div>
                     </div>
                 </div>
                 <div class="card chat">
@@ -646,13 +760,30 @@ pub fn chat_page(
                         <span class="spacer"></span>
                         <a class="hint" href="/admin/chat">"Clear view"</a>
                     </div>
-                    <div class="chat-log" id="chat-log">{messages}</div>
-                    <div class="quick">{quick}</div>
-                    <form class="chat-input" id="cmd-form" onsubmit="return false;">
-                        <input type="hidden" id="cmd-repo" value=selected/>
-                        <textarea id="cmd-input" rows="1" placeholder=placeholder disabled=!has_repo></textarea>
-                        <button class="btn primary" type="submit" disabled=!has_repo>"Send"</button>
-                    </form>
+                    {stats_strip}
+                    <div class="chat-log" id="chat-log" role="log" aria-live="polite" aria-label="Command output">
+                        {if no_repos {
+                            view! {
+                                <div class="empty">"No repositories are available to your account. Ask an administrator for access."</div>
+                            }
+                            .into_any()
+                        } else {
+                            messages.into_any()
+                        }}
+                    </div>
+                    {if no_repos {
+                        view! { <span></span> }.into_any()
+                    } else {
+                        view! {
+                            <div class="quick">{quick}</div>
+                            <form class="chat-input" id="cmd-form" onsubmit="return false;">
+                                <input type="hidden" id="cmd-repo" value=selected/>
+                                <textarea id="cmd-input" rows="1" aria-label="Command" placeholder=placeholder disabled=!has_repo></textarea>
+                                <button class="btn primary" type="submit" disabled=!has_repo>"Send"</button>
+                            </form>
+                        }
+                        .into_any()
+                    }}
                 </div>
             </div>
         </Shell>
@@ -735,6 +866,28 @@ pub fn config_page(
         })
         .collect_view();
 
+    let backup_rows = if backups.is_empty() {
+        view! {
+            <tr><td colspan="4" class="empty">"No backups yet — the first save creates one."</td></tr>
+        }
+        .into_any()
+    } else {
+        backup_rows.into_any()
+    };
+
+    // The POST handler is owner-only; showing the button to admins only ever
+    // produced an error flash after the round-trip.
+    let restart_control = if user.is_owner() {
+        view! {
+            <form method="post" action="/admin/system/restart" data-confirm="Are you sure you want to restart the service? The process will exit gracefully and be restarted by systemd / container runtime.">
+                <button class="btn" type="submit">"Restart Service"</button>
+            </form>
+        }
+        .into_any()
+    } else {
+        view! { <span class="hint">"Only an owner can restart the service."</span> }.into_any()
+    };
+
     view! {
         <Shell title="Configuration".to_string() active="config".to_string() user=Some(user.clone())>
             <div class="page-head">
@@ -743,9 +896,7 @@ pub fn config_page(
                     <h1>"Configuration Center"</h1>
                     <p>"Manage sugie.toml and .env online with schema validation, automatic backups, and atomic writes"</p>
                 </div>
-                <form method="post" action="/admin/system/restart" data-confirm="Are you sure you want to restart the service? The process will exit gracefully and be restarted by systemd / container runtime.">
-                    <button class="btn" type="submit">"Restart Service"</button>
-                </form>
+                {restart_control}
             </div>
             {flash_view}
             <div class="alert warn">"Note: Saving writes changes to disk. The running process uses the configuration loaded at startup; restart the service to apply changes."</div>
@@ -1054,6 +1205,15 @@ pub fn users_page(
         })
         .collect_view();
 
+    let rows = if users.is_empty() {
+        view! {
+            <tr><td colspan="8" class="empty">"No users yet — create the first account below."</td></tr>
+        }
+        .into_any()
+    } else {
+        rows.into_any()
+    };
+
     let global_2fa_card = {
         let status_badge = if global_2fa {
             view! { <span class="badge warn">"Global 2FA Enforced"</span> }.into_any()
@@ -1114,7 +1274,7 @@ pub fn users_page(
             <div class="stack">
                 <div class="card tight">
                     <div class="toolbar">
-                        <input type="search" placeholder="Search users…" data-filter-table="users-table" data-filter-kind="text" />
+                        <span class="cf"><input type="search" placeholder="Search users…" data-filter-table="users-table" data-filter-kind="text" aria-label="Search users"/><button type="button" class="cf-x" hidden aria-label="Clear user search" title="Clear">"×"</button></span>
                         <select data-filter-table="users-table" data-filter-kind="role">
                             <option value="">"All roles"</option>
                             <option value="owner">"Owner"</option>
@@ -1276,6 +1436,7 @@ pub fn security_page(
                             inputmode="numeric"
                             pattern="[0-9]{8}"
                             maxlength="8"
+                            data-autosubmit="8"
                             placeholder="00000000"
                             autocomplete="one-time-code"
                             required=""
@@ -1360,6 +1521,33 @@ pub fn security_page(
                     <dt>"RP ID (Domain)"</dt><dd class="mono">{data.rp_id.clone()}</dd>
                     <dt>"RP Origin"</dt><dd class="mono">{data.rp_origin.clone()}</dd>
                 </dl>
+            </div>
+
+            <div class="card" style="margin-bottom:16px">
+                <div class="card-head" style="margin-bottom:10px">
+                    <h2>"Change Password"</h2>
+                    <span class="hint">"Changing it signs out every other session"</span>
+                </div>
+                <form method="post" action="/admin/security/password">
+                    <div class="grid cols-3">
+                        <label class="field">
+                            <span>"Current password"</span>
+                            <input type="password" name="current" autocomplete="current-password" required/>
+                        </label>
+                        <label class="field">
+                            <span>"New password"</span>
+                            <input type="password" name="new_password" autocomplete="new-password" minlength="10" required/>
+                        </label>
+                        <label class="field">
+                            <span>"Confirm new password"</span>
+                            <input type="password" name="confirm" autocomplete="new-password" minlength="10" required/>
+                        </label>
+                    </div>
+                    <p class="hint" style="margin:0 0 12px">
+                        "At least 10 characters. A passphrase of four unrelated words is stronger than a short complex password."
+                    </p>
+                    <button class="btn primary" type="submit">"Update password"</button>
+                </form>
             </div>
 
             <div class="grid cols-2" style="align-items:start">
@@ -1534,10 +1722,10 @@ pub fn audit_page(
     http_filter: crate::web::db::SecurityHttpFilter,
 ) -> impl IntoView {
     let is_http_tab = tab == "inbound" || tab == "github" || tab == "notify" || tab == "http_all";
-    let flash_view = flash.map(|(ok, msg)| {
-        let cls = if ok { "alert ok" } else { "alert err" };
-        view! { <div class=cls>{msg}</div> }
-    });
+    let flash_view = match flash {
+        Some((ok, text)) => view! { <Flash ok=ok text=text/> }.into_any(),
+        None => view! { <span></span> }.into_any(),
+    };
 
     let prev = if is_http_tab {
         build_http_url(&tab, (page - 1).max(0), &http_filter)
@@ -1550,6 +1738,13 @@ pub fn audit_page(
         build_audit_url(&tab, page + 1, &audit_filter)
     };
     let pages = (total + 49) / 50;
+    // `total` is the filtered row count, so the last page has nothing after it.
+    let has_next = page + 1 < pages;
+    let next_control = if has_next {
+        view! { <a class="btn sm ghost" href=next>"Next"</a> }.into_any()
+    } else {
+        view! { <span class="btn sm ghost" aria-disabled="true">"Next"</span> }.into_any()
+    };
     let export_href = build_export_url(&tab, is_http_tab, &audit_filter, &http_filter);
 
     let is_filtered = if is_http_tab {
@@ -1675,16 +1870,7 @@ pub fn audit_page(
                             <th style="text-align:right">"Action"</th>
                         </tr>
                         <tr class="filter-row">
-                            <th class="col-ts">
-                                <input
-                                    type="date"
-                                    name="q_ts"
-                                    value=http_ts_val
-                                    class="col-filter"
-                                    onchange="this.form.submit()"
-                                    title="Filter by date"
-                                />
-                            </th>
+                            <th class="col-ts">{clearable_date("q_ts", http_ts_val, "date")}</th>
                             <th>{dir_cell}</th>
                             <th>
                                 <select name="q_method" class="col-filter" onchange="this.form.submit()">
@@ -1695,11 +1881,11 @@ pub fn audit_page(
                                     <option value="DELETE" selected=m_delete>"DELETE"</option>
                                 </select>
                             </th>
-                            <th><input type="text" name="q_target" value=http_filter.target.clone() placeholder="URL / Path…" class="col-filter" /></th>
-                            <th><input type="text" name="q_status" value=http_filter.status.clone() placeholder="200, 4xx…" class="col-filter" /></th>
+                            <th>{clearable_input("q_target", http_filter.target.clone(), "URL / Path…", "URL or path", true)}</th>
+                            <th>{clearable_input("q_status", http_filter.status.clone(), "200, 4xx…", "Status", true)}</th>
                             <th><span class="hint mono" style="font-size:11px">"-"</span></th>
-                            <th><input type="text" name="q_actor" value=http_filter.actor.clone() placeholder="Actor or IP…" class="col-filter" /></th>
-                            <th><input type="text" name="q_detail" value=http_filter.detail.clone() placeholder="Details…" class="col-filter" /></th>
+                            <th>{clearable_input("q_actor", http_filter.actor.clone(), "Actor or IP…", "Actor or IP", true)}</th>
+                            <th>{clearable_input("q_detail", http_filter.detail.clone(), "Details…", "Details", true)}</th>
                             <th class="nowrap" style="text-align:right">
                                 <div class="row" style="flex-wrap:nowrap;justify-content:flex-end">
                                     <button type="submit" class="btn sm primary">"Filter"</button>
@@ -1768,21 +1954,12 @@ pub fn audit_page(
                             <th style="text-align:right">"Action"</th>
                         </tr>
                         <tr class="filter-row">
-                            <th class="col-ts">
-                                <input
-                                    type="date"
-                                    name="q_ts"
-                                    value=audit_ts_val
-                                    class="col-filter"
-                                    onchange="this.form.submit()"
-                                    title="Filter by date"
-                                />
-                            </th>
-                            <th><input type="text" name="q_user" value=audit_filter.username.clone() placeholder="User…" class="col-filter" /></th>
-                            <th><input type="text" name="q_action" value=audit_filter.action.clone() placeholder="Action…" class="col-filter" /></th>
-                            <th><input type="text" name="q_target" value=audit_filter.target.clone() placeholder="Target…" class="col-filter" /></th>
-                            <th><input type="text" name="q_detail" value=audit_filter.detail.clone() placeholder="Details…" class="col-filter" /></th>
-                            <th><input type="text" name="q_ip" value=audit_filter.ip.clone() placeholder="IP…" class="col-filter" /></th>
+                            <th class="col-ts">{clearable_date("q_ts", audit_ts_val, "date")}</th>
+                            <th>{clearable_input("q_user", audit_filter.username.clone(), "User…", "User", true)}</th>
+                            <th>{clearable_input("q_action", audit_filter.action.clone(), "Action…", "Action", true)}</th>
+                            <th>{clearable_input("q_target", audit_filter.target.clone(), "Target…", "Target", true)}</th>
+                            <th>{clearable_input("q_detail", audit_filter.detail.clone(), "Details…", "Details", true)}</th>
+                            <th>{clearable_input("q_ip", audit_filter.ip.clone(), "IP…", "IP address", true)}</th>
                             <th>
                                 <select name="q_result" class="col-filter" onchange="this.form.submit()">
                                     <option value="" selected=res_all_selected>"All"</option>
@@ -1849,7 +2026,7 @@ pub fn audit_page(
                 </div>
                 <div class="row">
                     <a class="btn sm ghost" href=prev>"Previous"</a>
-                    <a class="btn sm ghost" href=next>"Next"</a>
+                    {next_control}
                 </div>
             </div>
             {flash_view}
@@ -1859,14 +2036,14 @@ pub fn audit_page(
                     <div class="card-head" style="margin-bottom:12px">
                         <div>
                             <div class="card-title">"Security Log Collection Settings"</div>
-                            <div class="card-sub">"Configure which log categories are recorded to SQLite and security_http.log (all enabled by default). Changes take effect immediately."</div>
+                            <div class="card-sub">"Configure which log categories are recorded to SQLite and security_http.log (all enabled by default). Changes take effect immediately. Login, user, security, configuration, command, repository-sync and audit-settings events are always recorded, regardless of these toggles."</div>
                         </div>
                         <button type="submit" class="btn sm primary">"Save Logging Settings"</button>
                     </div>
                     <div class="check-grid">
                         <label class="check">
                             <input type="checkbox" name="admin_audit" checked=log_settings.admin_audit />
-                            <span>"Admin Portal Action Audit (Logins, Users, 2FA, Config)"</span>
+                            <span>"Admin Portal Action Audit (Notifications, Restarts & Other Admin Actions)"</span>
                         </label>
                         <label class="check">
                             <input type="checkbox" name="inbound_webhooks" checked=log_settings.inbound_webhooks />
@@ -1926,6 +2103,63 @@ pub fn audit_page(
 /// GitHub returns HTTP 403 "This installation has been suspended" for suspended app installations.
 fn is_suspended_error(err: &str) -> bool {
     err.to_ascii_lowercase().contains("suspended")
+}
+
+/// A filter input with a built-in clear button.
+///
+/// Table filters are dense and easy to mistype; a single × inside the field is
+/// faster than selecting the text, and `apply_on_clear` re-submits the GET form
+/// so removing a filter takes effect immediately instead of waiting for the user
+/// to find the Filter button.
+fn clearable_input(
+    name: &str,
+    value: String,
+    placeholder: &str,
+    label: &str,
+    apply_on_clear: bool,
+) -> AnyView {
+    let empty = value.is_empty();
+    let wrapper = if apply_on_clear { "cf cf-apply" } else { "cf" };
+    let clear_label = format!("Clear {label}");
+    view! {
+        <span class=wrapper>
+            <input
+                type="text"
+                name=name.to_string()
+                value=value
+                placeholder=placeholder.to_string()
+                aria-label=label.to_string()
+                class="col-filter"
+            />
+            <button type="button" class="cf-x" hidden=empty aria-label=clear_label title="Clear">
+                "×"
+            </button>
+        </span>
+    }
+    .into_any()
+}
+
+/// Date variant of [`clearable_input`]: same wrapper, `type="date"` field.
+fn clearable_date(name: &str, value: String, label: &str) -> AnyView {
+    let empty = value.is_empty();
+    let clear_label = format!("Clear {label}");
+    view! {
+        <span class="cf cf-apply">
+            <input
+                type="date"
+                name=name.to_string()
+                value=value
+                class="col-filter"
+                onchange="this.form.submit()"
+                aria-label=label.to_string()
+                title="Filter by date"
+            />
+            <button type="button" class="cf-x" hidden=empty aria-label=clear_label title="Clear">
+                "×"
+            </button>
+        </span>
+    }
+    .into_any()
 }
 
 fn urlencode(s: &str) -> String {
@@ -2013,5 +2247,37 @@ pub fn notify_page(
                 </form>
             </div>
         </Shell>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn totp_field_announces_its_length_for_auto_submit() {
+        // app.js submits any `input[data-autosubmit]` once it holds that many
+        // digits, so the 2FA field must carry the attribute or the code never
+        // verifies without a click.
+        let challenge = LoginChallenge {
+            pending_token: "pending-token".to_string(),
+            username: "alice".to_string(),
+            has_totp: true,
+            has_passkey: false,
+        };
+        let html = crate::web::ui::render(login_page(None, "/admin".to_string(), Some(challenge)));
+
+        assert!(
+            html.contains(r#"name="totp_code""#),
+            "the 2FA page should still render the code field"
+        );
+        assert!(
+            html.contains(r#"data-autosubmit="8""#),
+            "the 2FA code field must be marked for auto-submit at 8 digits"
+        );
+        assert!(
+            html.contains(r#"maxlength="8""#),
+            "auto-submit length and maxlength must agree"
+        );
     }
 }

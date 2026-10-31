@@ -9,6 +9,81 @@ use crate::triage::TriageService;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// `/issues` and `/prs` in chat: default rows, maximum rows and the character
+/// budget for one message. Discord caps a message at 2000 characters and the
+/// other platforms are similar, so a long list is trimmed rather than rejected.
+const CHAT_LIST_DEFAULT: usize = 10;
+const CHAT_LIST_MAX: usize = 25;
+const CHAT_LIST_BUDGET: usize = 1800;
+/// Raw API pages one chat list may walk (the issues endpoint interleaves PRs).
+const CHAT_LIST_PAGE_SIZE: u32 = 100;
+const CHAT_LIST_MAX_RAW_PAGES: u32 = 5;
+
+/// Compose one chat list message from an already-fetched window.
+///
+/// Pure on purpose: the length budget and the "next page" footer are the parts
+/// most likely to break a platform's message limit, and they are worth testing
+/// without a GitHub client in the way.
+#[allow(clippy::too_many_arguments)]
+fn assemble_list_message(
+    icon: &str,
+    noun: &str,
+    repo: &str,
+    cmd: &str,
+    page: usize,
+    count: usize,
+    offset: usize,
+    lines: &[String],
+    total: Option<u64>,
+) -> String {
+    if lines.is_empty() {
+        return match total {
+            Some(0) => format!("{icon} No open {noun} in `{repo}`."),
+            _ => format!("{icon} No open {noun} on page {page} of `{repo}` ({count} per page)."),
+        };
+    }
+
+    let first = offset + 1;
+    let last = offset + lines.len();
+    let mut out = vec![match total {
+        Some(n) => {
+            format!("{icon} **Open {noun} in `{repo}`** ({n} total, showing {first}–{last}):")
+        }
+        None => format!("{icon} **Open {noun} in `{repo}`** (showing {first}–{last}):"),
+    }];
+
+    // Stay inside the platform limit instead of letting Discord reject the whole
+    // message. Titles vary in length, so the budget is measured in characters,
+    // not in rows.
+    let mut used = out[0].chars().count();
+    let mut shown = 0usize;
+    for line in lines {
+        let cost = line.chars().count() + 1;
+        if used + cost > CHAT_LIST_BUDGET {
+            break;
+        }
+        used += cost;
+        out.push(line.clone());
+        shown += 1;
+    }
+
+    if shown < lines.len() {
+        out.push(format!(
+            "… truncated to fit the message limit. Ask for fewer: `{cmd} {repo} {CHAT_LIST_DEFAULT} {page}`"
+        ));
+    } else {
+        let last_shown = offset + shown;
+        let more = match total {
+            Some(n) => (last_shown as u64) < n,
+            None => true,
+        };
+        if more {
+            out.push(format!("Next page: `{cmd} {repo} {count} {}`", page + 1));
+        }
+    }
+    out.join("\n")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatPlatform {
     Zulip,
@@ -49,9 +124,14 @@ pub enum ChatCommand {
     },
     Issues {
         repo: Option<String>,
+        /// Rows per message (clamped) and the 1-based page of issues to show.
+        count: usize,
+        page: usize,
     },
     Prs {
         repo: Option<String>,
+        count: usize,
+        page: usize,
     },
     Stats {
         repo: Option<String>,
@@ -151,11 +231,13 @@ impl ChatCommandParser {
                 ChatCommand::Unknown(trimmed.to_string())
             }
             "issues" | "prs" | "pulls" => {
-                let repo = parts.get(1).map(|r| Self::resolve_repo(r, known_repos));
+                // `issues [repo] [count] [page]` — the chat surfaces have no
+                // pagination UI, so the window is requested in the message.
+                let (repo, count, page) = Self::parse_list_options(&parts[1..], known_repos);
                 if cmd_key == "issues" {
-                    ChatCommand::Issues { repo }
+                    ChatCommand::Issues { repo, count, page }
                 } else {
-                    ChatCommand::Prs { repo }
+                    ChatCommand::Prs { repo, count, page }
                 }
             }
             _ => {
@@ -305,6 +387,33 @@ impl ChatCommandParser {
         trimmed.to_string()
     }
 
+    /// Parse `[repo] [count] [page]` in any order for `/issues` and `/prs`.
+    ///
+    /// Chat has no pagination controls, so a number in the message is the only
+    /// way to ask for more than the default ten. Numeric tokens fill count, then
+    /// page; the first non-numeric token is the repository.
+    fn parse_list_options(args: &[&str], known_repos: &[String]) -> (Option<String>, usize, usize) {
+        let mut repo = None;
+        let mut numbers = Vec::new();
+        for arg in args {
+            match arg.trim_start_matches('#').parse::<usize>() {
+                Ok(n) => numbers.push(n),
+                Err(_) => {
+                    if repo.is_none() {
+                        repo = Some(Self::resolve_repo(arg, known_repos));
+                    }
+                }
+            }
+        }
+        let count = numbers
+            .first()
+            .copied()
+            .unwrap_or(CHAT_LIST_DEFAULT)
+            .clamp(1, CHAT_LIST_MAX);
+        let page = numbers.get(1).copied().unwrap_or(1).max(1);
+        (repo, count, page)
+    }
+
     fn parse_single_slash_command(text: &str) -> Option<SlashCommand> {
         let mut config = crate::config::CommandsConfig::default();
         config.prefix = "/".to_string();
@@ -338,8 +447,14 @@ impl<'a> ChatCommandExecutor<'a> {
             ChatCommand::Workload { repo } => self.render_workload(repo.as_deref()),
             ChatCommand::Users { repo } => self.render_users(repo.as_deref()).await,
             ChatCommand::Metrics { repo } => self.render_metrics(repo.as_deref()).await,
-            ChatCommand::Issues { repo } => self.render_open_items(repo.as_deref(), false).await,
-            ChatCommand::Prs { repo } => self.render_open_items(repo.as_deref(), true).await,
+            ChatCommand::Issues { repo, count, page } => {
+                self.render_open_items(repo.as_deref(), false, count, page)
+                    .await
+            }
+            ChatCommand::Prs { repo, count, page } => {
+                self.render_open_items(repo.as_deref(), true, count, page)
+                    .await
+            }
             ChatCommand::Stats { repo } => self.render_stats(repo.as_deref()).await,
             ChatCommand::Config => self.render_config(),
             ChatCommand::Stale { repo } => self.run_stale(&message.sender, repo.as_deref()).await,
@@ -395,8 +510,8 @@ You can send commands directly to Sugie from this chat:
 | `metrics [repo]` | `@bot metrics ensia` | Displays 7-day issue & PR triage digest |
 | `stats [repo]` | `@bot stats ensia` | Issue / PR / commit statistics |
 | `config` | `@bot config` | Shows the active configuration summary |
-| `issues [repo]` | `@bot issues ensia` | Lists open issues (first 10) |
-| `prs [repo]` | `@bot prs ensia` | Lists open PRs with their requested reviewers |
+| `issues [repo] [count] [page]` | `@bot issues ensia 25 2` | Lists open issues (default 10, max 25; page 2 continues) |
+| `prs [repo] [count] [page]` | `@bot prs ensia 25` | Lists open PRs with their requested reviewers (default 10, max 25) |
 | `help` | `@bot help` | Displays this help manual |
 
 #### 🛠️ Repository & Issue/PR Actions
@@ -769,17 +884,25 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
         }
     }
 
-    async fn render_open_items(&self, target_repo: Option<&str>, prs: bool) -> String {
+    /// `/issues` and `/prs` for the chat platforms.
+    ///
+    /// `count`/`page` describe the window to show. The issues endpoint returns
+    /// issues and pull requests interleaved, so a window is filled by walking
+    /// raw pages (bounded); the header reports the repository total from the
+    /// exact counters, not from the length of the page we happened to fetch.
+    async fn render_open_items(
+        &self,
+        target_repo: Option<&str>,
+        prs: bool,
+        count: usize,
+        page: usize,
+    ) -> String {
+        let cmd = if prs { "prs" } else { "issues" };
         let repo = match target_repo {
             Some(r) => r.to_string(),
             None => match self.get_known_repositories().first() {
                 Some(first) => first.clone(),
-                None => {
-                    return format!(
-                        "⚠️ Please specify repository: `{} <owner/repo>`.",
-                        if prs { "prs" } else { "issues" }
-                    )
-                }
+                None => return format!("⚠️ Please specify repository: `{cmd} <owner/repo>`."),
             },
         };
         let Some((owner, repo_name)) = repo.split_once('/') else {
@@ -792,57 +915,83 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
                 Err(e) => return format!("❌ Could not access repository `{}`: {}", repo, e),
             },
         };
-        const LIMIT: usize = 10;
-        if prs {
-            match client.list_repo_pulls(owner, repo_name, "open", 100).await {
+
+        let count = count.clamp(1, CHAT_LIST_MAX);
+        let page = page.max(1);
+        let offset = (page - 1).saturating_mul(count);
+
+        // `lines` holds the rows for the requested window; `total` is the
+        // repository-wide count when the API answered the counter query.
+        let (icon, noun, lines, total) = if prs {
+            let total = client.count_open_pulls(owner, repo_name).await.ok();
+            match client
+                .list_repo_pulls_page(owner, repo_name, "open", count as u32, page as u32)
+                .await
+            {
                 Ok(list) => {
-                    let mut lines = vec![format!(
-                        "🔀 **Open PRs in `{}`** ({} total, showing {}):",
-                        repo,
-                        list.len(),
-                        list.len().min(LIMIT)
-                    )];
-                    for p in list.iter().take(LIMIT) {
-                        let reviewers = if p.requested_reviewers.is_empty() {
-                            "no reviewers".to_string()
-                        } else {
-                            p.requested_reviewers
-                                .iter()
-                                .map(|u| format!("@{}", u.login))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        };
-                        lines.push(format!(
-                            "- #{} {} — @{}{} · reviewers: {}",
-                            p.number,
-                            p.title,
-                            p.user.login,
-                            if p.draft { " (draft)" } else { "" },
-                            reviewers
-                        ));
-                    }
-                    lines.join("\n")
+                    let lines = list
+                        .iter()
+                        .map(|p| {
+                            let reviewers = if p.requested_reviewers.is_empty() {
+                                "no reviewers".to_string()
+                            } else {
+                                p.requested_reviewers
+                                    .iter()
+                                    .map(|u| format!("@{}", u.login))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            format!(
+                                "- #{} {} — @{}{} · reviewers: {}",
+                                p.number,
+                                p.title,
+                                p.user.login,
+                                if p.draft { " (draft)" } else { "" },
+                                reviewers
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    ("🔀", "PRs", lines, total)
                 }
-                Err(e) => format!("⚠️ Failed to fetch PRs for `{}`: {}", repo, e),
+                Err(e) => return format!("⚠️ Failed to fetch PRs for `{}`: {}", repo, e),
             }
         } else {
-            match client.list_repo_issues(owner, repo_name, "open", 100).await {
-                Ok(list) => {
-                    let issues: Vec<_> = list.into_iter().filter(|i| !i.is_pr()).collect();
-                    let mut lines = vec![format!(
-                        "🐞 **Open issues in `{}`** ({} total, showing {}):",
-                        repo,
-                        issues.len(),
-                        issues.len().min(LIMIT)
-                    )];
-                    for i in issues.iter().take(LIMIT) {
-                        lines.push(format!("- #{} {} — @{}", i.number, i.title, i.user.login));
+            let total = match tokio::join!(
+                client.count_open_issues_and_prs(owner, repo_name),
+                client.count_open_pulls(owner, repo_name)
+            ) {
+                (Ok(all), Ok(prs)) => Some(all.saturating_sub(prs)),
+                _ => None,
+            };
+            let want = offset + count;
+            let mut issues = Vec::new();
+            let mut raw_page = 1;
+            while issues.len() < want && raw_page <= CHAT_LIST_MAX_RAW_PAGES {
+                match client
+                    .list_repo_issues_page(owner, repo_name, "open", CHAT_LIST_PAGE_SIZE, raw_page)
+                    .await
+                {
+                    Ok(batch) => {
+                        let short_page = batch.len() < CHAT_LIST_PAGE_SIZE as usize;
+                        issues.extend(batch.into_iter().filter(|i| !i.is_pr()));
+                        if short_page {
+                            break;
+                        }
                     }
-                    lines.join("\n")
+                    Err(e) => return format!("⚠️ Failed to fetch issues for `{}`: {}", repo, e),
                 }
-                Err(e) => format!("⚠️ Failed to fetch issues for `{}`: {}", repo, e),
+                raw_page += 1;
             }
-        }
+            let start = offset.min(issues.len());
+            let end = (offset + count).min(issues.len());
+            let lines = issues[start..end]
+                .iter()
+                .map(|i| format!("- #{} {} — @{}", i.number, i.title, i.user.login))
+                .collect::<Vec<_>>();
+            ("🐞", "issues", lines, total)
+        };
+
+        assemble_list_message(icon, noun, &repo, cmd, page, count, offset, &lines, total)
     }
 
     async fn render_metrics(&self, target_repo: Option<&str>) -> String {
@@ -1106,7 +1255,26 @@ mod tests {
         assert_eq!(
             ChatCommandParser::parse("prs ensia", &known),
             ChatCommand::Prs {
-                repo: Some("StarLabsSI/ensia".to_string())
+                repo: Some("StarLabsSI/ensia".to_string()),
+                count: CHAT_LIST_DEFAULT,
+                page: 1,
+            }
+        );
+        // Numbers mean count then page, and may come before or after the repo.
+        assert_eq!(
+            ChatCommandParser::parse("issues 25 2", &known),
+            ChatCommand::Issues {
+                repo: None,
+                count: 25,
+                page: 2,
+            }
+        );
+        assert_eq!(
+            ChatCommandParser::parse("/prs ensia 30 3", &known),
+            ChatCommand::Prs {
+                repo: Some("StarLabsSI/ensia".to_string()),
+                count: CHAT_LIST_MAX,
+                page: 3,
             }
         );
 
@@ -1118,6 +1286,63 @@ mod tests {
                 number: 7,
                 command: SlashCommand::Retest,
             }
+        );
+    }
+
+    #[test]
+    fn chat_list_message_reports_real_total_and_next_page() {
+        let lines: Vec<String> = (1..=3)
+            .map(|n| format!("#{n} Some title — @alice"))
+            .collect();
+        let msg = assemble_list_message(
+            "🐞",
+            "issues",
+            "StarLabsSI/ensia",
+            "issues",
+            1,
+            10,
+            0,
+            &lines,
+            Some(240),
+        );
+        assert!(
+            msg.starts_with("🐞 **Open issues in `StarLabsSI/ensia`** (240 total, showing 1–3):")
+        );
+        assert!(msg.contains("#1 Some title"));
+        assert!(msg.ends_with("Next page: `issues StarLabsSI/ensia 10 2`"));
+    }
+
+    #[test]
+    fn chat_list_message_stops_advertising_pages_that_do_not_exist() {
+        let lines = vec!["#1 Only issue — @bob".to_string()];
+        let msg = assemble_list_message("🐞", "issues", "o/r", "issues", 1, 10, 0, &lines, Some(1));
+        assert!(msg.contains("(1 total, showing 1–1)"));
+        assert!(!msg.contains("Next page"));
+    }
+
+    #[test]
+    fn chat_list_message_is_trimmed_to_the_platform_budget() {
+        // 60 long rows would blow past Discord's 2000-character cap.
+        let lines: Vec<String> = (1..=60)
+            .map(|n| format!("#{n} {}", "x".repeat(80)))
+            .collect();
+        let msg = assemble_list_message("🔀", "PRs", "o/r", "prs", 1, 60, 0, &lines, Some(500));
+        assert!(msg.contains("truncated to fit the message limit"));
+        assert!(!msg.contains("Next page"));
+        // Budget plus the truncation notice, which is itself bounded.
+        assert!(msg.chars().count() <= CHAT_LIST_BUDGET + 160);
+    }
+
+    #[test]
+    fn chat_list_message_handles_empty_and_out_of_range() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            assemble_list_message("🐞", "issues", "o/r", "issues", 1, 10, 0, &empty, Some(0)),
+            "🐞 No open issues in `o/r`."
+        );
+        assert_eq!(
+            assemble_list_message("🐞", "issues", "o/r", "issues", 3, 10, 20, &empty, Some(25)),
+            "🐞 No open issues on page 3 of `o/r` (10 per page)."
         );
     }
 }

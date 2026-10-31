@@ -2,7 +2,8 @@ use crate::config::LabelsConfig;
 use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 pub struct LabelEngine {
     config: LabelsConfig,
@@ -174,7 +175,7 @@ impl LabelEngine {
         }
 
         if let Some(pattern) = regex_opt {
-            if let Ok(re) = Regex::new(pattern) {
+            if let Some(re) = cached_regex(pattern) {
                 if re.is_match(raw_text) {
                     return true;
                 }
@@ -183,6 +184,28 @@ impl LabelEngine {
 
         false
     }
+}
+
+/// Compiling a `Regex` is expensive and the rule set is static, but
+/// `match_text` runs for every issue/PR event, so keep one compiled instance per
+/// pattern. `Regex` is `Arc`-backed internally, so returning a clone is cheap.
+fn cached_regex(pattern: &str) -> Option<Regex> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Regex>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // A poisoned cache still works, it just stops remembering new patterns.
+    let Ok(mut cache) = cache.lock() else {
+        return Regex::new(pattern).ok();
+    };
+    if let Some(re) = cache.get(pattern) {
+        return Some(re.clone());
+    }
+    let re = Regex::new(pattern).ok()?;
+    // Patterns come from repo config, but keep the map bounded anyway.
+    if cache.len() >= 512 {
+        cache.clear();
+    }
+    cache.insert(pattern.to_string(), re.clone());
+    Some(re)
 }
 
 #[cfg(test)]

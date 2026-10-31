@@ -3,6 +3,7 @@
 
 use crate::config::SugieConfig;
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -135,11 +136,17 @@ impl ConfigFiles {
         let mut out = Vec::new();
         for line in raw.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || (trimmed.starts_with('#') && !trimmed.starts_with("#!")) {
+            // Skip blank lines and the `#!` shebang only: a commented-out variable
+            // is still shown in the UI (flagged as commented).
+            if trimmed.is_empty() || trimmed.starts_with("#!") {
                 continue;
             }
             let commented = trimmed.starts_with('#');
-            let body = trimmed.trim_start_matches('#').trim();
+            let body = if commented {
+                trimmed.trim_start_matches('#').trim()
+            } else {
+                trimmed
+            };
             let Some((key, value)) = body.split_once('=') else {
                 continue;
             };
@@ -158,41 +165,73 @@ impl ConfigFiles {
     }
 
     /// Merge submitted values back into the file, preserving comments, ordering
-    /// and any keys the form did not touch. Empty values mean "keep current".
+    /// and any keys the form did not touch. An empty value means "keep current"
+    /// for secret keys (the form never renders them); for any other key it means
+    /// "set to empty".
     pub fn save_env(&self, updates: &[(String, String)]) -> Result<Option<PathBuf>> {
         let raw = std::fs::read_to_string(&self.env_path).unwrap_or_default();
         let mut lines: Vec<String> = raw.lines().map(|l| l.to_string()).collect();
-        let mut pending: Vec<(String, String)> = updates
-            .iter()
-            .filter(|(k, v)| !k.trim().is_empty() && !v.is_empty())
-            .map(|(k, v)| (k.trim().to_string(), v.clone()))
-            .collect();
+        let mut pending: Vec<(String, String)> = Vec::new();
+        for (k, v) in updates {
+            let key = k.trim().to_string();
+            if key.is_empty() {
+                continue;
+            }
+            // A form field name becomes a raw line prefix; without this check a
+            // crafted key could append arbitrary `SECRET=...` definitions.
+            if !is_valid_env_key(&key) {
+                return Err(anyhow!("Invalid environment variable name `{key}`"));
+            }
+            if v.is_empty() && is_secret_key(&key) {
+                continue;
+            }
+            pending.push((key, v.clone()));
+        }
 
+        let mut rewritten: HashSet<String> = HashSet::new();
+        let mut commented: HashSet<String> = HashSet::new();
         for line in lines.iter_mut() {
             let trimmed = line.trim();
-            let is_comment = trimmed.starts_with('#');
-            let body = if is_comment {
-                trimmed.trim_start_matches('#').trim()
-            } else {
-                trimmed
-            };
-            let Some((key, _)) = body.split_once('=') else {
+            if trimmed.starts_with('#') {
+                let Some((key, value)) = trimmed.trim_start_matches('#').trim().split_once('=')
+                else {
+                    continue;
+                };
+                // Owned copies so the line can be rewritten below.
+                let key = key.trim().to_string();
+                let value = unquote(value.trim());
+                // An untouched comment stays documentation. A comment whose value
+                // the operator changed is promoted to a live definition in place —
+                // otherwise the UI reports "Saved .env" while dropping a rotated
+                // secret on the floor.
+                if let Some((_, new_value)) =
+                    pending.iter().find(|(k, _)| k.as_str() == key.as_str())
+                {
+                    if *new_value != value {
+                        *line = render_env(&key, new_value);
+                        rewritten.insert(key.clone());
+                    }
+                }
+                commented.insert(key);
+                continue;
+            }
+            let Some((key, _)) = trimmed.split_once('=') else {
                 continue;
             };
             let key = key.trim();
-            if let Some(idx) = pending.iter().position(|(k, _)| k == key) {
-                let value = pending.remove(idx).1;
-                let rendered = format!("{}={}", key, quote_if_needed(&value));
-                *line = if is_comment {
-                    format!("#{rendered}")
-                } else {
-                    rendered
-                };
+            if let Some((_, value)) = pending.iter().find(|(k, _)| k == key) {
+                // dotenv honours the *last* definition, so every occurrence has to
+                // be rewritten or an edit to a duplicated key silently does nothing.
+                let rendered = render_env(key, value);
+                rewritten.insert(key.to_string());
+                *line = rendered;
             }
         }
 
         for (key, value) in pending {
-            lines.push(format!("{}={}", key, quote_if_needed(&value)));
+            if !rewritten.contains(&key) && !commented.contains(&key) {
+                lines.push(render_env(&key, &value));
+            }
         }
 
         let mut content = lines.join("\n");
@@ -227,9 +266,7 @@ impl ConfigFiles {
         let mut dest = self.backup_dir.join(format!("{name}.{stamp}.bak"));
         let mut seq = 1;
         while dest.exists() {
-            dest = self
-                .backup_dir
-                .join(format!("{name}.{stamp}-{seq}.bak"));
+            dest = self.backup_dir.join(format!("{name}.{stamp}-{seq}.bak"));
             seq += 1;
             if seq > 99 {
                 break;
@@ -425,6 +462,26 @@ fn unquote(v: &str) -> String {
         v[1..v.len() - 1].to_string()
     } else {
         v.to_string()
+    }
+}
+
+/// `^[A-Za-z_][A-Za-z0-9_]*$` — the only shape a dotenv key may take, and the
+/// only way a submitted field name is allowed to reach the file verbatim.
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// An empty value is written as a bare `KEY=`, not `KEY=""`.
+fn render_env(key: &str, value: &str) -> String {
+    if value.is_empty() {
+        format!("{key}=")
+    } else {
+        format!("{key}={}", quote_if_needed(value))
     }
 }
 

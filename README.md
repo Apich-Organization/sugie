@@ -2,7 +2,7 @@
 
 > A powerful, highly configurable GitHub triage bot engineered in Rust for open-source organizations, mono-repos, and modern engineering teams. Native **Podman** containerized deployment with deep **Discord** & **Zulip** event synchronization.
 
-[![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![Podman Ready](https://img.shields.io/badge/container-podman%20native-purple.svg)](https://podman.io)
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
@@ -25,14 +25,14 @@
 | ⚖️ **Reviewer Load Balancing** | Distributes PR reviews using workload tracking (`least_busy` or `round_robin`), path-based component pools, configurable `reviewers_per_pr`, out-of-office exclusions, and capacity limits. |
 | 🚀 **Contributor Growth Tracking** | Tracks contributor milestone thresholds in persistent SQLite storage. Celebrates milestones and alerts maintainers to consider granting triage or committer rights. |
 | 📊 **Weekly & Monthly Triage Reports** | Aggregates metrics: new vs closed issues, close rate, time-to-first-response (TTFR), active contributors, net code lines added/deleted, and commit counts. Formats markdown digests and posts to GitHub issues, Discord, and Zulip on a configurable schedule. |
-| 💬 **Lark, Discord & Zulip Two-Way Chat Sync** | Full bidirectional chat integration: rich notifications for reports and triage events, plus interactive in-chat bot commands (`/status`, `/workload`, `/assign`, etc.). See [Chat Bots Configuration Guide](file:///home/pana/dev2/sugie/docs/CHAT_BOTS_CONFIGURATION_GUIDE.md). |
-| ⚡ **Interactive Slash Commands** | Commands in comments: `/assign`, `/unassign`, `/label`, `/unlabel`, `/close`, `/reopen`, `/retest`, `/project`, `/move` (cross-repo issue transfer), `/duplicate`, and `/help`. Supports custom command prefix and aliases (`/l` for `/label`, `/a` for `/assign`). |
+| 💬 **Lark, Discord & Zulip Two-Way Chat Sync** | Full bidirectional chat integration: rich notifications for reports and triage events, plus interactive in-chat bot commands (`/status`, `/workload`, `/assign`, etc.). See [Chat Bots Configuration Guide](docs/CHAT_BOTS_CONFIGURATION_GUIDE.md). |
+| ⚡ **Interactive Slash Commands** | Commands in comments: `/assign`, `/unassign`, `/label`, `/unlabel`, `/close`, `/reopen`, `/retest`, `/project`, `/move` (cross-repo issue transfer), `/duplicate`, `/title`, `/milestone`, `/lock`, `/unlock`, and `/help`. Supports custom command prefix and aliases (`/l` for `/label`, `/a` for `/assign`). |
 
 ---
 
 ## 💬 Lark, Discord & Zulip Notification Events
 
-Detailed setup instructions for all three platforms are documented in [`docs/CHAT_BOTS_CONFIGURATION_GUIDE.md`](file:///home/pana/dev2/sugie/docs/CHAT_BOTS_CONFIGURATION_GUIDE.md).
+Detailed setup instructions for all three platforms are documented in [`docs/CHAT_BOTS_CONFIGURATION_GUIDE.md`](docs/CHAT_BOTS_CONFIGURATION_GUIDE.md).
 
 Every event can be toggled individually in `sugie.toml`:
 
@@ -157,7 +157,99 @@ systemctl --user status sugie.service
 | `/project` | `/p` | `/project 1 In Progress` | Adds item to GitHub Project v2 board |
 | `/move` | `/m` | `/move other-org/target-repo` | **Cross-repo migration**: Copies issue, transfers labels, references author, and closes original |
 | `/duplicate`| - | `/duplicate #123` | Closes issue as duplicate of #123 |
+| `/title` | - | `/title Fix crash on Safari` | Renames the issue or PR (max 256 chars) |
+| `/milestone` | - | `/milestone v1.4` or `/milestone none` | Sets a milestone by title or `#num`; `none` clears it |
+| `/lock` | - | `/lock too heated` | Locks the conversation (`off-topic`, `too heated`, `resolved`, `spam`) |
+| `/unlock` | - | `/unlock` | Unlocks the conversation |
 | `/help` | - | `/help` | Displays command usage manual |
+
+---
+
+## 🖥️ Web Admin Console
+
+The bot serves a self-hosted admin console at **`/admin`** on the same port as
+the webhook listener — no extra process, no separate build pipeline, no SSH.
+
+```bash
+sugie serve --config ./sugie.toml
+# → http://localhost:8800/admin
+```
+
+On first start a bootstrap `owner` account is created and its generated password
+is written to `data/admin-initial-password.txt` (mode `0600`). The file is
+deleted as soon as the first session is minted.
+
+| Screen | What it does |
+| :--- | :--- |
+| **Dashboard** (`/admin`) | Per-repository issue / PR / commit / merged counters, cache age, repository sync |
+| **Repositories** (`/admin/repos`) | Every onboarded repository with its live counters and installation id |
+| **Console** (`/admin/chat`) | Pick a repository, type a slash command, watch the output stream over SSE; job history per user; **Stop** cancels a running command; long lists page with `/issues 50 2` and a **Show more** button |
+| **Configuration** (`/admin/config`) | Structured forms for `.env` and `sugie.toml` plus raw TOML editing, validation before save, automatic timestamped backups and one-click restore |
+| **Users** (`/admin/users`) | Create / edit / disable accounts, assign roles, per-repository and per-command grants, global 2FA enforcement |
+| **Audit** (`/admin/audit`) | Login, admin-action and command history with filters and CSV export |
+| **Security** (`/admin/security`) | TOTP enrolment (QR), WebAuthn passkeys, session revocation |
+
+### Permissions
+
+| Role | Execute commands | Edit config | Manage users | Purge audit |
+| :--- | :---: | :---: | :---: | :---: |
+| `owner` | ✅ | ✅ | ✅ (incl. other owners) | ✅ |
+| `admin` | ✅ | ✅ | ✅ (non-owner accounts) | ✅ |
+| `maintainer` | ✅ (granted repos only) | — | — | — |
+| `viewer` | — | — | — | — |
+
+Repositories and *restricted* commands are additionally gated per user: an
+account only sees and acts on the repositories it has been granted, and a
+command marked `restricted_commands` in `sugie.toml` needs an explicit
+per-command grant.
+
+### Security model
+
+- Argon2id password hashing, opaque 256-bit session tokens stored hashed.
+- Session cookies are `HttpOnly`, `SameSite=Strict`, `Secure`, and use the
+  `__Host-` prefix when served over TLS.
+- CSRF protection on every state-changing request (Origin / `Sec-Fetch-Site`
+  validation), strict CSP, `X-Frame-Options: DENY`, HSTS.
+- Login lockout with timing-equalised failures; optional TOTP and WebAuthn.
+  Global 2FA enforcement is **off on a fresh install** so the first owner can use
+  the console immediately; the dashboard shows a warning until it is enabled on
+  the Users page.
+- Config writes are validated, backed up, and applied atomically
+  (tmp + fsync + rename) with `0600` permissions; secrets are masked in the UI.
+- Every admin action and command is written to the audit log.
+- `SUGIE_GITHUB_WEBHOOK_SECRET` is **required**: while it is empty, `/webhook`
+  answers `503` and logs the reason, because HMAC would otherwise accept a
+  zero-length key that anyone can compute. Set it to the GitHub App's webhook
+  secret.
+- The Lark, Discord and Zulip inbound routes verify with their own credentials
+  (`SUGIE_LARK_VERIFICATION_TOKEN` / `SUGIE_LARK_ENCRYPT_KEY`,
+  `SUGIE_DISCORD_PUBLIC_KEY`, `SUGIE_ZULIP_OUTGOING_TOKEN`). `SUGIE_CHAT_API_TOKEN`
+  does not cover them; each unset secret is named in a startup warning.
+- `/status` reports a repository **count** only — the inventory is available to
+  signed-in console users who are allowed to see it.
+- The generic chat bridge endpoint `POST /api/chat/command` can run `/comment`,
+  `/assign`, `/close` and the rest of the chat commands. Set
+  `SUGIE_CHAT_API_TOKEN` to require the matching `X-Sugie-Chat-Token` header;
+  when it is unset the endpoint stays open (historical behaviour) and the
+  service logs a warning at startup.
+
+```bash
+# Recommended: a long random shared secret
+SUGIE_CHAT_API_TOKEN=$(openssl rand -hex 32)
+
+# Then every call from the bridge must carry it:
+curl -X POST http://localhost:8800/api/chat/command \
+  -H "X-Sugie-Chat-Token: $SUGIE_CHAT_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"command":"issues ensia 25 2","sender":"bridge"}'
+```
+
+See [`docs/ADMIN_CONSOLE_PLAN.md`](docs/ADMIN_CONSOLE_PLAN.md) for the design and
+[`docs/REVIEW_2026-10.md`](docs/REVIEW_2026-10.md) for the security review.
+
+> Changing `.env` or `sugie.toml` from the console writes the file immediately,
+> but some values (tokens, ports, notification credentials) are only read at
+> startup — use **Restart service** on the config page to apply them.
 
 ---
 
@@ -171,7 +263,15 @@ Place `.github/sugie.toml` in your repository's default branch to customize beha
 
 ---
 
-## 🧪 Testing
+## 🧪 Building & Testing
+
+`webauthn-rs` links OpenSSL, so a system OpenSSL 3 (`pkg-config` + `libssl-dev`
+on Debian, `openssl@3` on macOS) is required. To build a self-contained binary
+without it, enable the vendored feature:
+
+```bash
+cargo build --release --features vendored-openssl
+```
 
 ```bash
 # Run all unit and integration tests

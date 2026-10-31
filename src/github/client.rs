@@ -1,9 +1,10 @@
-use super::models::{CheckRun, Comment, CommitItem, Issue, PullRequest, PullRequestFile, User};
+use super::models::{
+    CheckRun, Comment, CommitItem, Issue, Label, Milestone, PullRequest, PullRequestFile, User,
+};
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
 use serde_json::json;
-
 
 /// Percent-encode a single path segment. Values such as label names are free-form
 /// user text; without this a `/` or `..` in a label would rewrite the request path
@@ -332,12 +333,7 @@ impl GitHubClient {
         .await
     }
 
-    pub async fn count_commits_since(
-        &self,
-        owner: &str,
-        repo: &str,
-        since: &str,
-    ) -> Result<u64> {
+    pub async fn count_commits_since(&self, owner: &str, repo: &str, since: &str) -> Result<u64> {
         self.total_count(&format!(
             "/repos/{}/{}/commits?since={}&per_page=1",
             seg(owner),
@@ -365,7 +361,10 @@ impl GitHubClient {
             .await?
             .error_for_status()?;
         let body: serde_json::Value = resp.json().await?;
-        Ok(body.get("total_count").and_then(|v| v.as_u64()).unwrap_or(0))
+        Ok(body
+            .get("total_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0))
     }
 
     pub async fn add_assignees(
@@ -444,6 +443,94 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Unlock a conversation that `lock_issue` closed.
+    pub async fn unlock_issue(&self, owner: &str, repo: &str, issue_number: u64) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}/lock",
+            self.base_url, owner, repo, issue_number
+        );
+        self.send_logged(reqwest::Method::DELETE, &url, None)
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Rename an issue or PR. Titles are the one field operators fix most often
+    /// during triage (typos, missing component prefixes).
+    pub async fn set_issue_title(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        title: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}",
+            self.base_url, owner, repo, issue_number
+        );
+        let payload = json!({ "title": title });
+        self.send_logged(reqwest::Method::PATCH, &url, Some(&payload))
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Assign a milestone by number, or clear it with `None` (`"milestone": null`).
+    pub async fn set_issue_milestone(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        milestone: Option<u64>,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}",
+            self.base_url, owner, repo, issue_number
+        );
+        let payload = json!({ "milestone": milestone });
+        self.send_logged(reqwest::Method::PATCH, &url, Some(&payload))
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Repository labels, so `/label` can be typed without guessing exact names.
+    pub async fn list_labels(&self, owner: &str, repo: &str) -> Result<Vec<Label>> {
+        let url = format!(
+            "{}/repos/{}/{}/labels?per_page=100",
+            self.base_url, owner, repo
+        );
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
+        Ok(resp.json::<Vec<Label>>().await?)
+    }
+
+    /// Open milestones, newest first as GitHub returns them.
+    pub async fn list_milestones(&self, owner: &str, repo: &str) -> Result<Vec<Milestone>> {
+        let url = format!(
+            "{}/repos/{}/{}/milestones?state=open&per_page=100",
+            self.base_url, owner, repo
+        );
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
+        Ok(resp.json::<Vec<Milestone>>().await?)
+    }
+
+    /// Remaining API quota for the installation token. `/rate_limit` does not
+    /// count against the limit, which makes it safe to poll.
+    pub async fn rate_limit(&self) -> Result<serde_json::Value> {
+        let url = format!("{}/rate_limit", self.base_url);
+        let resp = self
+            .send_logged(reqwest::Method::GET, &url, None)
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn list_repo_issues(
         &self,
         owner: &str,
@@ -451,9 +538,29 @@ impl GitHubClient {
         state: &str,
         per_page: u32,
     ) -> Result<Vec<Issue>> {
+        self.list_repo_issues_page(owner, repo, state, per_page, 1)
+            .await
+    }
+
+    /// One page of the issues list. Note that this endpoint returns **issues and
+    /// pull requests interleaved**, so a caller that wants issues only has to
+    /// keep walking pages until its window is full.
+    pub async fn list_repo_issues_page(
+        &self,
+        owner: &str,
+        repo: &str,
+        state: &str,
+        per_page: u32,
+        page: u32,
+    ) -> Result<Vec<Issue>> {
         let url = format!(
-            "{}/repos/{}/{}/issues?state={}&per_page={}&sort=updated&direction=desc",
-            self.base_url, owner, repo, state, per_page
+            "{}/repos/{}/{}/issues?state={}&per_page={}&page={}&sort=updated&direction=desc",
+            self.base_url,
+            seg(owner),
+            seg(repo),
+            seg(state),
+            per_page,
+            page
         );
         let resp = self
             .send_logged(reqwest::Method::GET, &url, None)
@@ -568,9 +675,28 @@ impl GitHubClient {
         state: &str,
         per_page: u32,
     ) -> Result<Vec<PullRequest>> {
+        self.list_repo_pulls_page(owner, repo, state, per_page, 1)
+            .await
+    }
+
+    /// One page of the pull-request list (no issues mixed in, so page `n` starts
+    /// at `(n - 1) * per_page + 1`).
+    pub async fn list_repo_pulls_page(
+        &self,
+        owner: &str,
+        repo: &str,
+        state: &str,
+        per_page: u32,
+        page: u32,
+    ) -> Result<Vec<PullRequest>> {
         let url = format!(
-            "{}/repos/{}/{}/pulls?state={}&per_page={}&sort=updated&direction=desc",
-            self.base_url, owner, repo, state, per_page
+            "{}/repos/{}/{}/pulls?state={}&per_page={}&page={}&sort=updated&direction=desc",
+            self.base_url,
+            seg(owner),
+            seg(repo),
+            seg(state),
+            per_page,
+            page
         );
         let resp = self
             .send_logged(reqwest::Method::GET, &url, None)

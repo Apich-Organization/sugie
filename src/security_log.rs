@@ -156,6 +156,13 @@ pub fn init(db_path: &str) {
             let _ = std::fs::create_dir_all(parent);
         }
     }
+    // Earlier versions created the log with the default umask (0644); tighten an
+    // existing file as well, since it may already contain webhook tokens.
+    #[cfg(unix)]
+    if log_file_path.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&log_file_path, std::fs::Permissions::from_mode(0o600));
+    }
 
     let Ok(conn) = Connection::open(db_path) else {
         return;
@@ -253,11 +260,16 @@ pub fn record(entry: SecurityHttpLogEntry) {
 
     // 1. Append JSON line to security_http.log
     if let Ok(_fguard) = logger.file_lock.lock() {
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&logger.log_file_path)
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        // The file holds webhook URLs (i.e. their bearer tokens); keep it
+        // owner-only instead of relying on the process umask.
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        if let Ok(mut file) = opts.open(&logger.log_file_path) {
             if let Ok(line) = serde_json::to_string(&entry) {
                 let _ = writeln!(file, "{line}");
             }
@@ -323,7 +335,9 @@ pub fn log_inbound_http(
         ts: Utc::now().to_rfc3339(),
         direction: "INBOUND_API".to_string(),
         method: method.to_string(),
-        target: uri.to_string(),
+        // Same treatment as outbound URLs: a future route may carry a token in
+        // the path or query string, so never store the raw target.
+        target: redact_url(uri),
         status,
         duration_ms,
         ip: ip.to_string(),
@@ -372,13 +386,73 @@ pub fn log_notification_request(
         ts: Utc::now().to_rfc3339(),
         direction: "OUTBOUND_NOTIFY".to_string(),
         method: method.to_string(),
-        target: url.to_string(),
+        // A webhook URL *is* the credential: never store it verbatim.
+        target: redact_url(url),
         status,
         duration_ms,
         ip: "-".to_string(),
         actor: format!("{platform}-notifier"),
         detail: truncate_detail(detail, 1000),
     });
+}
+
+/// Strip the secret part of a URL before it reaches the audit log.
+///
+/// Discord/Lark/Zulip webhook URLs carry their bearer token in the path, and
+/// arbitrary URLs can carry one in the query string, so the scheme, host and
+/// short path segments are kept while the credential-looking tail is masked.
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        // A relative inbound path: nothing host-like to keep, but its query may
+        // still carry a token.
+        return match url.split_once('?') {
+            Some((path, query)) => format!("{}?{}", mask_long_segments(path), mask_query(query)),
+            None => mask_long_segments(url),
+        };
+    };
+    let (authority, path_and_query) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // `user:password@host` puts the credential in the authority.
+    let authority = match authority.rsplit_once('@') {
+        Some((_, host)) => format!("…@{host}"),
+        None => authority.to_string(),
+    };
+
+    // Discord: /api/webhooks/<id>/<token> — keep the id (handy for support).
+    if let Some(tail) = path_and_query.strip_prefix("/api/webhooks/") {
+        let id = tail.split('/').next().unwrap_or_default();
+        return format!("{scheme}://{authority}/api/webhooks/{id}/…");
+    }
+
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_and_query, None),
+    };
+    let path = mask_long_segments(path);
+    match query {
+        Some(q) => format!("{scheme}://{authority}{path}?{}", mask_query(q)),
+        None => format!("{scheme}://{authority}{path}"),
+    }
+}
+
+fn mask_long_segments(path: &str) -> String {
+    path.split('/')
+        .map(|seg| if seg.chars().count() > 24 { "…" } else { seg })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn mask_query(query: &str) -> String {
+    query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) => format!("{key}=…"),
+            None => "…".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn truncate_detail(s: &str, max_chars: usize) -> String {

@@ -207,7 +207,10 @@ impl WebDb {
         .ok()
         .flatten()
         .map(|v| v == "true" || v == "1")
-        .unwrap_or(true)
+        // Default off. Forcing 2FA on a brand-new install bounced every page to
+        // /admin/security, which locks the first owner out of the console they
+        // just bootstrapped. The dashboard nudges instead.
+        .unwrap_or(false)
     }
 
     fn init(&self) -> Result<()> {
@@ -354,10 +357,18 @@ impl WebDb {
             "CREATE INDEX IF NOT EXISTS idx_web_audit_action ON web_audit(action, id DESC)",
             [],
         );
-
-        // Seed default global 2FA policy (enabled by default so first-time logins prompt 2FA setup)
+        // Actor lookups are a hot filter in /admin/audit and had no index. The
+        // `ts` indexes for both tables already exist above.
         let _ = conn.execute(
-            "INSERT OR IGNORE INTO web_settings (key, value, updated_at) VALUES (?1, 'true', ?2)",
+            "CREATE INDEX IF NOT EXISTS idx_web_audit_username ON web_audit(username, id DESC)",
+            [],
+        );
+
+        // Seed the global 2FA policy. Off by default: a fresh install must be
+        // usable before the owner has enrolled a second factor. Owners are
+        // nudged on the dashboard and can turn it on in one click.
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO web_settings (key, value, updated_at) VALUES (?1, 'false', ?2)",
             params![KEY_GLOBAL_2FA_ENABLED, Utc::now().to_rfc3339()],
         );
 
@@ -537,10 +548,7 @@ impl WebDb {
         )?;
         // A password rotation must invalidate every other session, otherwise a
         // stolen cookie keeps working after the user "secures" the account.
-        tx.execute(
-            "DELETE FROM web_sessions WHERE user_id = ?1",
-            params![id],
-        )?;
+        tx.execute("DELETE FROM web_sessions WHERE user_id = ?1", params![id])?;
         tx.execute(
             "DELETE FROM web_pending_2fa WHERE user_id = ?1",
             params![id],
@@ -1058,15 +1066,34 @@ impl WebDb {
     }
 
     pub fn consume_pending_2fa(&self, token_hash: &str) -> Result<Option<(UserRow, String)>> {
-        let res = self.get_pending_2fa(token_hash)?;
-        if res.is_some() {
-            let conn = self.lock_conn();
-            let _ = conn.execute(
-                "DELETE FROM web_pending_2fa WHERE token_hash = ?1",
+        let conn = self.lock_conn();
+        // Consume the token in one statement: the old check-then-delete let two
+        // concurrent OTP submissions both read the row and both mint a session.
+        let consumed: Option<(i64, String, String)> = conn
+            .query_row(
+                "DELETE FROM web_pending_2fa WHERE token_hash = ?1
+                 RETURNING user_id, next_url, expires_at",
                 params![token_hash],
-            );
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((user_id, next_url, expires_at)) = consumed else {
+            return Ok(None);
+        };
+
+        let expired = chrono::DateTime::parse_from_rfc3339(&expires_at)
+            .map(|d| d.with_timezone(&Utc) < Utc::now())
+            .unwrap_or(true);
+        if expired {
+            return Ok(None);
         }
-        Ok(res)
+
+        let sql = format!("{USER_SELECT_SQL} WHERE u.id = ?1");
+        let row = conn
+            .query_row(&sql, params![user_id], map_user)
+            .optional()?;
+        Ok(row.filter(|u| u.active).map(|u| (u, next_url)))
     }
 
     // --------------------------------------------------------------- perms
@@ -1138,11 +1165,17 @@ impl WebDb {
     ) {
         // Authentication and privilege changes are always recorded: letting the
         // toggle silence them would be an anti-forensics switch for an attacker
-        // who already holds an admin account.
+        // who already holds an admin account. Configuration writes, dispatched
+        // commands, repository syncs and audit-settings changes are in the same
+        // class — they explain *why* the system changed, not just who signed in.
         let always = action.starts_with("login")
             || action.starts_with("2fa.")
             || action.starts_with("user.")
-            || action.starts_with("security.");
+            || action.starts_with("security.")
+            || action.starts_with("config.")
+            || action.starts_with("command")
+            || action.starts_with("repos.sync")
+            || action.starts_with("audit.");
         if !always && !crate::security_log::current_settings().admin_audit {
             return;
         }
@@ -1184,8 +1217,9 @@ impl WebDb {
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if !filter.ts.trim().is_empty() {
-            sql.push_str(" AND ts LIKE ?");
-            params_vec.push(Box::new(format!("%{}%", filter.ts.trim())));
+            let (clause, value) = ts_filter(filter.ts.trim());
+            sql.push_str(clause);
+            params_vec.push(Box::new(value));
         }
         if !filter.username.trim().is_empty() {
             sql.push_str(" AND username LIKE ?");
@@ -1251,8 +1285,9 @@ impl WebDb {
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if !filter.ts.trim().is_empty() {
-            sql.push_str(" AND ts LIKE ?");
-            params_vec.push(Box::new(format!("%{}%", filter.ts.trim())));
+            let (clause, value) = ts_filter(filter.ts.trim());
+            sql.push_str(clause);
+            params_vec.push(Box::new(value));
         }
         if !filter.username.trim().is_empty() {
             sql.push_str(" AND username LIKE ?");
@@ -1338,8 +1373,9 @@ impl WebDb {
         }
 
         if !filter.ts.trim().is_empty() {
-            sql.push_str(" AND ts LIKE ?");
-            params_vec.push(Box::new(format!("%{}%", filter.ts.trim())));
+            let (clause, value) = ts_filter(filter.ts.trim());
+            sql.push_str(clause);
+            params_vec.push(Box::new(value));
         }
         if !filter.method.trim().is_empty() {
             sql.push_str(" AND method LIKE ?");
@@ -1429,8 +1465,9 @@ impl WebDb {
         }
 
         if !filter.ts.trim().is_empty() {
-            sql.push_str(" AND ts LIKE ?");
-            params_vec.push(Box::new(format!("%{}%", filter.ts.trim())));
+            let (clause, value) = ts_filter(filter.ts.trim());
+            sql.push_str(clause);
+            params_vec.push(Box::new(value));
         }
         if !filter.method.trim().is_empty() {
             sql.push_str(" AND method LIKE ?");
@@ -1549,6 +1586,17 @@ fn map_passkey(r: &rusqlite::Row<'_>) -> rusqlite::Result<PasskeyRow> {
         created_at: r.get(6)?,
         last_used_at: r.get(7)?,
     })
+}
+
+/// `ts` is stored as an RFC 3339 string, so a date-like filter is a prefix and
+/// stays index-friendly; only input with no digits at all falls back to the
+/// substring match that can never use an index.
+fn ts_filter(input: &str) -> (&'static str, String) {
+    if input.chars().any(|c| c.is_ascii_digit()) {
+        (" AND ts LIKE ? || '%'", input.to_string())
+    } else {
+        (" AND ts LIKE ?", format!("%{input}%"))
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

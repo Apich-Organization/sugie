@@ -36,6 +36,16 @@ impl Storage {
             }
         }
         let conn = Connection::open(path)?;
+        // The same file is written by `WebDb` and the security logger, so the
+        // same concurrency settings are required to avoid `SQLITE_BUSY`.
+        let _ = conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA foreign_keys = ON;
+            "#,
+        );
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -52,8 +62,16 @@ impl Storage {
         Ok(storage)
     }
 
+    /// Take the connection lock without propagating mutex poisoning: one panic
+    /// in a handler must not brick every later webhook and admin action.
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn init_tables(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS repositories (
@@ -96,7 +114,7 @@ impl Storage {
     // --- Repositories ---
 
     pub fn upsert_repository(&self, id: u64, full_name: &str, installation_id: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             r#"
@@ -113,7 +131,7 @@ impl Storage {
     }
 
     pub fn remove_repository(&self, full_name: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "DELETE FROM repositories WHERE full_name = ?1",
             params![full_name],
@@ -122,7 +140,7 @@ impl Storage {
     }
 
     pub fn list_repositories(&self) -> Result<Vec<(u64, String, u64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare("SELECT id, full_name, installation_id FROM repositories")?;
         let rows = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
@@ -139,7 +157,7 @@ impl Storage {
     }
 
     pub fn get_installation_id_for_repo(&self, full_name: &str) -> Result<Option<u64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt =
             conn.prepare("SELECT installation_id FROM repositories WHERE full_name = ?1")?;
         let mut rows = stmt.query(params![full_name])?;
@@ -154,7 +172,7 @@ impl Storage {
     // --- Contributor Stats ---
 
     pub fn record_merged_pr(&self, username: &str, repo: &str) -> Result<u32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             r#"
             INSERT INTO contributor_stats (username, repo, merged_prs, opened_issues, reviews_done, last_milestone_notified)
@@ -177,7 +195,7 @@ impl Storage {
         username: &str,
         repo: &str,
     ) -> Result<Option<ContributorStats>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT username, repo, merged_prs, opened_issues, reviews_done, last_milestone_notified FROM contributor_stats WHERE username = ?1 AND repo = ?2"
         )?;
@@ -202,7 +220,7 @@ impl Storage {
         repo: &str,
         milestone: u32,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "UPDATE contributor_stats SET last_milestone_notified = ?3 WHERE username = ?1 AND repo = ?2",
             params![username, repo, milestone],
@@ -213,7 +231,7 @@ impl Storage {
     // --- Reviewer Workloads ---
 
     pub fn get_reviewer_workload(&self, username: &str, repo: &str) -> Result<u32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT active_reviews FROM reviewer_workloads WHERE username = ?1 AND repo = ?2",
         )?;
@@ -227,7 +245,7 @@ impl Storage {
     }
 
     pub fn increment_reviewer_workload(&self, username: &str, repo: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             r#"
@@ -243,7 +261,7 @@ impl Storage {
     }
 
     pub fn decrement_reviewer_workload(&self, username: &str, repo: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             r#"
             UPDATE reviewer_workloads
@@ -259,7 +277,7 @@ impl Storage {
         &self,
         repo: Option<&str>,
     ) -> Result<Vec<(String, String, u32)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut workloads = Vec::new();
         if let Some(r) = repo {
             let mut stmt = conn.prepare(
@@ -286,7 +304,7 @@ impl Storage {
     // --- Stale Tracking ---
 
     pub fn record_stale_warned(&self, repo: &str, issue_number: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             r#"
@@ -300,7 +318,7 @@ impl Storage {
     }
 
     pub fn get_stale_warned(&self, repo: &str, issue_number: u64) -> Result<Option<DateTime<Utc>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT warned_at FROM stale_tracking WHERE repo = ?1 AND issue_number = ?2",
         )?;
@@ -318,7 +336,7 @@ impl Storage {
     }
 
     pub fn clear_stale_warned(&self, repo: &str, issue_number: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "DELETE FROM stale_tracking WHERE repo = ?1 AND issue_number = ?2",
             params![repo, issue_number as i64],

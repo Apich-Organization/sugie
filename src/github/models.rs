@@ -32,6 +32,20 @@ pub struct RepoOwner {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Milestone {
+    pub number: u64,
+    pub title: String,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub open_issues: Option<u64>,
+    #[serde(default)]
+    pub closed_issues: Option<u64>,
+    #[serde(default)]
+    pub due_on: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Label {
     pub id: Option<u64>,
     pub name: String,
@@ -57,6 +71,8 @@ pub struct Issue {
     pub pull_request: Option<IssuePullRequestRef>,
     pub author_association: Option<String>,
     pub comments: Option<u32>,
+    #[serde(default)]
+    pub milestone: Option<Milestone>,
 }
 
 impl Issue {
@@ -104,6 +120,8 @@ pub struct PullRequest {
     pub additions: Option<u64>,
     pub deletions: Option<u64>,
     pub changed_files: Option<u64>,
+    #[serde(default)]
+    pub milestone: Option<Milestone>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

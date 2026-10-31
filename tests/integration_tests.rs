@@ -60,6 +60,7 @@ fn create_test_state() -> (AppState, Storage) {
     let state = AppState {
         config: Arc::new(config),
         triage,
+        chat_api_token: None,
     };
 
     (state, storage)
@@ -310,6 +311,7 @@ fn test_duplicate_detector() {
         closed_at: None,
         pull_request: None,
         author_association: None,
+        milestone: None,
         comments: None,
     };
 
@@ -622,4 +624,124 @@ async fn test_generic_chat_command_endpoint() {
     let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     let resp_str = body_json.get("response").and_then(|v| v.as_str()).unwrap();
     assert!(resp_str.contains("StarLabsSI/ensia"));
+}
+
+/// With a shared secret configured the endpoint must refuse callers that do not
+/// present it — this route can run `/comment`, `/assign` and `/close`.
+#[tokio::test]
+async fn test_chat_command_endpoint_requires_configured_token() {
+    let (mut state, storage) = create_test_state();
+    state.chat_api_token = Some(Arc::from("s3cret-token-for-tests"));
+    storage
+        .upsert_repository(100, "StarLabsSI/ensia", 12345)
+        .unwrap();
+    let app = create_router(state);
+
+    let payload = serde_json::json!({ "command": "repos", "sender": "probe" });
+    let body = serde_json::to_vec(&payload).unwrap();
+
+    let build = |token: Option<&'static str>| {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/chat/command")
+            .header("content-type", "application/json");
+        if let Some(t) = token {
+            req = req.header("x-sugie-chat-token", t);
+        }
+        req.body(Body::from(body.clone())).unwrap()
+    };
+
+    // No token, then a wrong one: both rejected before any command runs.
+    let response = app.clone().oneshot(build(None)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .oneshot(build(Some("not-the-token")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // The right token is accepted.
+    let response = app
+        .oneshot(build(Some("s3cret-token-for-tests")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_webhook_rejects_when_secret_is_empty() {
+    // Regression for A1. HMAC accepts a zero-length key, so an unconfigured
+    // secret used to leave this endpoint forgeable: the attacker computes
+    // `HMAC(key="", body)` and the signature verifies. It must now be refused
+    // outright, and with a distinct status so the cause is obvious in logs.
+    let (base, _) = create_test_state();
+    let mut config = (*base.config).clone();
+    config.github.webhook_secret = String::new();
+    let state = AppState {
+        config: Arc::new(config),
+        triage: base.triage.clone(),
+        chat_api_token: None,
+    };
+
+    let payload = br#"{"action":"opened"}"#;
+    let forged = generate_test_signature("", payload);
+
+    let app = create_router(state.clone());
+    let req = Request::builder()
+        .uri("/webhook")
+        .method("POST")
+        .header("X-GitHub-Event", "issues")
+        .header("X-Hub-Signature-256", forged)
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // No signature at all must not fall through to the handler body either.
+    let app2 = create_router(state);
+    let req2 = Request::builder()
+        .uri("/api/github/webhook")
+        .method("POST")
+        .header("X-GitHub-Event", "issues")
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    assert_eq!(
+        app2.oneshot(req2).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn test_status_does_not_disclose_repository_names() {
+    // Regression for A2: /status is unauthenticated, so it may report a count
+    // but never the inventory itself.
+    let (state, storage) = create_test_state();
+    storage
+        .upsert_repository(100, "secret-org/private-repo", 12345)
+        .unwrap();
+
+    let app = create_router(state);
+    let req = Request::builder()
+        .uri("/status")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(json["onboarded_repositories_count"], 1);
+    assert!(
+        json.get("repositories").is_none(),
+        "the anonymous status endpoint must not list repository names"
+    );
+    assert!(!String::from_utf8_lossy(&bytes).contains("private-repo"));
 }
