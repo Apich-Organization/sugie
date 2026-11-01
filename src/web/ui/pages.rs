@@ -2036,6 +2036,10 @@ fn build_export_url(
     format!("/admin/audit/export?{}", q.join("&"))
 }
 
+// A page function takes exactly what its template needs. Bundling these eleven
+// values into a struct would only move the same list one level up, without
+// making any call site clearer.
+#[allow(clippy::too_many_arguments)]
 pub fn audit_page(
     user: CurrentUser,
     tab: String,

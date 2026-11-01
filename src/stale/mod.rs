@@ -106,7 +106,7 @@ impl StaleManager {
 
                     if let Some(ref cl_lbl) = self.config.closed_label {
                         let _ = client
-                            .add_labels(owner, repo, item.number, &[cl_lbl.clone()])
+                            .add_labels(owner, repo, item.number, std::slice::from_ref(cl_lbl))
                             .await;
                     }
 
@@ -137,7 +137,12 @@ impl StaleManager {
             } else if item.updated_at < warn_threshold {
                 let warn_body = interpolate(&self.config.warn_message, &vars);
                 client
-                    .add_labels(owner, repo, item.number, &[self.config.stale_label.clone()])
+                    .add_labels(
+                        owner,
+                        repo,
+                        item.number,
+                        std::slice::from_ref(&self.config.stale_label),
+                    )
                     .await?;
                 client
                     .create_comment(owner, repo, item.number, &warn_body)

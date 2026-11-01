@@ -245,24 +245,26 @@ mod tests {
         mappings.insert("feat".to_string(), "enhancement".to_string());
         mappings.insert("fix".to_string(), "bug".to_string());
 
-        let mut config = LabelsConfig::default();
-        config.conventional_commits = ConventionalCommitsConfig {
-            enabled: true,
-            mappings,
-        };
-        config.size_rules = SizeLabelConfig {
-            enabled: true,
-            xs_max: 10,
-            s_max: 50,
-            m_max: 200,
-            l_max: 500,
-            labels: vec![
-                "size/XS".to_string(),
-                "size/S".to_string(),
-                "size/M".to_string(),
-                "size/L".to_string(),
-                "size/XL".to_string(),
-            ],
+        let config = LabelsConfig {
+            conventional_commits: ConventionalCommitsConfig {
+                enabled: true,
+                mappings,
+            },
+            size_rules: SizeLabelConfig {
+                enabled: true,
+                xs_max: 10,
+                s_max: 50,
+                m_max: 200,
+                l_max: 500,
+                labels: vec![
+                    "size/XS".to_string(),
+                    "size/S".to_string(),
+                    "size/M".to_string(),
+                    "size/L".to_string(),
+                    "size/XL".to_string(),
+                ],
+            },
+            ..Default::default()
         };
 
         let engine = LabelEngine::new(config).unwrap();

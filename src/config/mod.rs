@@ -890,12 +890,14 @@ pub fn load_dotenv() {
                     if let Some((key, value)) = line.split_once('=') {
                         let key = key.trim();
                         let mut value = value.trim();
-                        if (value.starts_with('"') && value.ends_with('"'))
-                            || (value.starts_with('\'') && value.ends_with('\''))
+                        // A quoted value keeps its inner text; the length check is
+                        // part of the same condition so the slice below is always
+                        // in range.
+                        if ((value.starts_with('"') && value.ends_with('"'))
+                            || (value.starts_with('\'') && value.ends_with('\'')))
+                            && value.len() >= 2
                         {
-                            if value.len() >= 2 {
-                                value = &value[1..value.len() - 1];
-                            }
+                            value = &value[1..value.len() - 1];
                         }
                         if std::env::var(key).is_err() {
                             std::env::set_var(key, value);

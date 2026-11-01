@@ -29,6 +29,16 @@ pub struct GitHubClient {
     token: String,
 }
 
+/// A commit status to publish; see [`GitHubClient::create_commit_status`].
+pub struct CommitStatus<'a> {
+    pub sha: &'a str,
+    /// `error`, `failure`, `pending` or `success`.
+    pub state: &'a str,
+    pub context: &'a str,
+    pub description: &'a str,
+    pub target_url: Option<&'a str>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CheckRunsResponse {
     check_runs: Vec<CheckRun>,
@@ -708,26 +718,27 @@ impl GitHubClient {
 
     // --- Commit Status API ---
 
+    /// One commit status update.
+    ///
+    /// Grouped into a struct rather than five positional `&str` parameters:
+    /// `state`, `context` and `description` are all free-form strings, and a
+    /// positional call makes swapping them a silent, compiles-fine mistake.
     pub async fn create_commit_status(
         &self,
         owner: &str,
         repo: &str,
-        sha: &str,
-        state: &str, // "error", "failure", "pending", "success"
-        context: &str,
-        description: &str,
-        target_url: Option<&str>,
+        status: CommitStatus<'_>,
     ) -> Result<()> {
         let url = format!(
             "{}/repos/{}/{}/statuses/{}",
-            self.base_url, owner, repo, sha
+            self.base_url, owner, repo, status.sha
         );
         let mut payload = json!({
-            "state": state,
-            "context": context,
-            "description": description,
+            "state": status.state, // "error", "failure", "pending", "success"
+            "context": status.context,
+            "description": status.description,
         });
-        if let Some(target) = target_url {
+        if let Some(target) = status.target_url {
             payload["target_url"] = json!(target);
         }
         self.send_logged(reqwest::Method::POST, &url, Some(&payload))

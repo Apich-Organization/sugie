@@ -445,8 +445,10 @@ impl ChatCommandParser {
     }
 
     fn parse_single_slash_command(text: &str) -> Option<SlashCommand> {
-        let mut config = crate::config::CommandsConfig::default();
-        config.prefix = "/".to_string();
+        let config = crate::config::CommandsConfig {
+            prefix: "/".to_string(),
+            ..Default::default()
+        };
         let mut text_to_parse = text.trim().to_string();
         if !text_to_parse.starts_with('/') {
             text_to_parse = format!("/{}", text_to_parse);

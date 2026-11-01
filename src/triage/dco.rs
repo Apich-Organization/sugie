@@ -89,8 +89,10 @@ mod tests {
 
     #[test]
     fn test_dco_exempt_author() {
-        let mut config = DcoConfig::default();
-        config.exempt_authors = vec!["dependabot[bot]".to_string()];
+        let config = DcoConfig {
+            exempt_authors: vec!["dependabot[bot]".to_string()],
+            ..Default::default()
+        };
         let validator = DcoValidator::new(config);
 
         let unsigned_commit = CommitItem {

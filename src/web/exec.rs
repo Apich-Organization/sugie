@@ -513,9 +513,8 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             if !add.is_empty() {
                 match client.add_labels(owner, repo, num, &add).await {
                     Ok(_) => ctx.ok(format!(
-                        "Added labels on {}{}: {}",
+                        "Added labels on {}#{num}: {}",
                         ctx.repo,
-                        format!("#{num}"),
                         add.join(", ")
                     )),
                     Err(e) => {
@@ -526,11 +525,7 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             }
             for l in &remove {
                 match client.remove_label(owner, repo, num, l).await {
-                    Ok(_) => ctx.ok(format!(
-                        "Removed label `{l}` on {}{}",
-                        ctx.repo,
-                        format!("#{num}")
-                    )),
+                    Ok(_) => ctx.ok(format!("Removed label `{l}` on {}#{num}", ctx.repo)),
                     Err(e) => {
                         ctx.err(format!("Failed to remove label `{l}`: {e}"));
                         ok = false;
@@ -578,14 +573,13 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             match res {
                 Ok(_) => {
                     ctx.ok(format!(
-                        "{} {}{} → {}",
+                        "{} {}#{num} → {}",
                         if cmd == "assign" {
                             "Assigned"
                         } else {
                             "Unassigned"
                         },
                         ctx.repo,
-                        format!("#{num}"),
                         users.join(", ")
                     ));
                     true
@@ -668,10 +662,9 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             match res {
                 Ok(_) => {
                     ctx.ok(format!(
-                        "{} {}{}",
+                        "{} {}#{num}",
                         if cmd == "close" { "Closed" } else { "Reopened" },
-                        ctx.repo,
-                        format!("#{num}")
+                        ctx.repo
                     ));
                     true
                 }
@@ -700,7 +693,7 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             };
             match client.create_comment(owner, repo, num, &body).await {
                 Ok(c) => {
-                    ctx.ok(format!("Commented on {}{}", ctx.repo, format!("#{num}")));
+                    ctx.ok(format!("Commented on {}#{num}", ctx.repo));
                     if let Some(url) = c.html_url {
                         ctx.out(url);
                     }
@@ -748,9 +741,8 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             };
             if suites.is_empty() {
                 ctx.err(format!(
-                    "No check suites available to re-run on {}{}",
-                    ctx.repo,
-                    format!("#{num}")
+                    "No check suites available to re-run on {}#{num}",
+                    ctx.repo
                 ));
                 return false;
             }
@@ -768,10 +760,9 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 .collect();
             if failed.is_empty() {
                 ctx.info(format!(
-                    "All {} check suite(s) on {}{} already passed — nothing to re-run",
+                    "All {} check suite(s) on {}#{num} already passed — nothing to re-run",
                     suites.len(),
-                    ctx.repo,
-                    format!("#{num}")
+                    ctx.repo
                 ));
                 return true;
             }
@@ -1278,7 +1269,7 @@ async fn run_reviewer(ctx: &Ctx<'_>, cmd: &str, args: &[String], owner: &str, re
     }
 
     let clean = |s: &str| {
-        s.trim_start_matches(|c| c == '+' || c == '-')
+        s.trim_start_matches(['+', '-'])
             .trim_start_matches('@')
             .to_string()
     };
@@ -2095,7 +2086,10 @@ mod tests {
         // The aborted task may still reach `finish` before the abort lands.
         // It must report that it changed nothing, because whoever persists the
         // conversation keys off that answer.
-        assert!(!jobs.finish(&id, true), "a late finish must not claim the turn");
+        assert!(
+            !jobs.finish(&id, true),
+            "a late finish must not claim the turn"
+        );
         let job = jobs.snapshot(&id).expect("job");
         assert_eq!(job.status, JobStatus::Cancelled);
         assert!(job.abort.is_none(), "the abort handle is consumed once");

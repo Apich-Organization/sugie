@@ -240,9 +240,11 @@ fn test_bot_mention_commands_parser() {
 
 #[test]
 fn test_restricted_commands_authorization() {
-    let mut config = CommandsConfig::default();
-    config.super_users = vec!["alice".to_string(), "bob".to_string()];
-    config.restricted_commands = vec!["close".to_string(), "move".to_string()];
+    let config = CommandsConfig {
+        super_users: vec!["alice".to_string(), "bob".to_string()],
+        restricted_commands: vec!["close".to_string(), "move".to_string()],
+        ..Default::default()
+    };
 
     let super_user = User {
         login: "alice".to_string(),

@@ -114,10 +114,8 @@ impl MetricsReporter {
                         .entry(pr.user.login.clone())
                         .or_insert(0) += 2;
                 }
-            } else if pr.state == "closed" {
-                if pr.updated_at >= start_time {
-                    closed_prs_count += 1;
-                }
+            } else if pr.state == "closed" && pr.updated_at >= start_time {
+                closed_prs_count += 1;
             }
         }
 
@@ -136,7 +134,7 @@ impl MetricsReporter {
         };
 
         let mut sorted_contributors: Vec<(String, u32)> = contributor_actions.into_iter().collect();
-        sorted_contributors.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted_contributors.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         let total_commits = (merged_prs_count as u64) * 2 + (new_prs_count as u64);
 

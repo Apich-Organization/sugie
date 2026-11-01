@@ -270,7 +270,7 @@ impl PasskeyManager {
                 .iter()
                 .map(|(k, v)| (v.created_at, k.clone()))
                 .collect();
-            oldest.sort_by(|a, b| a.0.cmp(&b.0));
+            oldest.sort_by_key(|entry| entry.0);
             let excess = lock.len() + 1 - MAX_AUTH_CHALLENGES;
             for (_, key) in oldest.into_iter().take(excess) {
                 lock.remove(&key);

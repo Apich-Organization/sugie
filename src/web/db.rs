@@ -75,6 +75,11 @@ impl UserRow {
     }
 }
 
+/// A resolved console session: the account plus the repository and command
+/// grants it holds. Named because the tuple otherwise shows up in every
+/// signature that carries it.
+pub type SessionPrincipal = (UserRow, Vec<String>, Vec<String>);
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PasskeyRow {
     pub id: i64,
@@ -577,12 +582,7 @@ impl WebDb {
     /// Persist one retention value and refresh its in-memory copy. Returns the
     /// normalised value (`0` for "keep everything") so the caller can decide
     /// whether a prune is needed.
-    fn save_keep(
-        &self,
-        key: &str,
-        slot: &std::sync::atomic::AtomicI64,
-        keep: i64,
-    ) -> Result<i64> {
+    fn save_keep(&self, key: &str, slot: &std::sync::atomic::AtomicI64, keep: i64) -> Result<i64> {
         let keep = keep.max(0);
         {
             let conn = self.lock_conn();
@@ -910,10 +910,7 @@ impl WebDb {
 
     /// Resolve session → user → grants in a single round-trip. This is the hot
     /// path for every admin request, so it must not fan out into four queries.
-    pub fn session_principal(
-        &self,
-        token_hash: &str,
-    ) -> Result<Option<(UserRow, Vec<String>, Vec<String>)>> {
+    pub fn session_principal(&self, token_hash: &str) -> Result<Option<SessionPrincipal>> {
         let conn = self.lock_conn();
         let row = conn
             .query_row(
@@ -2036,7 +2033,8 @@ fn prune_chat_history(conn: &Connection, keep: i64) {
 /// one. A single global DELETE would let a busy account evict everybody else's
 /// history, which is the opposite of what the per-user limit means.
 fn prune_console_history(conn: &Connection, keep: i64) {
-    let users: Vec<String> = match conn.prepare("SELECT DISTINCT username FROM web_console_history") {
+    let users: Vec<String> = match conn.prepare("SELECT DISTINCT username FROM web_console_history")
+    {
         Ok(mut stmt) => stmt
             .query_map([], |r| r.get::<_, String>(0))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -2116,12 +2114,21 @@ mod tests {
     #[test]
     fn console_history_round_trips_a_turn() {
         let db = WebDb::new_in_memory().expect("in-memory db");
-        db.console_history_start("job-1", "alice", "o/r", "/issues 5", "2026-10-31T10:00:00+00:00");
+        db.console_history_start(
+            "job-1",
+            "alice",
+            "o/r",
+            "/issues 5",
+            "2026-10-31T10:00:00+00:00",
+        );
 
         let rows = db.console_history_page("alice", None, 10).expect("page");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].is_running(), "a dispatched turn starts as running");
-        assert!(rows[0].lines.is_empty(), "the reply is unknown until it settles");
+        assert!(
+            rows[0].lines.is_empty(),
+            "the reply is unknown until it settles"
+        );
 
         db.console_history_finish(
             "job-1",
@@ -2173,7 +2180,13 @@ mod tests {
     #[test]
     fn console_history_is_scoped_to_the_owner() {
         let db = WebDb::new_in_memory().expect("in-memory db");
-        db.console_history_start("job-a", "alice", "o/r", "/issues", "2026-10-31T10:00:00+00:00");
+        db.console_history_start(
+            "job-a",
+            "alice",
+            "o/r",
+            "/issues",
+            "2026-10-31T10:00:00+00:00",
+        );
         db.console_history_start("job-b", "bob", "o/r", "/prs", "2026-10-31T10:00:00+00:00");
 
         let alice = db.console_history_page("alice", None, 10).expect("page");
@@ -2272,10 +2285,7 @@ mod tests {
             .expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].username, "bob");
-        assert_eq!(
-            db.count_chat_logs_filtered(&by_platform).expect("count"),
-            1
-        );
+        assert_eq!(db.count_chat_logs_filtered(&by_platform).expect("count"), 1);
 
         // Free text searches both sides of the exchange.
         let in_reply = ChatLogFilter {
@@ -2387,19 +2397,31 @@ mod tests {
         assert_eq!(alice.len(), 2, "alice is trimmed to the cap");
         assert_eq!(alice[0].command, "/issues 3", "the newest turns survive");
         assert_eq!(
-            db.console_history_page("bob", None, 10).expect("page").len(),
+            db.console_history_page("bob", None, 10)
+                .expect("page")
+                .len(),
             2,
             "bob was already under the cap"
         );
 
         // A new turn for alice evicts her oldest, and only hers.
-        db.console_history_start("a-new", "alice", "o/r", "/help", "2026-10-31T10:01:00+00:00");
+        db.console_history_start(
+            "a-new",
+            "alice",
+            "o/r",
+            "/help",
+            "2026-10-31T10:01:00+00:00",
+        );
         assert_eq!(
-            db.console_history_page("alice", None, 10).expect("page").len(),
+            db.console_history_page("alice", None, 10)
+                .expect("page")
+                .len(),
             2
         );
         assert_eq!(
-            db.console_history_page("bob", None, 10).expect("page").len(),
+            db.console_history_page("bob", None, 10)
+                .expect("page")
+                .len(),
             2
         );
     }

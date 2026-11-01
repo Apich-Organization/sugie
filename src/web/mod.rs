@@ -342,6 +342,13 @@ fn safe_next(raw: &str) -> String {
 }
 
 /// Resolves the signed-in user even when first-login 2FA enrollment is pending.
+///
+/// The three `gate*` helpers return `Result<CurrentUser, Response>` because the
+/// error *is* the handler's answer: every call site is `Err(r) => return r`.
+/// `Response` is 128 bytes, just over the lint's threshold — boxing it would add
+/// an allocation and a deref at all 37 call sites to save a stack copy that is
+/// moved straight out anyway.
+#[allow(clippy::result_large_err)]
 fn gate_allow_setup(state: &WebState, headers: &HeaderMap) -> Result<CurrentUser, Response> {
     match auth::current_user(&state.db, headers) {
         Some(user) => Ok(user),
@@ -351,6 +358,7 @@ fn gate_allow_setup(state: &WebState, headers: &HeaderMap) -> Result<CurrentUser
 
 /// Every standard page handler funnels through this: anonymous callers get bounced
 /// to `/admin/login`, and users required to enroll 2FA get directed to `/admin/security`.
+#[allow(clippy::result_large_err)]
 fn gate(state: &WebState, headers: &HeaderMap) -> Result<CurrentUser, Response> {
     let user = gate_allow_setup(state, headers)?;
     if user.needs_2fa_setup {
@@ -359,6 +367,7 @@ fn gate(state: &WebState, headers: &HeaderMap) -> Result<CurrentUser, Response> 
     Ok(user)
 }
 
+#[allow(clippy::result_large_err)]
 fn gate_admin(state: &WebState, headers: &HeaderMap) -> Result<CurrentUser, Response> {
     let user = gate(state, headers)?;
     if user.can_manage() {
@@ -3114,7 +3123,7 @@ async fn create_user(
     {
         Ok(id) => {
             if actor.is_owner() && two_fa_policy != "default" {
-                let _ = state.db.set_user_two_fa_policy(id, &two_fa_policy);
+                let _ = state.db.set_user_two_fa_policy(id, two_fa_policy);
             }
             let repos: Vec<String> = form
                 .get("repos")

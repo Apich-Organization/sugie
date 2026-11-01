@@ -251,7 +251,7 @@ pub fn encrypt_lark_payload(encrypt_key: &str, plaintext: &str) -> anyhow::Resul
         .unwrap_or_default()
         .as_nanos();
     let mut iv_hasher = Sha256::new();
-    iv_hasher.update(&now.to_le_bytes());
+    iv_hasher.update(now.to_le_bytes());
     iv_hasher.update(plaintext.as_bytes());
     let iv_hash = iv_hasher.finalize();
     let mut iv = [0u8; 16];

@@ -11,7 +11,7 @@ pub mod reviewers;
 
 use crate::config::{RepoConfig, SugieConfig};
 use crate::github::auth::GitHubAuthManager;
-use crate::github::client::GitHubClient;
+use crate::github::client::{CommitStatus, GitHubClient};
 use crate::github::models::*;
 use crate::notifications::{
     DiscordEmbedField, NotificationDispatcher, NotificationLevel, SugieEventType,
@@ -496,11 +496,14 @@ impl TriageService {
                             .create_commit_status(
                                 owner,
                                 repo,
-                                &event.pull_request.head.sha,
-                                "failure",
-                                validator.status_context(),
-                                "Some commits are missing a valid Signed-off-by trailer",
-                                None,
+                                CommitStatus {
+                                    sha: &event.pull_request.head.sha,
+                                    state: "failure",
+                                    context: validator.status_context(),
+                                    description:
+                                        "Some commits are missing a valid Signed-off-by trailer",
+                                    target_url: None,
+                                },
                             )
                             .await;
                     }
@@ -515,11 +518,13 @@ impl TriageService {
                             .create_commit_status(
                                 owner,
                                 repo,
-                                &event.pull_request.head.sha,
-                                "success",
-                                validator.status_context(),
-                                "All commits are properly signed off",
-                                None,
+                                CommitStatus {
+                                    sha: &event.pull_request.head.sha,
+                                    state: "success",
+                                    context: validator.status_context(),
+                                    description: "All commits are properly signed off",
+                                    target_url: None,
+                                },
                             )
                             .await;
                     }
