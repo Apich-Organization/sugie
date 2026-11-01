@@ -27,6 +27,9 @@ From your workstation, with the repo checked out:
 ```bash
 # Raspberry Pi: build there (different CPU architecture from your laptop)
 ./deploy/deploy.sh --host pi@192.168.1.50 --build-on-target
+
+# Non-standard SSH port (e.g. a Pi behind a forwarded 2222)
+./deploy/deploy.sh --host pi@192.168.1.50 --port 2222 --build-on-target
 ```
 
 Building on the Pi needs a toolchain and OpenSSL headers, once:
@@ -62,9 +65,8 @@ which writes the same files and restarts on demand.
 # same architecture (x86_64 → x86_64)
 ./deploy/deploy.sh --host user@host
 
-# cross-compile for aarch64 (Raspberry Pi) using `cross`:
-cross build --bin sugie --release --features vendored-openssl --target aarch64-unknown-linux-gnu
-./deploy/deploy.sh --host pi@192.168.1.50 --binary target/aarch64-unknown-linux-gnu/release/sugie
+# pre-built aarch64 binary from a cross toolchain or CI
+./deploy/deploy.sh --host pi@192.168.1.50 --binary ./sugie-aarch64
 ```
 
 `deploy.sh` refuses to ship a binary whose architecture does not match the
@@ -88,7 +90,7 @@ systemd with very little to go on.
    (this is the bit that survives a reboot), then `restart`.
 7. Polls `http://127.0.0.1:<port>/health` and prints the unit status.
 
-Options: `--prefix`, `--user`, `--unit`, `--binary`, `--no-start`.
+Options: `--prefix`, `--user`, `--unit`, `--binary`, `--port`, `--no-start`.
 
 ---
 

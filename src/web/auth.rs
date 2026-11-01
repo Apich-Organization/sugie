@@ -3,8 +3,8 @@
 use crate::web::db::{UserRow, WebDb};
 use crate::web::perms::{CurrentUser, Role};
 use anyhow::{anyhow, Result};
-use argon2::password_hash::rand_core::{OsRng, RngCore};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
@@ -22,10 +22,14 @@ const LOCKOUT_SECS: i64 = 15 * 60;
 /// Wrong OTP codes tolerated for a single pending 2FA challenge.
 pub const MAX_OTP_ATTEMPTS: i64 = 5;
 
+/// Hash a password with Argon2id and a fresh random salt.
+///
+/// `password-hash` 0.6 draws the salt inside `hash_password` itself (via the
+/// `getrandom` feature, which `argon2` enables by default), so there is no
+/// `SaltString` to generate and pass along any more.
 pub fn hash_password(password: &str) -> Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| anyhow!("hash password: {e}"))
 }
@@ -58,7 +62,9 @@ pub async fn verify_password_async(password: String, hash: String) -> bool {
 /// 32 random bytes, hex encoded — used as the opaque session token.
 pub fn random_token() -> String {
     let mut buf = [0u8; 32];
-    OsRng.fill_bytes(&mut buf);
+    // Straight to the OS CSPRNG. A failure means the platform cannot provide
+    // randomness at all, so there is no safe value to fall back to.
+    getrandom::fill(&mut buf).expect("operating system randomness unavailable");
     hex::encode(buf)
 }
 

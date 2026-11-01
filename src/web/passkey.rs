@@ -296,11 +296,16 @@ impl PasskeyManager {
         Ok((user_id_from_uuid(u_uuid), b64url_encode(cred_id_bytes)))
     }
 
-    /// Finishes a discoverable authentication ceremony against the user's registered keys.
+    /// Finishes a discoverable authentication ceremony against one registered key.
+    ///
+    /// The caller resolves which key the browser used (`identify_credential`
+    /// already reports its id), so v2 can be handed that single credential
+    /// instead of the whole list — it skips the internal copy the deprecated
+    /// slice-based entry point had to do.
     pub fn finish_discoverable_authentication(
         &self,
         cred: &PublicKeyCredential,
-        discoverable_keys: &[DiscoverableKey],
+        passkey: &Passkey,
     ) -> Result<AuthenticationResult, String> {
         #[derive(serde::Deserialize)]
         struct ClientData {
@@ -321,7 +326,7 @@ impl PasskeyManager {
         })?;
 
         self.webauthn
-            .finish_discoverable_authentication(cred, entry.state, discoverable_keys)
+            .finish_discoverable_authentication_v2(cred, entry.state, passkey)
             .map_err(|e| format!("Passkey authentication verification failed: {e}"))
     }
 }

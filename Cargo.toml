@@ -29,18 +29,21 @@ anyhow = "1.0"
 thiserror = "2.0"
 strsim = "0.11"
 base64 = "0.23"
-ed25519-dalek = "2.2"
+ed25519-dalek = "3.0"
 aes = "0.9"
 cbc = "0.2"
 
 # --- Admin console (Leptos SSR + auth + config editing) ---
 leptos = { version = "0.8", features = ["ssr"] }
-argon2 = "0.5"
-toml_edit = "0.22"
+argon2 = "0.6"
+# OS randomness for session tokens and job ids. `argon2` pulls it in
+# transitively, but a direct dependency is what lets us name it.
+getrandom = "0.4"
+toml_edit = "0.25"
 async-stream = "0.3"
 totp-rs = { version = "6.0", features = ["qr", "gen_secret", "otpauth"] }
 qrcodegen-image = "1.5"
-webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 # `webauthn-rs-core` links OpenSSL for attestation parsing. By default we use the
 # system OpenSSL 3 (fast, no build-script compile). `--features vendored-openssl`
 # builds a self-contained binary for images that ship no OpenSSL headers.
@@ -51,6 +54,17 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [features]
 default = []
 vendored-openssl = ["openssl/vendored"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+strip = true
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = true
 
 [dev-dependencies]
 tempfile = "3.13"

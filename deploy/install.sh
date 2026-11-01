@@ -14,6 +14,7 @@ SERVICE_USER="sugie"
 UNIT_NAME="sugie"
 UNIT_DIR="${SUGIE_UNIT_DIR:-/etc/systemd/system}"
 BINARY_SRC=""
+APP_PORT=""
 START=1
 
 usage() {
@@ -24,6 +25,7 @@ Usage: sudo ./install.sh [options]
   --prefix DIR    Install directory (default: /opt/sugie)
   --user NAME     Service account (default: sugie)
   --unit NAME     systemd unit name (default: sugie)
+  --port N        Set `port` in sugie.toml (and use it for the health check)
   --no-start      Install files and enable the unit, but do not start it now
   -h, --help      Show this help
 
@@ -48,6 +50,7 @@ while [ $# -gt 0 ]; do
         --prefix)   PREFIX="${2:?--prefix needs a path}"; shift 2 ;;
         --user)     SERVICE_USER="${2:?--user needs a name}"; shift 2 ;;
         --unit)     UNIT_NAME="${2:?--unit needs a name}"; shift 2 ;;
+        --port)     APP_PORT="${2:?--port needs a number}"; shift 2 ;;
         --no-start) START=0; shift ;;
         -h|--help)  usage; exit 0 ;;
         *)          die "Unknown option: $1 (try --help)" ;;
@@ -109,6 +112,21 @@ else
         warn "Installed the example .env — fill in SUGIE_GITHUB_APP_ID, SUGIE_GITHUB_WEBHOOK_SECRET and the private key path in $PREFIX/.env."
     else
         die "No .env and no template to copy. Create $PREFIX/.env first (mode 0600)."
+    fi
+fi
+
+# `--port` is explicit, so it wins over whatever the file already says. Done
+# before the chown below: `sed -i` replaces the file and would otherwise leave it
+# owned by root.
+if [ -n "$APP_PORT" ]; then
+    case "$APP_PORT" in
+        '' | *[!0-9]*) die "--port must be a whole number, got '$APP_PORT'" ;;
+    esac
+    sed -i "s/^[[:space:]]*port[[:space:]]*=.*/port = $APP_PORT/" "$PREFIX/sugie.toml"
+    if grep -qx "port = $APP_PORT" "$PREFIX/sugie.toml"; then
+        log "Set port = $APP_PORT in $PREFIX/sugie.toml"
+    else
+        warn "sugie.toml has no top-level 'port = …' line — set the port by hand."
     fi
 fi
 

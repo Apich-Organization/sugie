@@ -1811,12 +1811,36 @@ async fn api_passkey_auth_finish(
         .iter()
         .filter_map(|r| serde_json::from_str::<webauthn_rs::prelude::Passkey>(&r.passkey_json).ok())
         .collect();
-    let discoverable: Vec<webauthn_rs::prelude::DiscoverableKey> =
-        passkeys.iter().map(|pk| pk.into()).collect();
+
+    // The ceremony names one credential; resolve it before handing the assertion
+    // to the library, which otherwise only fails deep inside with a generic
+    // "credential not found". A client that claims an id it never registered
+    // gets the same 401 as an unknown passkey.
+    let matched = match passkeys
+        .iter()
+        .find(|pk| pk.cred_id().as_slice() == req.credential.raw_id.as_slice())
+    {
+        Some(pk) => pk,
+        None => {
+            state.db.audit(
+                &user_row.username,
+                "login.passkey",
+                "-",
+                "assertion for a credential that is not registered to this account",
+                &ip,
+                false,
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Unrecognized Passkey credential" })),
+            )
+                .into_response();
+        }
+    };
 
     let auth_result = match state
         .passkey
-        .finish_discoverable_authentication(&req.credential, &discoverable)
+        .finish_discoverable_authentication(&req.credential, matched)
     {
         Ok(res) => res,
         Err(e) => {

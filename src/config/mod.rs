@@ -881,27 +881,39 @@ pub fn load_dotenv() {
     let candidates = [Path::new(".env"), Path::new("../.env")];
     for path in &candidates {
         if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
+            let content = match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(e) => {
+                    // Skipping an unreadable `.env` in silence makes the failure
+                    // look like "SUGIE_GITHUB_APP_ID not set", which sends people
+                    // hunting through the config instead of at `ls -l .env`.
+                    eprintln!(
+                        "warning: {} exists but could not be read ({e}); \
+                         starting without it. Check its owner and mode.",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim();
+                    let mut value = value.trim();
+                    // A quoted value keeps its inner text; the length check is
+                    // part of the same condition so the slice below is always
+                    // in range.
+                    if ((value.starts_with('"') && value.ends_with('"'))
+                        || (value.starts_with('\'') && value.ends_with('\'')))
+                        && value.len() >= 2
+                    {
+                        value = &value[1..value.len() - 1];
                     }
-                    if let Some((key, value)) = line.split_once('=') {
-                        let key = key.trim();
-                        let mut value = value.trim();
-                        // A quoted value keeps its inner text; the length check is
-                        // part of the same condition so the slice below is always
-                        // in range.
-                        if ((value.starts_with('"') && value.ends_with('"'))
-                            || (value.starts_with('\'') && value.ends_with('\'')))
-                            && value.len() >= 2
-                        {
-                            value = &value[1..value.len() - 1];
-                        }
-                        if std::env::var(key).is_err() {
-                            std::env::set_var(key, value);
-                        }
+                    if std::env::var(key).is_err() {
+                        std::env::set_var(key, value);
                     }
                 }
             }

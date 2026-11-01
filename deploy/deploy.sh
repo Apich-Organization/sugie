@@ -19,13 +19,17 @@ PREFIX="/opt/sugie"
 SERVICE_USER="sugie"
 UNIT_NAME="sugie"
 START_ARGS=""
-SSH_OPTS=(-o BatchMode=no)
+APP_PORT_ARGS=""
+SSH_PORT="22"
 
 usage() {
     cat <<'EOF'
 Usage: ./deploy/deploy.sh --host USER@HOST [options]
 
   --host USER@HOST   Target machine (required), e.g. pi@192.168.1.50
+  --port N           SSH port on the target (default: 22)
+  --app-port N       Port the bot listens on, written into sugie.toml
+                     (default: whatever the config already says)
   --build-on-target  Build the release binary on the target instead of here.
                      Use this when the target architecture differs (aarch64 Pi).
   --binary PATH      Ship a pre-built binary instead of building.
@@ -44,9 +48,24 @@ log()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Read the architecture out of an ELF header. A cross-compiled binary must match
+# the target, not the machine running this script — checking `uname -m` here
+# would reject exactly the aarch64-for-a-Pi build we want to ship.
+binary_arch() {
+    command -v file >/dev/null || { echo unknown; return; }
+    case "$(file -b "$1" 2>/dev/null)" in
+        *"ARM aarch64"*) echo aarch64 ;;
+        *"x86-64"*)      echo x86_64 ;;
+        *"ARM,"*)        echo armv7l ;;
+        *)               echo unknown ;;
+    esac
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --host)            HOST="${2:?--host needs USER@HOST}"; shift 2 ;;
+        --port)            SSH_PORT="${2:?--port needs a number}"; shift 2 ;;
+        --app-port)        APP_PORT_ARGS="--port ${2:?--app-port needs a number}"; shift 2 ;;
         --binary)          BINARY="${2:?--binary needs a path}"; shift 2 ;;
         --build-on-target) BUILD_ON_TARGET=1; shift ;;
         --prefix)          PREFIX="${2:?--prefix needs a path}"; shift 2 ;;
@@ -59,6 +78,10 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$HOST" ] || { usage; exit 1; }
+
+# Every ssh/scp call goes through SSH_OPTS so the port applies to the staging
+# cleanup in the trap as well.
+SSH_OPTS=(-p "$SSH_PORT" -o BatchMode=no)
 
 ssh_cmd() { ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
 
@@ -76,7 +99,12 @@ trap 'ssh "${SSH_OPTS[@]}" "$HOST" "rm -rf $STAGE" >/dev/null 2>&1 || true' EXIT
 # ---------------------------------------------------------------------- build
 if [ -n "$BINARY" ]; then
     [ -f "$BINARY" ] || die "Binary not found: $BINARY"
-    log "Shipping pre-built binary $BINARY"
+    BIN_ARCH="$(binary_arch "$BINARY")"
+    if [ "$BIN_ARCH" != "unknown" ] && [ "$BIN_ARCH" != "$TARGET_ARCH" ]; then
+        die "$BINARY is $BIN_ARCH but $HOST is $TARGET_ARCH.
+     Rebuild for the target, or drop --binary and use --build-on-target."
+    fi
+    log "Shipping pre-built $BIN_ARCH binary $BINARY"
 elif [ "$BUILD_ON_TARGET" -eq 1 ]; then
     log "Building release binary on $HOST (this takes a while on a Pi)"
     # rustup installs cargo into ~/.cargo/bin, which a non-interactive SSH shell
@@ -126,6 +154,6 @@ ssh -t "${SSH_OPTS[@]}" "$HOST" \
         --binary '$STAGE/sugie' \
         --prefix '$PREFIX' \
         --user '$SERVICE_USER' \
-        --unit '$UNIT_NAME' $START_ARGS"
+        --unit '$UNIT_NAME' $APP_PORT_ARGS $START_ARGS"
 
 log "Done. Follow the logs with: ssh $HOST journalctl -u $UNIT_NAME -f"
