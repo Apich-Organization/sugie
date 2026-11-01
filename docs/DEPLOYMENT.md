@@ -62,8 +62,9 @@ which writes the same files and restarts on demand.
 # same architecture (x86_64 → x86_64)
 ./deploy/deploy.sh --host user@host
 
-# pre-built aarch64 binary from a cross toolchain or CI
-./deploy/deploy.sh --host pi@192.168.1.50 --binary ./sugie-aarch64
+# cross-compile for aarch64 (Raspberry Pi) using `cross`:
+cross build --bin sugie --release --features vendored-openssl --target aarch64-unknown-linux-gnu
+./deploy/deploy.sh --host pi@192.168.1.50 --binary target/aarch64-unknown-linux-gnu/release/sugie
 ```
 
 `deploy.sh` refuses to ship a binary whose architecture does not match the

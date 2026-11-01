@@ -87,7 +87,12 @@ The recommended deployment is a release binary under a systemd unit, enabled so
 it comes back after a reboot. One command from your workstation:
 
 ```bash
+# Option A: Build on the Pi (remote release compilation)
 ./deploy/deploy.sh --host pi@192.168.1.50 --build-on-target
+
+# Option B: Cross-compile on your workstation with `cross` and deploy
+cross build --bin sugie --release --features vendored-openssl --target aarch64-unknown-linux-gnu
+./deploy/deploy.sh --host pi@192.168.1.50 --binary target/aarch64-unknown-linux-gnu/release/sugie
 ```
 
 That builds `--release` on the target (a Pi is a different CPU architecture),
@@ -275,6 +280,18 @@ without it, enable the vendored feature:
 ```bash
 cargo build --release --features vendored-openssl
 ```
+
+### Cross-compilation (e.g. Raspberry Pi / 64-bit ARM)
+
+To cross-compile for Raspberry Pi (`aarch64-unknown-linux-gnu`) on an x86_64 host using [`cross`](https://github.com/cross-rs/cross), use `--features vendored-openssl` to build OpenSSL from source within the container:
+
+```bash
+cross build --bin sugie --release --features vendored-openssl --target aarch64-unknown-linux-gnu
+```
+
+The output binary will be located at `target/aarch64-unknown-linux-gnu/release/sugie`.
+
+### Running Tests
 
 ```bash
 # Run all unit and integration tests
