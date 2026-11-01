@@ -6,9 +6,14 @@ set -euo pipefail
 
 IMAGE_NAME="localhost/sugie:latest"
 CONTAINER_NAME="sugie-bot"
-PORT="${SUGIE_PORT:-8080}"
 CONFIG_FILE="$(pwd)/sugie.toml"
+ENV_FILE="$(pwd)/.env"
 DATA_DIR="$(pwd)/data"
+
+# Publish the port the bot actually listens on. Reading it from the config avoids
+# the classic "container is running but nothing answers" mismatch.
+PORT="${SUGIE_PORT:-$(sed -n 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' "${CONFIG_FILE}" 2>/dev/null | head -1)}"
+PORT="${PORT:-8800}"
 
 mkdir -p "${DATA_DIR}"
 
@@ -25,13 +30,23 @@ start_container() {
     fi
 
     echo "🚀 Starting Sugie Bot with Podman..."
+    # The image ships no secrets: without .env the bot starts but every GitHub
+    # delivery is rejected, so refuse to run rather than fail later.
+    if [ ! -f "${ENV_FILE}" ]; then
+        echo "❌ Environment file ${ENV_FILE} not found."
+        echo "💡 Copy templates/.env.example to .env and fill in the secrets."
+        exit 1
+    fi
+
     podman run -d \
         --name "${CONTAINER_NAME}" \
         --replace \
         --restart always \
-        -p "${PORT}:8080" \
+        --userns=keep-id:uid=1000,gid=1000 \
+        -p "${PORT}:${PORT}" \
         -v "${DATA_DIR}:/app/data:Z" \
-        -v "${CONFIG_FILE}:/app/sugie.toml:ro,Z" \
+        -v "${CONFIG_FILE}:/app/sugie.toml:rw,Z" \
+        -v "${ENV_FILE}:/app/.env:rw,Z" \
         -e RUST_LOG=info \
         -e SUGIE_DB_PATH=/app/data/sugie.db \
         "${IMAGE_NAME}" serve --config /app/sugie.toml

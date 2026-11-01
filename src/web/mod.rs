@@ -64,6 +64,9 @@ impl WebState {
         shutdown: Arc<tokio::sync::Notify>,
     ) -> anyhow::Result<Self> {
         let db = WebDb::open(&config.db_path)?;
+        // A fresh process has an empty job registry, so any conversation turn
+        // still marked `running` in the database was cut off by the last exit.
+        db.console_history_mark_interrupted();
         crate::security_log::init(&config.db_path);
         if auth::bootstrap_admin(&db)?.is_some() {
             tracing::warn!(
@@ -98,6 +101,9 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/repos", get(repos_page))
         .route("/admin/api/repos/sync", post(sync_repos))
         .route("/admin/chat", get(chat_page))
+        .route("/admin/chat/retention", post(console_retention_save))
+        .route("/admin/chats", get(chats_page))
+        .route("/admin/chats/retention", post(chat_retention_save))
         .route("/admin/config", get(config_page))
         .route("/admin/users", get(users_page))
         .route("/admin/audit", get(audit_page))
@@ -874,6 +880,12 @@ struct ChatQuery {
     repo: String,
     #[serde(default)]
     refresh: String,
+    /// Cursor for "Load older": the id of the oldest turn already on screen.
+    #[serde(default)]
+    before: Option<i64>,
+    /// Result of the retention form: `1` saved, `0` rejected.
+    #[serde(default)]
+    saved: Option<String>,
 }
 
 async fn chat_page(
@@ -921,8 +933,228 @@ async fn chat_page(
         cached.map(|(s, _)| s)
     };
 
-    let history = state.jobs.recent_for(&user.username, 20);
-    html(pages::chat_page(user, repos, selected, history, stats))
+    let history = load_console_history(&state, &user.username, query.before);
+    let saved = query.saved.as_deref().map(|v| v == "1");
+    html(pages::chat_page(
+        user,
+        repos,
+        selected,
+        history,
+        stats,
+        state.db.console_history_keep(),
+        saved,
+    ))
+}
+
+#[derive(Deserialize)]
+struct ConsoleRetentionForm {
+    #[serde(default)]
+    keep: String,
+    #[serde(default)]
+    repo: String,
+}
+
+/// Save how many console turns to keep per user. `0` keeps every turn.
+///
+/// The console itself is open to any signed-in account, but this is a global
+/// setting, so only people who can manage the console may change it.
+async fn console_retention_save(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<ConsoleRetentionForm>,
+) -> Response {
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let back = if form.repo.is_empty() {
+        "/admin/chat".to_string()
+    } else {
+        format!("/admin/chat?repo={}", pages::urlencode(&form.repo))
+    };
+    let sep = if back.contains('?') { '&' } else { '?' };
+    let keep = match form.keep.trim().parse::<i64>() {
+        Ok(n) if n >= 0 => n,
+        // Refuse rather than clamp: turning "-5" into 0 would silently remove
+        // the limit the operator was trying to set.
+        _ => return Redirect::to(&format!("{back}{sep}saved=0")).into_response(),
+    };
+    let ip = auth::client_ip(&headers);
+    match state.db.set_console_history_keep(keep) {
+        Ok(()) => {
+            state.db.audit(
+                &user.username,
+                "config.console_retention",
+                &form.repo,
+                &format!("keep={keep}"),
+                &ip,
+                true,
+            );
+            Redirect::to(&format!("{back}{sep}saved=1")).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Failed to save console history retention: {e}");
+            Redirect::to(&format!("{back}{sep}saved=0")).into_response()
+        }
+    }
+}
+
+/// Number of conversation turns rendered per page of `/admin/chat`.
+const CHAT_PAGE_SIZE: usize = 20;
+
+/// Load one page of a user's console conversation, newest turn first.
+///
+/// Rows come from SQLite, so history survives a restart and can be paged back
+/// well past the in-memory registry's window. Turns that are still running have
+/// no stored reply yet, so their live lines are read from the registry instead.
+fn load_console_history(
+    state: &WebState,
+    username: &str,
+    before: Option<i64>,
+) -> pages::ChatHistory {
+    // Fetch one extra row: its presence is what tells the page whether a
+    // "Load older" link is worth rendering.
+    let mut entries = match state
+        .db
+        .console_history_page(username, before, CHAT_PAGE_SIZE + 1)
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("Failed to load console history for {username}: {e}");
+            Vec::new()
+        }
+    };
+    let has_more = entries.len() > CHAT_PAGE_SIZE;
+    entries.truncate(CHAT_PAGE_SIZE);
+
+    for entry in entries.iter_mut().filter(|e| e.is_running()) {
+        if let Some(job) = state.jobs.snapshot(&entry.job_id) {
+            entry.lines = job.lines;
+            entry.status = match job.status {
+                JobStatus::Running => "running",
+                JobStatus::Done => "done",
+                JobStatus::Failed => "failed",
+                JobStatus::Cancelled => "cancelled",
+            }
+            .to_string();
+        }
+    }
+
+    pages::ChatHistory {
+        entries,
+        has_more,
+        paged: before.is_some(),
+    }
+}
+
+/// Filters and page cursor for `/admin/chats`.
+#[derive(Deserialize, Default)]
+struct ChatsQuery {
+    #[serde(default)]
+    page: i64,
+    #[serde(default)]
+    q_platform: String,
+    #[serde(default)]
+    q_user: String,
+    #[serde(default)]
+    q_ts: String,
+    #[serde(default)]
+    q_text: String,
+    #[serde(default)]
+    q_status: String,
+    /// Result of the retention form: `1` saved, `0` rejected.
+    #[serde(default)]
+    saved: Option<String>,
+}
+
+/// What the bot was asked and what it answered, across every connected platform.
+///
+/// Console commands are already covered by `/admin/chat`; this page is for the
+/// conversations that arrive from Zulip / Lark / Discord / the generic API and
+/// would otherwise leave no trace at all.
+async fn chats_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<ChatsQuery>,
+) -> Response {
+    // These rows quote repository names, issue bodies and command output, so the
+    // page is limited to the people who can already read the audit log.
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    // Clamp before multiplying: a caller-supplied page would otherwise overflow
+    // the offset (panic in debug, negative offset in release).
+    let page = query.page.clamp(0, 100_000);
+    let filter = db::ChatLogFilter {
+        platform: query.q_platform,
+        username: query.q_user,
+        ts: query.q_ts,
+        text: query.q_text,
+        status: query.q_status,
+    };
+    let rows = state
+        .db
+        .list_chat_logs_filtered(&filter, 50, page.saturating_mul(50))
+        .unwrap_or_default();
+    let total = state.db.count_chat_logs_filtered(&filter).unwrap_or(0);
+    let saved = query.saved.as_deref().map(|v| v == "1");
+    html(pages::chats_page(
+        user,
+        rows,
+        page,
+        total,
+        filter,
+        state.db.chat_history_keep(),
+        saved,
+    ))
+}
+
+#[derive(Deserialize)]
+struct ChatRetentionForm {
+    #[serde(default)]
+    keep: String,
+}
+
+/// Save how many chat exchanges to keep. `0` keeps every exchange, which is the
+/// default: trimming a conversation is an operator decision, not something that
+/// should happen behind their back at an arbitrary row count.
+async fn chat_retention_save(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<ChatRetentionForm>,
+) -> Response {
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let keep = match form.keep.trim().parse::<i64>() {
+        Ok(n) if n >= 0 => n,
+        // Negative or non-numeric input is refused rather than clamped: silently
+        // turning "-5" into 0 would wipe the limit the operator meant to set.
+        _ => return Redirect::to("/admin/chats?saved=0").into_response(),
+    };
+    let ip = auth::client_ip(&headers);
+    match state.db.set_chat_history_keep(keep) {
+        Ok(()) => {
+            // `config.` prefixed actions are always audited, even when the
+            // general admin-audit toggle is off: this explains why history
+            // disappeared.
+            state.db.audit(
+                &user.username,
+                "config.chat_retention",
+                "",
+                &format!("keep={keep}"),
+                &ip,
+                true,
+            );
+            Redirect::to("/admin/chats?saved=1").into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Failed to save chat history retention: {e}");
+            Redirect::to("/admin/chats?saved=0").into_response()
+        }
+    }
 }
 
 async fn config_page(
@@ -2318,6 +2550,17 @@ async fn api_job_cancel(
     match state.jobs.cancel(&id) {
         Some((owner, repo, command)) => {
             let ip = auth::client_ip(&headers);
+            // Mirror the stop into the persisted conversation: the row was
+            // created as `running`, and the task that would normally settle it
+            // has just been aborted, so nothing else will write this turn.
+            if let Some(job) = state.jobs.snapshot(&id) {
+                state.db.console_history_finish(
+                    &id,
+                    "cancelled",
+                    &job.lines,
+                    &chrono::Utc::now().to_rfc3339(),
+                );
+            }
             state.db.audit(
                 &user.username,
                 "command_cancel",

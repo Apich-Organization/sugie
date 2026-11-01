@@ -18,6 +18,24 @@ use tracing::{debug, error, info, warn};
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 
+/// Answer an inbound command and record the exchange for `/admin/chats`.
+///
+/// Recording is best-effort and never affects the answer: the calling platform
+/// is blocked on the reply, and `record_chat_exchange` already swallows storage
+/// errors, so there is no path here that can turn a webhook into a failure.
+async fn execute_and_record(
+    executor: &ChatCommandExecutor<'_>,
+    inbound: &InboundChatMessage,
+    db: Option<&crate::web::db::WebDb>,
+) -> String {
+    let started = std::time::Instant::now();
+    let reply = executor.execute(inbound).await;
+    if let Some(db) = db {
+        db.record_chat_exchange(inbound, &reply, started.elapsed().as_millis() as i64);
+    }
+    reply
+}
+
 // ==============================================================================
 // 1. Zulip Inbound Webhook
 // ==============================================================================
@@ -137,7 +155,7 @@ pub async fn zulip_chat_handler(
     };
 
     let executor = ChatCommandExecutor::new(&state.config, &state.triage);
-    let reply = executor.execute(&inbound).await;
+    let reply = execute_and_record(&executor, &inbound, state.web_db.as_ref()).await;
 
     // Zulip automatically renders JSON `{ "content": "..." }` in the stream or direct message
     (StatusCode::OK, Json(json!({ "content": reply })))
@@ -423,11 +441,14 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
 
             let config = state.config.clone();
             let triage = state.triage.clone();
+            // The console database handle, cloned so the spawned task can record
+            // the exchange without capturing the whole `AppState`.
+            let chat_db = state.web_db.clone();
 
             // Spawn execution and dispatch reply back to Lark
             tokio::spawn(async move {
                 let executor = ChatCommandExecutor::new(&config, &triage);
-                let reply = executor.execute(&inbound).await;
+                let reply = execute_and_record(&executor, &inbound, chat_db.as_ref()).await;
                 info!("Sending Lark response: {}", reply);
 
                 if let Some(lark) = triage.notifier().lark() {
@@ -564,7 +585,7 @@ pub async fn discord_chat_handler(
     };
 
     let executor = ChatCommandExecutor::new(&state.config, &state.triage);
-    let reply = executor.execute(&inbound).await;
+    let reply = execute_and_record(&executor, &inbound, state.web_db.as_ref()).await;
 
     // Discord Type 4: ChannelMessageWithSource
     (
@@ -699,7 +720,7 @@ pub async fn generic_chat_command_handler(
     };
 
     let executor = ChatCommandExecutor::new(&state.config, &state.triage);
-    let reply = executor.execute(&inbound).await;
+    let reply = execute_and_record(&executor, &inbound, state.web_db.as_ref()).await;
 
     (
         StatusCode::OK,

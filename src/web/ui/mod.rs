@@ -26,6 +26,7 @@ fn nav_items(user: &Option<CurrentUser>) -> Vec<(&'static str, &'static str, &'s
         items.push(("users", "/admin/users", "Users"));
         items.push(("notify", "/admin/notify", "Notify"));
         items.push(("audit", "/admin/audit", "Audit Logs"));
+        items.push(("chats", "/admin/chats", "Chat Bots"));
     }
     items.push(("security", "/admin/security", "2FA & Passkeys"));
     items

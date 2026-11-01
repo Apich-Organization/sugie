@@ -61,6 +61,9 @@ fn create_test_state() -> (AppState, Storage) {
         config: Arc::new(config),
         triage,
         chat_api_token: None,
+        // The admin console is not mounted in these tests, so chat exchanges
+        // have nowhere to be recorded — exactly the `create_router` case.
+        web_db: None,
     };
 
     (state, storage)
@@ -683,6 +686,7 @@ async fn test_webhook_rejects_when_secret_is_empty() {
         config: Arc::new(config),
         triage: base.triage.clone(),
         chat_api_token: None,
+        web_db: None,
     };
 
     let payload = br#"{"action":"opened"}"#;

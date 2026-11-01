@@ -37,7 +37,7 @@ pub enum JobStatus {
     Cancelled,
 }
 
-#[derive(Clone, Serialize, Debug)]
+#[derive(Clone, Serialize, serde::Deserialize, Debug)]
 pub struct LogLine {
     pub level: String,
     pub text: String,
@@ -118,13 +118,18 @@ impl JobRegistry {
         }
     }
 
-    pub fn finish(&self, id: &str, ok: bool) {
+    /// Move a running job to its terminal state.
+    ///
+    /// Returns `true` when this call performed the transition. A job cancelled a
+    /// moment before it completed returns `false`: the cancel path has already
+    /// published "cancelled" and owns the persisted history row, so the late
+    /// task must not relabel it.
+    pub fn finish(&self, id: &str, ok: bool) -> bool {
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(job) = guard.0.get_mut(id) {
-                // First terminal state wins: a job cancelled a moment before it
-                // completed must not be relabelled "done" by the late task.
+                // First terminal state wins.
                 if job.status != JobStatus::Running {
-                    return;
+                    return false;
                 }
                 job.status = if ok {
                     JobStatus::Done
@@ -132,8 +137,10 @@ impl JobRegistry {
                     JobStatus::Failed
                 };
                 job.finished_at = Some(clock());
+                return true;
             }
         }
+        false
     }
 
     /// Remember how to stop a job that was just spawned.
@@ -181,23 +188,6 @@ impl JobRegistry {
         let job = guard.0.get(id)?;
         let lines = job.lines.iter().skip(from).cloned().collect();
         Some((lines, job.status))
-    }
-
-    pub fn recent_for(&self, username: &str, limit: usize) -> Vec<Job> {
-        let Ok(guard) = self.inner.lock() else {
-            return Vec::new();
-        };
-        // Walk the order deque newest-first and clone only what is returned: the
-        // previous version cloned every retained job (up to 5001 log lines each).
-        guard
-            .1
-            .iter()
-            .rev()
-            .filter_map(|id| guard.0.get(id))
-            .filter(|j| j.username.eq_ignore_ascii_case(username))
-            .take(limit)
-            .cloned()
-            .collect()
     }
 }
 
@@ -275,6 +265,17 @@ pub fn dispatch(
     }
 
     let job_id = state.jobs.create(&user.username, &repo, &raw);
+    // Persist the turn before it runs: a command that is stopped, or that dies
+    // with the process, still shows up in the console history afterwards.
+    // `Job::started_at` is only a time of day, so the row carries a wall-clock
+    // timestamp instead — history spans days.
+    state.db.console_history_start(
+        &job_id,
+        &user.username,
+        &repo,
+        &raw,
+        &chrono::Utc::now().to_rfc3339(),
+    );
     let spawn_state = state.clone();
     let spawn_job = job_id.clone();
     let audit_ip = ip.to_string();
@@ -286,7 +287,18 @@ pub fn dispatch(
             user: &user,
         };
         let ok = run(&ctx, &cmd, &args).await;
-        spawn_state.jobs.finish(&spawn_job, ok);
+        // Only the call that actually settles the job writes the reply: a job
+        // cancelled mid-flight was already persisted by the cancel handler.
+        if spawn_state.jobs.finish(&spawn_job, ok) {
+            if let Some(job) = spawn_state.jobs.snapshot(&spawn_job) {
+                spawn_state.db.console_history_finish(
+                    &spawn_job,
+                    if ok { "done" } else { "failed" },
+                    &job.lines,
+                    &chrono::Utc::now().to_rfc3339(),
+                );
+            }
+        }
         spawn_state.db.audit(
             &user.username,
             "command",
@@ -2081,7 +2093,9 @@ mod tests {
         let id = jobs.create("alice", "o/r", "/stale");
         assert!(jobs.cancel(&id).is_some());
         // The aborted task may still reach `finish` before the abort lands.
-        jobs.finish(&id, true);
+        // It must report that it changed nothing, because whoever persists the
+        // conversation keys off that answer.
+        assert!(!jobs.finish(&id, true), "a late finish must not claim the turn");
         let job = jobs.snapshot(&id).expect("job");
         assert_eq!(job.status, JobStatus::Cancelled);
         assert!(job.abort.is_none(), "the abort handle is consumed once");
@@ -2092,7 +2106,11 @@ mod tests {
     fn cancel_leaves_finished_jobs_alone() {
         let jobs = JobRegistry::default();
         let id = jobs.create("bob", "o/r", "/issues");
-        jobs.finish(&id, false);
+        assert!(jobs.finish(&id, false), "the first finish settles the job");
+        assert!(
+            !jobs.finish(&id, true),
+            "a second finish must not flip a failed job to done"
+        );
         assert!(jobs.cancel(&id).is_none());
         assert_eq!(jobs.snapshot(&id).expect("job").status, JobStatus::Failed);
     }

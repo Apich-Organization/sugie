@@ -13,6 +13,18 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub const KEY_GLOBAL_2FA_ENABLED: &str = "global_2fa_enabled";
+/// `web_settings` key holding how many bot exchanges to keep. `0` keeps all.
+pub const KEY_CHAT_HISTORY_KEEP: &str = "chat_history_keep";
+/// `web_settings` key holding how many console turns to keep **per user**.
+/// `0` keeps all.
+pub const KEY_CONSOLE_HISTORY_KEEP: &str = "console_history_keep";
+
+/// Default for both history-retention settings: keep everything.
+///
+/// Deleting a conversation is the operator's call, not a side effect of hitting
+/// an arbitrary row count. Both console pages expose a knob for installs that
+/// would rather cap it — chat history in total, console history per user.
+const HISTORY_KEEP_DEFAULT: i64 = 0;
 
 #[derive(Clone)]
 pub struct WebDb {
@@ -20,6 +32,10 @@ pub struct WebDb {
     /// Cached copy of `web_settings.global_2fa_enabled` so resolving a principal
     /// does not need a second round-trip on every request.
     global_2fa: Arc<std::sync::atomic::AtomicBool>,
+    /// Cached copies of the two history-retention settings. Both tables are
+    /// written per request, so neither limit is re-queried on insert.
+    chat_keep: Arc<std::sync::atomic::AtomicI64>,
+    console_keep: Arc<std::sync::atomic::AtomicI64>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +129,80 @@ impl AuditFilter {
     }
 }
 
+/// One turn of the console conversation: the command a user submitted and the
+/// output the server streamed back.
+///
+/// The in-memory `JobRegistry` only keeps a short, volatile window of this, so
+/// the same exchange is also written to SQLite. That is what lets `/admin/chat`
+/// reopen an older conversation after a restart.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsoleHistoryRow {
+    pub id: i64,
+    pub job_id: String,
+    pub username: String,
+    pub repo: String,
+    pub command: String,
+    /// `running`, `done`, `failed`, `cancelled` or `interrupted`.
+    pub status: String,
+    pub lines: Vec<crate::web::exec::LogLine>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+impl ConsoleHistoryRow {
+    pub fn is_running(&self) -> bool {
+        self.status == "running"
+    }
+}
+
+/// One exchange with the chat bot: what an external platform sent and what the
+/// bot answered.
+///
+/// Unlike the console's own history, these messages originate outside the admin
+/// console (Zulip / Lark / Discord / the generic API), so they are kept in their
+/// own table and surfaced on `/admin/chats`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatLogRow {
+    pub id: i64,
+    pub ts: String,
+    /// `zulip`, `lark`, `discord` or `api`.
+    pub platform: String,
+    pub username: String,
+    pub display_name: String,
+    /// Stream / group / channel the message arrived in, when the platform says.
+    pub channel: String,
+    pub command: String,
+    pub reply: String,
+    /// `ok`, `warn` or `error` — see [`crate::chat::reply_status`].
+    pub status: String,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct ChatLogFilter {
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub ts: String,
+    /// Matches either the incoming command or the bot's reply.
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+impl ChatLogFilter {
+    pub fn is_empty(&self) -> bool {
+        self.platform.trim().is_empty()
+            && self.username.trim().is_empty()
+            && self.ts.trim().is_empty()
+            && self.text.trim().is_empty()
+            && self.status.trim().is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct SecurityHttpFilter {
     #[serde(default)]
@@ -165,9 +255,12 @@ impl WebDb {
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
             global_2fa: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            chat_keep: Arc::new(std::sync::atomic::AtomicI64::new(HISTORY_KEEP_DEFAULT)),
+            console_keep: Arc::new(std::sync::atomic::AtomicI64::new(HISTORY_KEEP_DEFAULT)),
         };
         db.init()?;
         db.refresh_global_2fa();
+        db.refresh_history_keep();
         Ok(db)
     }
 
@@ -176,9 +269,12 @@ impl WebDb {
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
             global_2fa: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            chat_keep: Arc::new(std::sync::atomic::AtomicI64::new(HISTORY_KEEP_DEFAULT)),
+            console_keep: Arc::new(std::sync::atomic::AtomicI64::new(HISTORY_KEEP_DEFAULT)),
         };
         db.init()?;
         db.refresh_global_2fa();
+        db.refresh_history_keep();
         Ok(db)
     }
 
@@ -287,6 +383,46 @@ impl WebDb {
                 command TEXT NOT NULL,
                 PRIMARY KEY (user_id, command)
             );
+
+            CREATE TABLE IF NOT EXISTS web_console_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                repo TEXT NOT NULL DEFAULT '',
+                command TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                lines_json TEXT NOT NULL DEFAULT '[]',
+                started_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_web_console_history_user
+                ON web_console_history(username, id DESC);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_web_console_history_job
+                ON web_console_history(job_id);
+
+            CREATE TABLE IF NOT EXISTS web_chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                sender_id TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                channel TEXT NOT NULL DEFAULT '',
+                message_id TEXT NOT NULL DEFAULT '',
+                command TEXT NOT NULL,
+                reply TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'ok',
+                duration_ms INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_web_chat_history_ts
+                ON web_chat_history(id DESC);
+            CREATE INDEX IF NOT EXISTS idx_web_chat_history_platform
+                ON web_chat_history(platform, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_web_chat_history_user
+                ON web_chat_history(username, id DESC);
 
             CREATE TABLE IF NOT EXISTS web_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -405,6 +541,83 @@ impl WebDb {
         self.global_2fa
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Bot exchanges to keep, across all platforms. `0` keeps every one.
+    pub fn chat_history_keep(&self) -> i64 {
+        self.chat_keep.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Console turns to keep **per user**. `0` keeps every one.
+    pub fn console_history_keep(&self) -> i64 {
+        self.console_keep.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the chat-history limit and apply it immediately, so lowering the
+    /// value takes visible effect instead of waiting for the next bot message.
+    pub fn set_chat_history_keep(&self, keep: i64) -> Result<()> {
+        let keep = self.save_keep(KEY_CHAT_HISTORY_KEEP, &self.chat_keep, keep)?;
+        if keep > 0 {
+            let conn = self.lock_conn();
+            prune_chat_history(&conn, keep);
+        }
+        Ok(())
+    }
+
+    /// Set the per-user console limit and trim every account immediately.
+    pub fn set_console_history_keep(&self, keep: i64) -> Result<()> {
+        let keep = self.save_keep(KEY_CONSOLE_HISTORY_KEEP, &self.console_keep, keep)?;
+        if keep > 0 {
+            let conn = self.lock_conn();
+            prune_console_history(&conn, keep);
+        }
+        Ok(())
+    }
+
+    /// Persist one retention value and refresh its in-memory copy. Returns the
+    /// normalised value (`0` for "keep everything") so the caller can decide
+    /// whether a prune is needed.
+    fn save_keep(
+        &self,
+        key: &str,
+        slot: &std::sync::atomic::AtomicI64,
+        keep: i64,
+    ) -> Result<i64> {
+        let keep = keep.max(0);
+        {
+            let conn = self.lock_conn();
+            conn.execute(
+                "INSERT INTO web_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![key, keep.to_string(), Utc::now().to_rfc3339()],
+            )?;
+        }
+        slot.store(keep, std::sync::atomic::Ordering::Relaxed);
+        Ok(keep)
+    }
+
+    fn refresh_history_keep(&self) {
+        let chat = self.read_keep(KEY_CHAT_HISTORY_KEEP);
+        let console = self.read_keep(KEY_CONSOLE_HISTORY_KEEP);
+        self.chat_keep
+            .store(chat, std::sync::atomic::Ordering::Relaxed);
+        self.console_keep
+            .store(console, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn read_keep(&self, key: &str) -> i64 {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT value FROM web_settings WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(HISTORY_KEEP_DEFAULT)
+        .max(0)
     }
 
     pub fn get_security_log_settings(&self) -> crate::security_log::SecurityLogSettings {
@@ -1152,6 +1365,212 @@ impl WebDb {
         Ok(rows)
     }
 
+    // ----------------------------------------------------- console history
+
+    /// Record a command as soon as it is dispatched, so a run that is stopped or
+    /// dies with the process still leaves a visible turn in the conversation.
+    pub fn console_history_start(
+        &self,
+        job_id: &str,
+        username: &str,
+        repo: &str,
+        command: &str,
+        started_at: &str,
+    ) {
+        // History is a convenience, never a reason to fail a command: every
+        // failure here is swallowed, exactly like `audit`.
+        let conn = self.lock_conn();
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO web_console_history
+                 (job_id, username, repo, command, status, lines_json, started_at, finished_at)
+             VALUES (?1, ?2, ?3, ?4, 'running', '[]', ?5, NULL)",
+            params![job_id, username, repo, command, started_at],
+        );
+        // Retention is operator-controlled and off by default, so nothing is
+        // deleted unless an admin asked for a cap.
+        let keep = self.console_history_keep();
+        if keep > 0 {
+            // The subquery resolves to NULL while the user has fewer rows than
+            // the cap, and `id <= NULL` matches nothing, so no delete happens
+            // until the account is actually full.
+            let _ = conn.execute(
+                "DELETE FROM web_console_history
+                  WHERE username = ?1
+                    AND id <= (SELECT id FROM web_console_history
+                                WHERE username = ?1
+                                ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+                params![username, keep],
+            );
+        }
+    }
+
+    /// Store the reply for a job, replacing whatever placeholder the start wrote.
+    pub fn console_history_finish(
+        &self,
+        job_id: &str,
+        status: &str,
+        lines: &[crate::web::exec::LogLine],
+        finished_at: &str,
+    ) {
+        let json = serde_json::to_string(lines).unwrap_or_else(|_| "[]".to_string());
+        let conn = self.lock_conn();
+        let _ = conn.execute(
+            "UPDATE web_console_history
+                SET status = ?2, lines_json = ?3, finished_at = ?4
+              WHERE job_id = ?1",
+            params![job_id, status, json, finished_at],
+        );
+    }
+
+    /// Close out turns that were still marked `running` when the process exited.
+    ///
+    /// The job registry lives in memory, so after a restart no turn can
+    /// legitimately still be running: any row left open belongs to a run the
+    /// server died in the middle of, and leaving it `running` would show a Stop
+    /// button that can only ever answer 409.
+    pub fn console_history_mark_interrupted(&self) {
+        let conn = self.lock_conn();
+        let _ = conn.execute(
+            "UPDATE web_console_history
+                SET status = 'interrupted', finished_at = COALESCE(finished_at, ?1)
+              WHERE status = 'running'",
+            params![Utc::now().to_rfc3339()],
+        );
+    }
+
+    /// One page of a user's conversation, newest turn first.
+    ///
+    /// `before` is the cursor: pass the `id` of the oldest turn currently on
+    /// screen to fetch the page behind it. An `id` cursor rather than an offset
+    /// keeps paging stable while new commands are being appended.
+    pub fn console_history_page(
+        &self,
+        username: &str,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ConsoleHistoryRow>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, job_id, username, repo, command, status, lines_json, started_at,
+                    finished_at
+               FROM web_console_history
+              WHERE username = ?1 AND (?2 IS NULL OR id < ?2)
+              ORDER BY id DESC
+              LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![username, before, limit as i64], |r| {
+                let lines_json: String = r.get(6)?;
+                Ok(ConsoleHistoryRow {
+                    id: r.get(0)?,
+                    job_id: r.get(1)?,
+                    username: r.get(2)?,
+                    repo: r.get(3)?,
+                    command: r.get(4)?,
+                    status: r.get(5)?,
+                    // A row written by an older build, or truncated by a crash,
+                    // must degrade to "no output" rather than blank the page.
+                    lines: serde_json::from_str(&lines_json).unwrap_or_default(),
+                    started_at: r.get(7)?,
+                    finished_at: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // -------------------------------------------------------- chat history
+
+    /// Record one inbound bot message together with the reply it produced.
+    ///
+    /// Deliberately best-effort: an external chat platform is waiting on the
+    /// answer, so a storage problem must never turn into a failed webhook.
+    pub fn record_chat_exchange(
+        &self,
+        msg: &crate::chat::InboundChatMessage,
+        reply: &str,
+        duration_ms: i64,
+    ) {
+        let conn = self.lock_conn();
+        let _ = conn.execute(
+            "INSERT INTO web_chat_history
+                 (ts, platform, sender_id, username, display_name, channel, message_id,
+                  command, reply, status, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                Utc::now().to_rfc3339(),
+                msg.platform.as_str(),
+                msg.sender.id,
+                msg.sender.username,
+                msg.sender.display_name.as_deref().unwrap_or(""),
+                msg.stream_or_channel.as_deref().unwrap_or(""),
+                msg.message_id.as_deref().unwrap_or(""),
+                // A single chat message can be arbitrarily long; cap both sides
+                // so one paste cannot dominate the table.
+                truncate(&msg.raw_content, 2000),
+                truncate(reply, 8000),
+                crate::chat::reply_status(reply),
+                duration_ms,
+            ],
+        );
+        // Retention is operator-controlled and off by default, so a fresh
+        // install never silently loses a conversation.
+        let keep = self.chat_history_keep();
+        if keep > 0 {
+            prune_chat_history(&conn, keep);
+        }
+    }
+
+    pub fn list_chat_logs_filtered(
+        &self,
+        filter: &ChatLogFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ChatLogRow>> {
+        let conn = self.lock_conn();
+        let mut sql = "SELECT id, ts, platform, username, display_name, channel, command, reply,
+                              status, duration_ms
+                         FROM web_chat_history WHERE 1=1"
+            .to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        chat_filter_clauses(&mut sql, &mut params_vec, filter);
+        sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
+        params_vec.push(Box::new(limit));
+        params_vec.push(Box::new(offset));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(&params_refs[..], |r| {
+                Ok(ChatLogRow {
+                    id: r.get(0)?,
+                    ts: r.get(1)?,
+                    platform: r.get(2)?,
+                    username: r.get(3)?,
+                    display_name: r.get(4)?,
+                    channel: r.get(5)?,
+                    command: r.get(6)?,
+                    reply: r.get(7)?,
+                    status: r.get(8)?,
+                    duration_ms: r.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn count_chat_logs_filtered(&self, filter: &ChatLogFilter) -> Result<i64> {
+        let conn = self.lock_conn();
+        let mut sql = "SELECT COUNT(*) FROM web_chat_history WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        chat_filter_clauses(&mut sql, &mut params_vec, filter);
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let count = conn.query_row(&sql, &params_refs[..], |r| r.get::<_, i64>(0))?;
+        Ok(count)
+    }
+
     // --------------------------------------------------------------- audit
 
     pub fn audit(
@@ -1599,10 +2018,389 @@ fn ts_filter(input: &str) -> (&'static str, String) {
     }
 }
 
+/// Drop the oldest chat exchanges until at most `keep` remain.
+///
+/// The subquery resolves to NULL while the table is smaller than the cap, and
+/// `id <= NULL` matches nothing, so this is a no-op until the limit is reached.
+fn prune_chat_history(conn: &Connection, keep: i64) {
+    let _ = conn.execute(
+        "DELETE FROM web_chat_history
+          WHERE id <= (SELECT id FROM web_chat_history ORDER BY id DESC LIMIT 1 OFFSET ?1)",
+        params![keep],
+    );
+}
+
+/// Drop each user's oldest console turns until at most `keep` remain.
+///
+/// The limit is per user, so this walks the distinct accounts and trims each
+/// one. A single global DELETE would let a busy account evict everybody else's
+/// history, which is the opposite of what the per-user limit means.
+fn prune_console_history(conn: &Connection, keep: i64) {
+    let users: Vec<String> = match conn.prepare("SELECT DISTINCT username FROM web_console_history") {
+        Ok(mut stmt) => stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+    for user in users {
+        let _ = conn.execute(
+            "DELETE FROM web_console_history
+              WHERE username = ?1
+                AND id <= (SELECT id FROM web_console_history
+                            WHERE username = ?1
+                            ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+            params![user, keep],
+        );
+    }
+}
+
+/// WHERE clauses shared by the chat-history list and count queries, so a filter
+/// can never apply to one and not the other.
+fn chat_filter_clauses(
+    sql: &mut String,
+    params_vec: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    filter: &ChatLogFilter,
+) {
+    if !filter.platform.trim().is_empty() {
+        // Exact match: the stored value is a fixed label, not free text.
+        sql.push_str(" AND platform = ?");
+        params_vec.push(Box::new(filter.platform.trim().to_ascii_lowercase()));
+    }
+    if !filter.username.trim().is_empty() {
+        sql.push_str(" AND username LIKE ?");
+        params_vec.push(Box::new(format!("%{}%", filter.username.trim())));
+    }
+    if !filter.ts.trim().is_empty() {
+        let (clause, value) = ts_filter(filter.ts.trim());
+        sql.push_str(clause);
+        params_vec.push(Box::new(value));
+    }
+    if !filter.text.trim().is_empty() {
+        // One box matches either side of the exchange: searching for a repo name
+        // should find the question and the answer that mentions it.
+        sql.push_str(" AND (command LIKE ? OR reply LIKE ?)");
+        let needle = format!("%{}%", filter.text.trim());
+        params_vec.push(Box::new(needle.clone()));
+        params_vec.push(Box::new(needle));
+    }
+    if !filter.status.trim().is_empty() {
+        sql.push_str(" AND status = ?");
+        params_vec.push(Box::new(filter.status.trim().to_ascii_lowercase()));
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
         s.chars().take(max).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::web::exec::LogLine;
+
+    fn line(level: &str, text: &str) -> LogLine {
+        LogLine {
+            level: level.to_string(),
+            text: text.to_string(),
+            ts: "10:00:00".to_string(),
+        }
+    }
+
+    /// A turn is written twice — once at dispatch, once when it settles — and the
+    /// console reads back exactly what the second write stored.
+    #[test]
+    fn console_history_round_trips_a_turn() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        db.console_history_start("job-1", "alice", "o/r", "/issues 5", "2026-10-31T10:00:00+00:00");
+
+        let rows = db.console_history_page("alice", None, 10).expect("page");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_running(), "a dispatched turn starts as running");
+        assert!(rows[0].lines.is_empty(), "the reply is unknown until it settles");
+
+        db.console_history_finish(
+            "job-1",
+            "done",
+            &[line("cmd", "/issues 5"), line("ok", "#1 open")],
+            "2026-10-31T10:00:02+00:00",
+        );
+
+        let rows = db.console_history_page("alice", None, 10).expect("page");
+        assert_eq!(rows[0].status, "done");
+        assert_eq!(rows[0].lines.len(), 2);
+        assert_eq!(rows[0].lines[1].text, "#1 open");
+        assert_eq!(
+            rows[0].finished_at.as_deref(),
+            Some("2026-10-31T10:00:02+00:00")
+        );
+    }
+
+    /// Paging uses an id cursor, so a command dispatched between two page loads
+    /// cannot shift the rows the reader is walking through.
+    #[test]
+    fn console_history_pages_backwards_without_overlap() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        for i in 0..3 {
+            db.console_history_start(
+                &format!("job-{i}"),
+                "alice",
+                "o/r",
+                &format!("/issues {i}"),
+                "2026-10-31T10:00:00+00:00",
+            );
+        }
+
+        let first = db.console_history_page("alice", None, 2).expect("page 1");
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].command, "/issues 2", "newest turn comes first");
+
+        let cursor = first.last().map(|r| r.id);
+        let second = db.console_history_page("alice", cursor, 2).expect("page 2");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].command, "/issues 0");
+        assert!(
+            second[0].id < first[1].id,
+            "the second page continues behind the first"
+        );
+    }
+
+    /// History is per account: a turn must not leak into another user's console.
+    #[test]
+    fn console_history_is_scoped_to_the_owner() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        db.console_history_start("job-a", "alice", "o/r", "/issues", "2026-10-31T10:00:00+00:00");
+        db.console_history_start("job-b", "bob", "o/r", "/prs", "2026-10-31T10:00:00+00:00");
+
+        let alice = db.console_history_page("alice", None, 10).expect("page");
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].command, "/issues");
+    }
+
+    // ---------------------------------------------------------- chat history
+
+    fn inbound(
+        platform: crate::chat::ChatPlatform,
+        user: &str,
+        text: &str,
+    ) -> crate::chat::InboundChatMessage {
+        crate::chat::InboundChatMessage {
+            platform,
+            sender: crate::chat::InboundSender {
+                id: format!("{user}-id"),
+                username: user.to_string(),
+                display_name: Some(format!("{user} display")),
+            },
+            raw_content: text.to_string(),
+            stream_or_channel: Some("stream-1".to_string()),
+            message_id: Some("m-1".to_string()),
+        }
+    }
+
+    /// The recorded outcome comes from the reply text, because the executor
+    /// signals problems with a leading marker instead of an error type.
+    #[test]
+    fn chat_history_derives_status_from_the_reply() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        let cases = [
+            ("✅ Commented on o/r#1", "ok"),
+            ("⚠️ Please specify repository", "warn"),
+            ("❌ Could not access repository", "error"),
+            ("❓ Unknown command `/nope`", "warn"),
+        ];
+        for (reply, expected) in cases {
+            let msg = inbound(crate::chat::ChatPlatform::Zulip, "alice", "/issues");
+            db.record_chat_exchange(&msg, reply, 7);
+            let rows = db
+                .list_chat_logs_filtered(&ChatLogFilter::default(), 1, 0)
+                .expect("list");
+            assert_eq!(rows[0].status, expected, "reply {reply:?}");
+        }
+        let total = db
+            .count_chat_logs_filtered(&ChatLogFilter::default())
+            .expect("count");
+        assert_eq!(total, 4);
+    }
+
+    /// Everything the console page shows has to survive the round trip: the
+    /// platform label, the sender, the channel and the reply text.
+    #[test]
+    fn chat_history_round_trips_the_exchange() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        let msg = inbound(crate::chat::ChatPlatform::Discord, "carol", "issues o/r");
+        db.record_chat_exchange(&msg, "3 open issues in o/r", 42);
+
+        let rows = db
+            .list_chat_logs_filtered(&ChatLogFilter::default(), 10, 0)
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].platform, "discord");
+        assert_eq!(rows[0].username, "carol");
+        assert_eq!(rows[0].display_name, "carol display");
+        assert_eq!(rows[0].channel, "stream-1");
+        assert_eq!(rows[0].command, "issues o/r");
+        assert_eq!(rows[0].reply, "3 open issues in o/r");
+        assert_eq!(rows[0].duration_ms, 42);
+    }
+
+    /// Filters are shared between the list and the count, so a filtered page
+    /// never claims a total that disagrees with what it can show.
+    #[test]
+    fn chat_history_filters_apply_to_list_and_count_alike() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        db.record_chat_exchange(
+            &inbound(crate::chat::ChatPlatform::Zulip, "alice", "issues o/r"),
+            "3 open issues in o/r",
+            5,
+        );
+        db.record_chat_exchange(
+            &inbound(crate::chat::ChatPlatform::Lark, "bob", "status"),
+            "✅ all systems normal",
+            6,
+        );
+
+        let by_platform = ChatLogFilter {
+            platform: "lark".to_string(),
+            ..Default::default()
+        };
+        let rows = db
+            .list_chat_logs_filtered(&by_platform, 10, 0)
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].username, "bob");
+        assert_eq!(
+            db.count_chat_logs_filtered(&by_platform).expect("count"),
+            1
+        );
+
+        // Free text searches both sides of the exchange.
+        let in_reply = ChatLogFilter {
+            text: "open issues".to_string(),
+            ..Default::default()
+        };
+        let rows = db.list_chat_logs_filtered(&in_reply, 10, 0).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].username, "alice");
+
+        let by_status = ChatLogFilter {
+            status: "error".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(db.count_chat_logs_filtered(&by_status).expect("count"), 0);
+    }
+
+    /// Retention is off by default: an install that never touches the setting
+    /// keeps every exchange.
+    #[test]
+    fn chat_history_keeps_everything_by_default() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        assert_eq!(db.chat_history_keep(), 0, "0 means unlimited");
+        for i in 0..5 {
+            let msg = inbound(
+                crate::chat::ChatPlatform::Api,
+                "alice",
+                &format!("/issues {i}"),
+            );
+            db.record_chat_exchange(&msg, "ok", 1);
+        }
+        assert_eq!(
+            db.count_chat_logs_filtered(&ChatLogFilter::default())
+                .expect("count"),
+            5
+        );
+    }
+
+    /// A configured limit applies the moment it is saved, and keeps applying as
+    /// new exchanges arrive, so the table cannot creep back over the cap.
+    #[test]
+    fn chat_history_retention_prunes_to_the_limit() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        for i in 0..5 {
+            let msg = inbound(
+                crate::chat::ChatPlatform::Api,
+                "alice",
+                &format!("/issues {i}"),
+            );
+            db.record_chat_exchange(&msg, "ok", 1);
+        }
+
+        db.set_chat_history_keep(2).expect("set keep");
+        assert_eq!(db.chat_history_keep(), 2);
+        let rows = db
+            .list_chat_logs_filtered(&ChatLogFilter::default(), 10, 0)
+            .expect("list");
+        assert_eq!(rows.len(), 2, "saving the limit trims immediately");
+        assert_eq!(rows[0].command, "/issues 4", "the newest exchanges survive");
+
+        db.record_chat_exchange(
+            &inbound(crate::chat::ChatPlatform::Api, "alice", "/prs"),
+            "ok",
+            1,
+        );
+        let rows = db
+            .list_chat_logs_filtered(&ChatLogFilter::default(), 10, 0)
+            .expect("list");
+        assert_eq!(rows.len(), 2, "a new exchange evicts the oldest");
+        assert_eq!(rows[0].command, "/prs");
+    }
+
+    /// Console retention is per user: capping the table must not let one busy
+    /// account delete somebody else's conversation.
+    #[test]
+    fn console_history_retention_is_per_user() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        assert_eq!(db.console_history_keep(), 0, "0 means unlimited");
+        for i in 0..4 {
+            db.console_history_start(
+                &format!("a-{i}"),
+                "alice",
+                "o/r",
+                &format!("/issues {i}"),
+                "2026-10-31T10:00:00+00:00",
+            );
+        }
+        for i in 0..2 {
+            db.console_history_start(
+                &format!("b-{i}"),
+                "bob",
+                "o/r",
+                &format!("/prs {i}"),
+                "2026-10-31T10:00:00+00:00",
+            );
+        }
+        assert_eq!(
+            db.console_history_page("alice", None, 10)
+                .expect("page")
+                .len(),
+            4,
+            "nothing is dropped until a limit is set"
+        );
+
+        db.set_console_history_keep(2).expect("set keep");
+        assert_eq!(db.console_history_keep(), 2);
+
+        let alice = db.console_history_page("alice", None, 10).expect("page");
+        assert_eq!(alice.len(), 2, "alice is trimmed to the cap");
+        assert_eq!(alice[0].command, "/issues 3", "the newest turns survive");
+        assert_eq!(
+            db.console_history_page("bob", None, 10).expect("page").len(),
+            2,
+            "bob was already under the cap"
+        );
+
+        // A new turn for alice evicts her oldest, and only hers.
+        db.console_history_start("a-new", "alice", "o/r", "/help", "2026-10-31T10:01:00+00:00");
+        assert_eq!(
+            db.console_history_page("alice", None, 10).expect("page").len(),
+            2
+        );
+        assert_eq!(
+            db.console_history_page("bob", None, 10).expect("page").len(),
+            2
+        );
     }
 }

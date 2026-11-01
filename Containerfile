@@ -1,5 +1,8 @@
 # Multi-stage Containerfile for Sugie GitHub Triage Bot (Podman native)
-FROM rust:1.85-bookworm as builder
+# Pinned to the toolchain this lockfile was verified against: current
+# dependencies require rustc >= 1.89 (uuid, webauthn-rs, time), so the old
+# 1.85 image no longer builds.
+FROM rust:1.99-bookworm AS builder
 
 # `webauthn-rs-core` links OpenSSL for attestation parsing. The system package
 # keeps the build fast; pass `--features vendored-openssl` instead if you would
@@ -12,8 +15,10 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY templates ./templates
+# The SSR shell embeds the logo with include_str!, so it is a build input.
+COPY sugie-mark.svg ./
 
-RUN cargo build --release
+RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 
@@ -34,7 +39,7 @@ RUN useradd -m -u 1000 -U sugie && \
 
 USER sugie
 
-EXPOSE 8080
+EXPOSE 8800
 
 ENTRYPOINT ["sugie"]
 CMD ["serve"]

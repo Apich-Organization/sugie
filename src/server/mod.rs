@@ -24,6 +24,10 @@ pub struct AppState {
     /// Shared secret for `POST /api/chat/command`. `None` keeps the endpoint
     /// open (the historical behaviour) and is warned about at startup.
     pub chat_api_token: Option<Arc<str>>,
+    /// Console database, used to record the chat-bot exchanges shown on
+    /// `/admin/chats`. `None` when the admin console is not mounted: the bot
+    /// still answers, it just has nowhere to keep the conversation.
+    pub web_db: Option<crate::web::db::WebDb>,
 }
 
 pub fn create_router(state: AppState) -> Router {

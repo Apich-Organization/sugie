@@ -92,6 +92,36 @@ pub enum ChatPlatform {
     Api,
 }
 
+impl ChatPlatform {
+    /// Stable lowercase label, used as the stored value and as the filter value
+    /// in the console's chat history.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChatPlatform::Zulip => "zulip",
+            ChatPlatform::Lark => "lark",
+            ChatPlatform::Discord => "discord",
+            ChatPlatform::Api => "api",
+        }
+    }
+}
+
+/// Classify a bot reply for the console's chat history.
+///
+/// The executor reports problems with a leading marker rather than a `Result`,
+/// so the recorded outcome is derived from the text the user actually saw:
+/// `❌` is a hard failure, `⚠️`/`❓` is a refusal or misuse, everything else —
+/// help text, listings, `✅` confirmations — counts as a successful turn.
+pub fn reply_status(reply: &str) -> &'static str {
+    let head = reply.trim_start();
+    if head.starts_with('❌') {
+        "error"
+    } else if head.starts_with('⚠') || head.starts_with('❓') {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundSender {
     pub id: String,

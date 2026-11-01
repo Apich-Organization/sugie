@@ -1,3 +1,10 @@
+// The SSR pages are single deeply-nested `view!` trees. Leptos encodes every
+// element's children in the type, so the admin pages sit close to rustc's
+// default trait-solving depth — the release profile, which computes layouts
+// differently from debug, tips over it. Raising the limit is the standard fix
+// for deeply nested Leptos views.
+#![recursion_limit = "256"]
+
 pub mod chat;
 pub mod config;
 pub mod github;

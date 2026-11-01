@@ -1,27 +1,44 @@
-# Podman Quadlet container definition for Sugie Bot
-# Install location: ~/.config/containers/systemd/sugie.container (user mode)
-# Or system-wide:   /etc/containers/systemd/sugie.container
+# Podman Quadlet unit for Sugie.
 #
-# After placing this file, run:
-#   systemctl --user daemon-reload
-#   systemctl --user start sugie.service
+# Install system-wide so it comes back after a reboot without a login:
+#   sudo cp sugie.container /etc/containers/systemd/sugie.container
+#   sudo systemctl daemon-reload
+#   sudo systemctl start sugie.service
+#   systemctl is-enabled sugie.service   # -> generated
+#
+# The unit name is derived from the file name: `sugie.container` becomes
+# `sugie.service`. Do not `systemctl enable` it — Quadlet units are generated,
+# and the [Install] section below is what pulls them in at boot.
 
 [Unit]
-Description=Sugie GitHub Triage Bot Container
+Description=Sugie GitHub Triage Bot (container)
 After=network-online.target
+Wants=network-online.target
 
 [Container]
 ContainerName=sugie-bot
 Image=localhost/sugie:latest
-PublishPort=8080:8080
-Volume=%h/sugie/data:/app/data:Z
-Volume=%h/sugie/sugie.toml:/app/sugie.toml:ro,Z
+# Must match `port` in sugie.toml, which is what the bot listens on inside the
+# container. A mismatch here is the classic "container is up but nothing answers".
+PublishPort=8800:8800
+
+# Everything the bot reads or writes lives under one directory, exactly like the
+# native install. `.env` is required — the image ships no secrets — and the admin
+# console rewrites it, hence the read-write mounts.
+Volume=/opt/sugie/data:/app/data:Z
+Volume=/opt/sugie/sugie.toml:/app/sugie.toml:rw,Z
+Volume=/opt/sugie/.env:/app/.env:rw,Z
+
 Environment=RUST_LOG=info
 Environment=SUGIE_DB_PATH=/app/data/sugie.db
+
 Exec=serve --config /app/sugie.toml
 
 [Service]
-Restart=always
+Restart=on-failure
+RestartSec=5s
+# Give the bot time to finish an in-flight GitHub call on stop.
+TimeoutStopSec=30
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

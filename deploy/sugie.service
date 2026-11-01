@@ -1,0 +1,45 @@
+[Unit]
+Description=Sugie GitHub Triage Bot
+Documentation=file:/opt/sugie/README.md
+# The bot needs outbound HTTPS (GitHub API, Discord/Zulip/Lark webhooks) and an
+# inbound listener. `network-online.target` is what makes a reboot on a Pi with
+# a slow DHCP lease wait for the interface instead of failing the first fetch.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sugie
+Group=sugie
+WorkingDirectory=/opt/sugie
+ExecStart=/opt/sugie/sugie serve --config /opt/sugie/sugie.toml
+# Restart only on real failures. `Restart=always` would also restart a clean
+# exit, which hides a deliberate stop in the logs.
+Restart=on-failure
+RestartSec=5s
+
+# The admin console rewrites `.env` and `sugie.toml` and owns `data/`, so the
+# install directory has to stay writable while the rest of the filesystem does
+# not. Everything else the service can write is denied.
+ProtectSystem=strict
+ReadWritePaths=/opt/sugie
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# IPv4/IPv6 for the listener and outbound calls, AF_UNIX for DNS via nsswitch.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sugie
+
+[Install]
+WantedBy=multi-user.target

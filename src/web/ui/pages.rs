@@ -2,11 +2,24 @@
 //! no hydration, no client-side router.
 
 use crate::web::config_store::{BackupInfo, EnvEntry};
-use crate::web::exec::Job;
+use crate::web::db::ConsoleHistoryRow;
+use crate::web::exec::LogLine;
 use crate::web::perms::{CurrentUser, COMMANDS};
 use crate::web::stats::RepoStats;
 use crate::web::ui::{number, AmbientBg, Flash, Shell, StatCard};
 use leptos::prelude::*;
+
+/// One page of the console conversation, plus what the page needs to know about
+/// the turns that are not on screen.
+#[derive(Clone, Default)]
+pub struct ChatHistory {
+    /// Newest first, as returned by the query.
+    pub entries: Vec<ConsoleHistoryRow>,
+    /// Another page exists behind the oldest rendered turn.
+    pub has_more: bool,
+    /// The page was opened through a cursor, so the newest turns are not shown.
+    pub paged: bool,
+}
 
 #[derive(Clone, Default)]
 pub struct RepoCard {
@@ -592,8 +605,10 @@ pub fn chat_page(
     user: CurrentUser,
     repos: Vec<String>,
     selected: String,
-    history: Vec<Job>,
+    history: ChatHistory,
     stats: Option<RepoStats>,
+    keep: i64,
+    saved: Option<bool>,
 ) -> impl IntoView {
     let repo_links = repos
         .iter()
@@ -661,40 +676,30 @@ pub fn chat_page(
         "Please select a repository on the left".to_string()
     };
 
+    // The log renders oldest → newest so the newest turn sits next to the input,
+    // matching the order the live stream appends in. The query hands us the
+    // newest page first, so reverse it here.
     let messages = history
+        .entries
         .iter()
         .rev()
-        .map(|job| {
-            let cmd = job.command.clone();
-            let meta = format!("@{} · {}", job.username, job.started_at);
-            let status = match job.status {
-                crate::web::exec::JobStatus::Running => "running",
-                crate::web::exec::JobStatus::Done => "done",
-                crate::web::exec::JobStatus::Failed => "failed",
-                crate::web::exec::JobStatus::Cancelled => "cancelled",
-            };
-            let bot_meta = format!("sugie · {} · {}", job.repo, status);
+        .map(|entry| {
+            let cmd = entry.command.clone();
+            let meta = format!("@{} · {}", entry.username, fmt_when(&entry.started_at));
+            let status = entry.status.as_str();
+            let bot_meta = format!("sugie · {} · {}", entry.repo, status);
             // Failed jobs must not look like an empty successful run; a cancelled
             // one is a deliberate stop and gets its own neutral style.
-            let bot_cls = match job.status {
-                crate::web::exec::JobStatus::Failed => "msg bot failed",
-                crate::web::exec::JobStatus::Cancelled => "msg bot cancelled",
+            let bot_cls = match status {
+                "failed" => "msg bot failed",
+                "cancelled" | "interrupted" => "msg bot cancelled",
                 _ => "msg bot",
             };
-            let lines = job
-                .lines
-                .iter()
-                .skip(1)
-                .map(|l| {
-                    let cls = format!("line-{}", l.level);
-                    let text = format!("{}\n", l.text);
-                    view! { <span class=cls>{text}</span> }
-                })
-                .collect_view();
+            let lines = render_lines(&entry.lines);
             // A job still running after a page reload keeps a working Stop
             // button; the stream that created it is gone, but the job is not.
-            let stop_btn = if job.status == crate::web::exec::JobStatus::Running {
-                let id = job.id.clone();
+            let stop_btn = if entry.is_running() {
+                let id = entry.job_id.clone();
                 view! {
                     <button type="button" class="btn sm ghost stop-btn" data-job-id=id
                         aria-label="Stop this command">"Stop"</button>
@@ -716,6 +721,44 @@ pub fn chat_page(
         })
         .collect_view();
 
+    // Cursor for the page behind this one: the oldest turn currently on screen.
+    let older_href = match (history.has_more, history.entries.last()) {
+        (true, Some(oldest)) => Some(format!(
+            "/admin/chat?repo={}&before={}",
+            urlencode(&selected),
+            oldest.id
+        )),
+        _ => None,
+    };
+    let older_nav = match older_href {
+        Some(href) => view! {
+            <div class="older-nav">
+                <a class="btn sm ghost" href=href>"Load older"</a>
+            </div>
+        }
+        .into_any(),
+        None if history.paged => view! {
+            <div class="older-nav"><span class="hint">"Start of the conversation"</span></div>
+        }
+        .into_any(),
+        None => view! { <span></span> }.into_any(),
+    };
+    // Opening the page through a cursor hides the newest turns, so say so and
+    // offer a way back instead of silently truncating the conversation.
+    let paged_nav = if history.paged {
+        let latest = format!("/admin/chat?repo={}", urlencode(&selected));
+        view! {
+            <div class="older-nav">
+                <span class="hint">"Showing earlier commands"</span>
+                <a class="hint" href=latest>"Back to latest"</a>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! { <span></span> }.into_any()
+    };
+    let no_history = history.entries.is_empty();
+
     let quick = COMMANDS
         .iter()
         .take(10)
@@ -725,6 +768,33 @@ pub fn chat_page(
         })
         .collect_view();
 
+    // Retention is a global setting, so only managers get the control; everyone
+    // else just reads the conversation.
+    let retention = if user.can_manage() {
+        let saved_hint = match saved {
+            Some(true) => view! { <span class="badge ok">"Saved"</span> }.into_any(),
+            Some(false) => view! {
+                <span class="badge bad">"Enter a whole number ≥ 0"</span>
+            }
+            .into_any(),
+            None => view! { <span></span> }.into_any(),
+        };
+        view! {
+            <form method="post" action="/admin/chat/retention" class="row" style="margin:0;gap:6px">
+                <input type="hidden" name="repo" value=selected.clone()/>
+                <span class="hint">"Keep"</span>
+                <input type="number" name="keep" min="0" value=keep.to_string()
+                    style="width:92px" aria-label="Console turns to keep per user"/>
+                <span class="hint">"per user (0 = all)"</span>
+                <button type="submit" class="btn sm">"Save"</button>
+                {saved_hint}
+            </form>
+        }
+        .into_any()
+    } else {
+        view! { <span></span> }.into_any()
+    };
+
     view! {
         <Shell title="Console".to_string() active="chat".to_string() user=Some(user.clone())>
             <div class="page-head">
@@ -733,7 +803,10 @@ pub fn chat_page(
                     <h1>"Command Console"</h1>
                     <p>"Select a repository and dispatch triage commands executed directly via GitHub API"</p>
                 </div>
-                <span class="badge">{format!("Role: {}", user.role.label())}</span>
+                <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
+                    {retention}
+                    <span class="badge">{format!("Role: {}", user.role.label())}</span>
+                </div>
             </div>
             <div class="console">
                 <div class="card tight">
@@ -768,7 +841,19 @@ pub fn chat_page(
                             }
                             .into_any()
                         } else {
-                            messages.into_any()
+                            view! {
+                                {paged_nav}
+                                {older_nav}
+                                {if no_history {
+                                    view! {
+                                        <div class="empty">"No commands yet. Type one below to start the conversation."</div>
+                                    }
+                                    .into_any()
+                                } else {
+                                    messages.into_any()
+                                }}
+                            }
+                            .into_any()
                         }}
                     </div>
                     {if no_repos {
@@ -785,6 +870,249 @@ pub fn chat_page(
                         .into_any()
                     }}
                 </div>
+            </div>
+        </Shell>
+    }
+}
+
+// -------------------------------------------------------------------- chats
+
+/// Rebuild `/admin/chats` with a different page but the same filters, so paging
+/// never silently drops what the reader was looking for.
+fn build_chats_url(page: i64, filter: &crate::web::db::ChatLogFilter) -> String {
+    let mut url = format!("/admin/chats?page={page}");
+    for (key, value) in [
+        ("q_platform", &filter.platform),
+        ("q_user", &filter.username),
+        ("q_ts", &filter.ts),
+        ("q_text", &filter.text),
+        ("q_status", &filter.status),
+    ] {
+        if !value.trim().is_empty() {
+            url.push_str(&format!("&{key}={}", urlencode(value)));
+        }
+    }
+    url
+}
+
+/// `/admin/chats`: the bot conversation log across every connected platform.
+pub fn chats_page(
+    user: CurrentUser,
+    rows: Vec<crate::web::db::ChatLogRow>,
+    page: i64,
+    total: i64,
+    filter: crate::web::db::ChatLogFilter,
+    keep: i64,
+    saved: Option<bool>,
+) -> impl IntoView {
+    let pages = (total + 49) / 50;
+    let has_next = page + 1 < pages;
+    let prev = build_chats_url((page - 1).max(0), &filter);
+    let next = build_chats_url(page + 1, &filter);
+    let reset_url = "/admin/chats".to_string();
+
+    let next_control = if has_next {
+        view! { <a class="btn sm ghost" href=next>"Next"</a> }.into_any()
+    } else {
+        view! { <span class="btn sm ghost" aria-disabled="true">"Next"</span> }.into_any()
+    };
+    let filter_badge = if filter.is_empty() {
+        view! { <span></span> }.into_any()
+    } else {
+        view! {
+            <span class="badge warn" style="margin-left:8px">
+                "Filtered"
+                <a href=reset_url.clone() style="margin-left:6px;text-decoration:underline">"Clear"</a>
+            </span>
+        }
+        .into_any()
+    };
+
+    let body = if rows.is_empty() {
+        view! {
+            <tr><td colspan="8" class="empty">"No bot conversations match the current filters"</td></tr>
+        }
+        .into_any()
+    } else {
+        rows.iter()
+            .map(|row| {
+                let status_cls = match row.status.as_str() {
+                    "ok" => "badge ok",
+                    "warn" => "badge warn",
+                    _ => "badge bad",
+                };
+                // The reply is markdown with newlines and can be long (a help
+                // dump, an issue list). Show the first line and let the reader
+                // expand it, instead of letting one answer set the row height.
+                let reply_text = row.reply.trim();
+                let first_line: String = reply_text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(140)
+                    .collect();
+                let needs_details =
+                    reply_text.lines().count() > 1 || reply_text.chars().count() > 140;
+                let reply_cell = if reply_text.is_empty() {
+                    view! { <span class="hint">"—"</span> }.into_any()
+                } else if needs_details {
+                    view! {
+                        <details class="chat-reply">
+                            <summary>{first_line}</summary>
+                            <pre>{reply_text.to_string()}</pre>
+                        </details>
+                    }
+                    .into_any()
+                } else {
+                    view! { <span class="hint">{reply_text.to_string()}</span> }.into_any()
+                };
+                let sender = if row.display_name.is_empty() {
+                    row.username.clone()
+                } else {
+                    format!("{} ({})", row.username, row.display_name)
+                };
+                let channel = if row.channel.is_empty() {
+                    "—".to_string()
+                } else {
+                    row.channel.clone()
+                };
+                view! {
+                    <tr>
+                        <td class="hint mono nowrap col-ts">{fmt_when(&row.ts)}</td>
+                        <td class="nowrap"><span class="badge">{row.platform.clone()}</span></td>
+                        <td class="nowrap">{sender}</td>
+                        <td class="hint mono" style="max-width:180px;word-break:break-all">{channel}</td>
+                        <td class="mono" style="max-width:260px;word-break:break-word">{row.command.clone()}</td>
+                        <td style="max-width:420px">{reply_cell}</td>
+                        <td><span class=status_cls>{row.status.clone()}</span></td>
+                        <td class="num">{format!("{} ms", row.duration_ms)}</td>
+                    </tr>
+                }
+            })
+            .collect_view()
+            .into_any()
+    };
+
+    let platform_all = filter.platform.is_empty();
+    let platform_zulip = filter.platform == "zulip";
+    let platform_lark = filter.platform == "lark";
+    let platform_discord = filter.platform == "discord";
+    let platform_api = filter.platform == "api";
+
+    let status_all = filter.status.is_empty();
+    let status_ok = filter.status == "ok";
+    let status_warn = filter.status == "warn";
+    let status_error = filter.status == "error";
+
+    // The date input wants `YYYY-MM-DD`; anything else is passed through so the
+    // stored filter value is never silently rewritten.
+    let ts_val = if filter.ts.len() >= 10
+        && filter.ts.chars().nth(4) == Some('-')
+        && filter.ts.chars().nth(7) == Some('-')
+    {
+        filter.ts.chars().take(10).collect::<String>()
+    } else {
+        filter.ts.clone()
+    };
+
+    view! {
+        <Shell title="Chat Bots".to_string() active="chats".to_string() user=Some(user.clone())>
+            <div class="page-head">
+                <div>
+                    <div class="eyebrow">"Chat Bots"</div>
+                    <div class="row" style="gap:8px">
+                        <h1>"Bot Conversation History"</h1>
+                        {filter_badge}
+                    </div>
+                    <p>{format!(
+                        "{total} exchanges recorded · Page {} of {} · {}",
+                        page + 1,
+                        pages.max(1),
+                        if keep > 0 {
+                            format!("Newest {} kept", number(keep as u64))
+                        } else {
+                            "Keeping every exchange".to_string()
+                        },
+                    )}</p>
+                </div>
+                <div class="row">
+                    <a class="btn sm ghost" href=prev>"Previous"</a>
+                    {next_control}
+                </div>
+            </div>
+            <div class="row" style="margin-bottom:14px;align-items:center;gap:10px;flex-wrap:wrap">
+                <form method="post" action="/admin/chats/retention" class="row" style="margin:0;gap:8px">
+                    <span class="hint">"Keep newest"</span>
+                    <input type="number" name="keep" min="0" value=keep.to_string() style="width:120px" aria-label="Exchanges to keep"/>
+                    <span class="hint">"exchanges (0 = keep all)"</span>
+                    <button type="submit" class="btn sm">"Save"</button>
+                </form>
+                {match saved {
+                    Some(true) => view! { <span class="badge ok">"Saved"</span> }.into_any(),
+                    Some(false) => view! {
+                        <span class="badge bad">"Enter a whole number ≥ 0"</span>
+                    }
+                    .into_any(),
+                    None => view! { <span></span> }.into_any(),
+                }}
+                {if keep > 0 {
+                    view! {
+                        <span class="hint">"Older exchanges were deleted when the limit was saved."</span>
+                    }
+                    .into_any()
+                } else {
+                    view! { <span></span> }.into_any()
+                }}
+            </div>
+            <div class="card tight">
+                <form method="get" action="/admin/chats" style="margin:0">
+                    <table class="audit-table">
+                        <thead>
+                            <tr>
+                                <th class="col-ts">"Time"</th>
+                                <th>"Platform"</th>
+                                <th>"Sender"</th>
+                                <th>"Channel"</th>
+                                <th>"Command"</th>
+                                <th>"Reply"</th>
+                                <th>"Status"</th>
+                                <th>"Latency"</th>
+                            </tr>
+                            <tr class="filter-row">
+                                <th class="col-ts">{clearable_date("q_ts", ts_val, "date")}</th>
+                                <th>
+                                    <select name="q_platform" class="col-filter" onchange="this.form.submit()">
+                                        <option value="" selected=platform_all>"All"</option>
+                                        <option value="zulip" selected=platform_zulip>"Zulip"</option>
+                                        <option value="lark" selected=platform_lark>"Lark"</option>
+                                        <option value="discord" selected=platform_discord>"Discord"</option>
+                                        <option value="api" selected=platform_api>"API"</option>
+                                    </select>
+                                </th>
+                                <th>{clearable_input("q_user", filter.username.clone(), "User…", "Sender", true)}</th>
+                                <th><span class="hint mono" style="font-size:11px">"-"</span></th>
+                                <th>{clearable_input("q_text", filter.text.clone(), "Command or reply…", "Command or reply", true)}</th>
+                                <th><span class="hint mono" style="font-size:11px">"-"</span></th>
+                                <th>
+                                    <select name="q_status" class="col-filter" onchange="this.form.submit()">
+                                        <option value="" selected=status_all>"All"</option>
+                                        <option value="ok" selected=status_ok>"ok"</option>
+                                        <option value="warn" selected=status_warn>"warn"</option>
+                                        <option value="error" selected=status_error>"error"</option>
+                                    </select>
+                                </th>
+                                <th class="nowrap" style="text-align:right">
+                                    <div class="row" style="flex-wrap:nowrap;justify-content:flex-end">
+                                        <button type="submit" class="btn sm primary">"Filter"</button>
+                                        <a href=reset_url class="btn sm ghost" style="margin-left:4px">"Reset"</a>
+                                    </div>
+                                </th>
+                            </tr>
+                        </thead>
+                        <tbody>{body}</tbody>
+                    </table>
+                </form>
             </div>
         </Shell>
     }
@@ -2162,7 +2490,7 @@ fn clearable_date(name: &str, value: String, label: &str) -> AnyView {
     .into_any()
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
@@ -2173,6 +2501,39 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Render a stored reply, dropping the echoed command line: the user bubble
+/// above the answer already shows it, so repeating it reads like a duplicate.
+fn render_lines(lines: &[LogLine]) -> AnyView {
+    let body: Vec<&LogLine> = lines.iter().skip(1).collect();
+    if body.is_empty() {
+        // Never leave an empty bubble: a run with no output still has to say so,
+        // and a failed one must not look like a successful empty run.
+        return view! { <span class="line-info">"(no output)\n"</span> }.into_any();
+    }
+    body.into_iter()
+        .map(|l| {
+            let cls = format!("line-{}", l.level);
+            let text = format!("{}\n", l.text);
+            view! { <span class=cls>{text}</span> }
+        })
+        .collect_view()
+        .into_any()
+}
+
+/// Format a stored RFC 3339 timestamp for the bubble meta line.
+///
+/// History spans days, so a bare time of day would be ambiguous; anything that
+/// does not parse is shown verbatim rather than dropped.
+fn fmt_when(ts: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+        Err(_) => ts.to_string(),
+    }
 }
 
 // --------------------------------------------------------------------- notify

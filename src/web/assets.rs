@@ -278,6 +278,13 @@ dialog.modal-dialog::backdrop{
 }
 .repo-stats .rs-refresh:hover{background:var(--accent-soft); border-color:var(--primary)}
 .chat-log{flex:1; overflow:auto; padding:18px 20px; display:flex; flex-direction:column; gap:14px}
+/* Paging controls for the persisted conversation: they sit above the oldest
+   turn on screen, so reading order stays oldest → newest. */
+.chat-log .older-nav{
+  display:flex; align-items:center; justify-content:center; gap:10px;
+  align-self:stretch; font-size:11.5px;
+}
+.chat-log .older-nav .btn{font-family:inherit; padding:4px 12px; font-size:11.5px}
 .msg{max-width:min(720px,92%); border-radius:16px; padding:12px 14px; font-size:13px}
 .msg.user{align-self:flex-end; background:linear-gradient(140deg,var(--primary),var(--accent)); color:#fff; border-bottom-right-radius:6px}
 .msg.bot{align-self:flex-start; background:var(--surface-alt); border:1px solid var(--border); border-bottom-left-radius:6px}
@@ -399,6 +406,19 @@ td:last-child .row{justify-content:flex-end}
 select.col-filter{padding:4px 6px; cursor:pointer}
 input[type=date].col-filter{min-width:135px; padding:4px 6px; cursor:pointer}
 [data-theme="dark"] input[type=date]::-webkit-calendar-picker-indicator{filter:invert(0.85); cursor:pointer}
+
+/* Bot conversation log: a reply is collapsed to its first line until opened, so
+   one long answer cannot set the height of the whole table. */
+.chat-reply summary{cursor:pointer; color:var(--text-2); list-style:none}
+.chat-reply summary::-webkit-details-marker{display:none}
+.chat-reply summary::after{content:" ▾"; color:var(--text-3); font-size:10px}
+.chat-reply[open] summary::after{content:" ▴"}
+.chat-reply summary:hover{color:var(--text-1)}
+.chat-reply pre{
+  margin:8px 0 0; padding:10px 12px; max-height:320px; overflow:auto;
+  background:var(--surface-alt); border:1px solid var(--border); border-radius:10px;
+  font-size:11.5px; line-height:1.6; white-space:pre-wrap; word-break:break-word;
+}
 
 /* ================= visual refresh: Bezier motion, living gradient, frosted glass ================= */
 :root{
@@ -687,6 +707,10 @@ pub const JS: &str = r#"
     }
 
     function appendJob(command, jobId) {
+      // The empty-state placeholder only belongs to a conversation with no
+      // turns; the first command sent retires it.
+      var placeholder = log.querySelector('.empty');
+      if (placeholder) placeholder.remove();
       var userMsg = document.createElement('div');
       userMsg.className = 'msg user';
       userMsg.innerHTML = '<div class="meta">You · just now</div>';

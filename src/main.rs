@@ -254,6 +254,9 @@ async fn main() -> anyhow::Result<()> {
                 config: config.clone(),
                 triage,
                 chat_api_token,
+                // Same handle the console uses, so a chat reply is recorded even
+                // when the request is served by a different task.
+                web_db: Some(web_state.db.clone()),
             };
 
             let app = sugie::server::create_router_with_web(state, Some(web_state));
