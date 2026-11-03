@@ -84,7 +84,7 @@ fn assemble_list_message(
     out.join("\n")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatPlatform {
     Zulip,
     Lark,
@@ -127,6 +127,32 @@ pub struct InboundSender {
     pub id: String,
     pub username: String,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub extra_ids: Vec<String>,
+}
+
+impl InboundSender {
+    pub fn new(id: impl Into<String>, username: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            username: username.into(),
+            display_name: None,
+            extra_ids: Vec::new(),
+        }
+    }
+
+    pub fn with_display_name(mut self, name: impl Into<String>) -> Self {
+        self.display_name = Some(name.into());
+        self
+    }
+
+    pub fn with_extra_id(mut self, extra_id: impl Into<String>) -> Self {
+        let eid = extra_id.into();
+        if !eid.trim().is_empty() && !self.extra_ids.contains(&eid) {
+            self.extra_ids.push(eid);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,6 +500,17 @@ impl<'a> ChatCommandExecutor<'a> {
         let known_repos = self.get_known_repositories();
         let cmd = ChatCommandParser::parse(&message.raw_content, &known_repos);
 
+        let is_super = self.is_super_user(message.platform, &message.sender);
+        if self.config.default_rules.commands.admin_only
+            && !is_super
+            && !matches!(cmd, ChatCommand::ChatId | ChatCommand::Help | ChatCommand::Status)
+        {
+            return format!(
+                "⛔ Access Denied: Sugie is configured in admin-only mode (`admin_only = true`).\nOnly authorized administrators can run commands.\n\nYour User ID is `{}` (@{}). Type `/chatid` to see how to request access.",
+                message.sender.id, message.sender.username
+            );
+        }
+
         match cmd {
             ChatCommand::Help => self.render_help(),
             ChatCommand::Status => self.render_status(Some(message)).await,
@@ -492,18 +529,16 @@ impl<'a> ChatCommandExecutor<'a> {
             }
             ChatCommand::Stats { repo } => self.render_stats(repo.as_deref()).await,
             ChatCommand::Config => self.render_config(),
-            ChatCommand::Stale { repo } => self.run_stale(&message.sender, repo.as_deref()).await,
+            ChatCommand::Stale { repo } => self.run_stale(message, repo.as_deref()).await,
             ChatCommand::Comment { repo, number, body } => {
-                self.post_comment(&message.sender, &repo, number, &body)
-                    .await
+                self.post_comment(message, &repo, number, &body).await
             }
             ChatCommand::IssueAction {
                 repo,
                 number,
                 command,
             } => {
-                self.execute_issue_action(&message.sender, &repo, number, command)
-                    .await
+                self.execute_issue_action(message, &repo, number, command).await
             }
             ChatCommand::Unknown(text) => {
                 format!(
@@ -572,29 +607,61 @@ impl<'a> ChatCommandExecutor<'a> {
             .as_deref()
             .unwrap_or("(direct message / unassigned)");
 
+        let is_admin = self.is_super_user(message.platform, &message.sender);
+        let admin_badge = if is_admin {
+            "🟢 Authorized Super User / Admin"
+        } else {
+            "🔴 Standard User (Not authorized for restricted commands)"
+        };
+
+        let mut out = format!(
+            "### 📍 Chat & User Identification\n\n\
+            - **Platform**: {}\n\
+            - **Current Chat ID**: `{}`\n\
+            - **Your User ID**: `{}`\n\
+            - **Your Username**: `@{}`\n\
+            - **Admin Permission**: {}\n",
+            platform_name, channel, message.sender.id, message.sender.username, admin_badge
+        );
+
+        if !message.sender.extra_ids.is_empty() {
+            out.push_str(&format!(
+                "- **Alternate IDs**: `{}`\n",
+                message.sender.extra_ids.join("`, `")
+            ));
+        }
+
+        if !is_admin {
+            let config_field = match message.platform {
+                ChatPlatform::Lark => "lark_super_users",
+                ChatPlatform::Discord => "discord_super_users",
+                ChatPlatform::Zulip => "zulip_super_users",
+                ChatPlatform::Api => "super_users",
+            };
+            out.push_str(&format!(
+                "\n💡 **To grant this user admin permissions**, add to `sugie.toml`:\n```toml\n[default_rules.commands]\n{} = [\"{}\"]\n```\n",
+                config_field, message.sender.id
+            ));
+        }
+
         let toml_snippet = match message.platform {
             ChatPlatform::Lark => format!(
-                "\n\n💡 To register this channel in `sugie.toml`:\n```toml\n[[notifications.lark.channels]]\nname = \"my-channel\"\nchat_id = \"{}\"\n```",
+                "\n💡 **To register this channel in `sugie.toml`**:\n```toml\n[[notifications.lark.channels]]\nname = \"my-channel\"\nchat_id = \"{}\"\n```",
                 channel
             ),
             ChatPlatform::Discord => format!(
-                "\n\n💡 To register this channel in `sugie.toml`:\n```toml\n[[notifications.discord.bot_channels]]\nname = \"my-channel\"\nchannel_id = \"{}\"\n```",
+                "\n💡 **To register this channel in `sugie.toml`**:\n```toml\n[[notifications.discord.bot_channels]]\nname = \"my-channel\"\nchannel_id = \"{}\"\n```",
                 channel
             ),
             ChatPlatform::Zulip => format!(
-                "\n\n💡 To register this channel in `sugie.toml`:\n```toml\n[[notifications.zulip.channels]]\nname = \"my-channel\"\nchannel = \"{}\"\ntopic = \"announcements\"\n```",
+                "\n💡 **To register this channel in `sugie.toml`**:\n```toml\n[[notifications.zulip.channels]]\nname = \"my-channel\"\nchannel = \"{}\"\ntopic = \"announcements\"\n```",
                 channel
             ),
             ChatPlatform::Api => String::new(),
         };
 
-        format!(
-            "### 📍 Chat / Channel Information\n\n\
-            - **Platform**: {}\n\
-            - **Current Chat ID**: `{}`\
-            {}",
-            platform_name, channel, toml_snippet
-        )
+        out.push_str(&toml_snippet);
+        out
     }
 
     async fn render_status(&self, message: Option<&InboundChatMessage>) -> String {
@@ -616,13 +683,48 @@ impl<'a> ChatCommandExecutor<'a> {
         }
 
         let current_chat_info = if let Some(m) = message {
-            if let Some(ref ch) = m.stream_or_channel {
-                format!("- **Current Chat ID**: `{}`\n", ch)
-            } else {
-                String::new()
-            }
+            let is_admin = self.is_super_user(m.platform, &m.sender);
+            format!(
+                "- **Current User**: `{}` (@{}) — {}\n{}",
+                m.sender.id,
+                m.sender.username,
+                if is_admin { "🟢 Super User" } else { "⚪ Standard User" },
+                if let Some(ref ch) = m.stream_or_channel {
+                    format!("- **Current Chat ID**: `{}`\n", ch)
+                } else {
+                    String::new()
+                }
+            )
         } else {
             String::new()
+        };
+
+        let cmd_cfg = &self.config.default_rules.commands;
+        let mut super_summary = Vec::new();
+        if !cmd_cfg.super_users.is_empty() {
+            super_summary.push(format!("GitHub/Global: {}", cmd_cfg.super_users.join(", ")));
+        }
+        if !cmd_cfg.lark_super_users.is_empty() {
+            super_summary.push(format!("Lark: {}", cmd_cfg.lark_super_users.join(", ")));
+        }
+        if !cmd_cfg.discord_super_users.is_empty() {
+            super_summary.push(format!("Discord: {}", cmd_cfg.discord_super_users.join(", ")));
+        }
+        if !cmd_cfg.zulip_super_users.is_empty() {
+            super_summary.push(format!("Zulip: {}", cmd_cfg.zulip_super_users.join(", ")));
+        }
+        let super_str = if super_summary.is_empty() {
+            "(None)".to_string()
+        } else {
+            super_summary.join(" | ")
+        };
+
+        let mode_str = if cmd_cfg.admin_only {
+            "🔒 **Admin Only** (all bot commands require super user)".to_string()
+        } else if cmd_cfg.restricted_commands.is_empty() {
+            "Open (no command restrictions)".to_string()
+        } else {
+            format!("/{}", cmd_cfg.restricted_commands.join(", /"))
         };
 
         format!(
@@ -641,26 +743,8 @@ impl<'a> ChatCommandExecutor<'a> {
                 ch_list.join(", ")
             },
             current_chat_info,
-            if self.config.default_rules.commands.super_users.is_empty() {
-                "(None)".to_string()
-            } else {
-                self.config.default_rules.commands.super_users.join(", ")
-            },
-            if self
-                .config
-                .default_rules
-                .commands
-                .restricted_commands
-                .is_empty()
-            {
-                "(None)".to_string()
-            } else {
-                self.config
-                    .default_rules
-                    .commands
-                    .restricted_commands
-                    .join(", ")
-            }
+            super_str,
+            mode_str,
         )
     }
 
@@ -718,17 +802,61 @@ impl<'a> ChatCommandExecutor<'a> {
         lines.join("\n")
     }
 
-    fn is_super_user(&self, sender: &InboundSender) -> bool {
-        self.config
-            .default_rules
-            .commands
-            .super_users
-            .iter()
-            .any(|su| {
-                let clean = su.trim_start_matches('@');
-                clean.eq_ignore_ascii_case(&sender.username)
-                    || clean.eq_ignore_ascii_case(&sender.id)
-            })
+    pub fn is_super_user(&self, platform: ChatPlatform, sender: &InboundSender) -> bool {
+        Self::check_super_user(&self.config.default_rules.commands, platform, sender)
+    }
+
+    pub fn check_super_user(
+        commands_cfg: &crate::config::CommandsConfig,
+        platform: ChatPlatform,
+        sender: &InboundSender,
+    ) -> bool {
+        let platform_super_users: &[String] = match platform {
+            ChatPlatform::Lark => &commands_cfg.lark_super_users,
+            ChatPlatform::Discord => &commands_cfg.discord_super_users,
+            ChatPlatform::Zulip => &commands_cfg.zulip_super_users,
+            ChatPlatform::Api => &[],
+        };
+
+        let matches_user = |su: &str| {
+            let clean = su.trim().trim_start_matches('@');
+            if clean.is_empty() {
+                return false;
+            }
+            let target = if let Some((p, rest)) = clean.split_once(':') {
+                let p_matches = match platform {
+                    ChatPlatform::Lark => {
+                        p.eq_ignore_ascii_case("lark") || p.eq_ignore_ascii_case("feishu")
+                    }
+                    ChatPlatform::Discord => p.eq_ignore_ascii_case("discord"),
+                    ChatPlatform::Zulip => p.eq_ignore_ascii_case("zulip"),
+                    ChatPlatform::Api => p.eq_ignore_ascii_case("api"),
+                };
+                if !p_matches {
+                    return false;
+                }
+                rest.trim()
+            } else {
+                clean
+            };
+
+            target.eq_ignore_ascii_case(&sender.id)
+                || target.eq_ignore_ascii_case(&sender.username)
+                || sender
+                    .display_name
+                    .as_deref()
+                    .map_or(false, |dn| target.eq_ignore_ascii_case(dn))
+                || sender
+                    .extra_ids
+                    .iter()
+                    .any(|eid| target.eq_ignore_ascii_case(eid))
+        };
+
+        if platform_super_users.iter().any(|su| matches_user(su)) {
+            return true;
+        }
+
+        commands_cfg.super_users.iter().any(|su| matches_user(su))
     }
 
     async fn client_for(&self, repo: &str) -> Result<GitHubClient> {
@@ -859,25 +987,54 @@ impl<'a> ChatCommandExecutor<'a> {
 
     fn render_config(&self) -> String {
         let s = crate::web::config_store::ConfigSummary::from_config(self.config);
+        let cmd_cfg = &self.config.default_rules.commands;
         format!(
-            "⚙️ **Active Configuration**\n\n- Listen: `{}:{}`\n- Notification channels: {}\n- Repository filter: {}\n- Super users: {}\n- Restricted commands: {}\n- Stale sweep: {} · Auto reviewers: {} · Auto labels: {}",
+            "⚙️ **Active Configuration**\n\n\
+            - Listen: `{}:{}`\n\
+            - Notification channels: {}\n\
+            - Repository filter: {}\n\
+            - Admin-only mode: {}\n\
+            - Super users (GitHub): {}\n\
+            - Platform admins: Lark ({}) · Discord ({}) · Zulip ({})\n\
+            - Restricted commands: {}\n\
+            - Stale sweep: {} · Auto reviewers: {} · Auto labels: {}",
             s.host,
             s.port,
-            if s.channels.is_empty() { "None".to_string() } else { s.channels.join(", ") },
-            if s.allowed_repositories.is_empty() { "all onboarded repositories".to_string() } else { s.allowed_repositories.join(", ") },
-            if s.super_users.is_empty() { "(none)".to_string() } else { s.super_users.join(", ") },
-            if s.restricted_commands.is_empty() { "(none)".to_string() } else { format!("/{}", s.restricted_commands.join(", /")) },
+            if s.channels.is_empty() {
+                "None".to_string()
+            } else {
+                s.channels.join(", ")
+            },
+            if s.allowed_repositories.is_empty() {
+                "all onboarded repositories".to_string()
+            } else {
+                s.allowed_repositories.join(", ")
+            },
+            if cmd_cfg.admin_only { "🔒 ON (all commands require admin)" } else { "off" },
+            if s.super_users.is_empty() {
+                "(none)".to_string()
+            } else {
+                s.super_users.join(", ")
+            },
+            if cmd_cfg.lark_super_users.is_empty() { "none".to_string() } else { cmd_cfg.lark_super_users.join(", ") },
+            if cmd_cfg.discord_super_users.is_empty() { "none".to_string() } else { cmd_cfg.discord_super_users.join(", ") },
+            if cmd_cfg.zulip_super_users.is_empty() { "none".to_string() } else { cmd_cfg.zulip_super_users.join(", ") },
+            if s.restricted_commands.is_empty() {
+                "(none)".to_string()
+            } else {
+                format!("/{}", s.restricted_commands.join(", /"))
+            },
             if s.stale_enabled { "on" } else { "off" },
             if s.reviewers_enabled { "on" } else { "off" },
             if s.labels_enabled { "on" } else { "off" },
         )
     }
 
-    async fn run_stale(&self, sender: &InboundSender, target_repo: Option<&str>) -> String {
-        if !self.is_super_user(sender) {
+    async fn run_stale(&self, message: &InboundChatMessage, target_repo: Option<&str>) -> String {
+        if !self.is_super_user(message.platform, &message.sender) {
             return format!(
-                "⛔ Sorry @{}, `/stale` is restricted to authorized super users.",
-                sender.username
+                "⛔ Sorry @{}, `/stale` is restricted to authorized super users.\n\nYour User ID is `{}`.",
+                message.sender.username, message.sender.id
             );
         }
         let rules = self.config.default_rules.stale.clone();
@@ -910,15 +1067,16 @@ impl<'a> ChatCommandExecutor<'a> {
 
     async fn post_comment(
         &self,
-        sender: &InboundSender,
+        message: &InboundChatMessage,
         repo: &str,
         number: u64,
         body: &str,
     ) -> String {
-        if !self.is_super_user(sender) {
+        let sender = &message.sender;
+        if !self.is_super_user(message.platform, sender) {
             return format!(
-                "⛔ Sorry @{}, `/comment` is restricted to authorized super users.",
-                sender.username
+                "⛔ Sorry @{}, `/comment` is restricted to authorized super users.\n\nYour User ID is `{}`.",
+                sender.username, sender.id
             );
         }
         let Some((owner, repo_name)) = repo.split_once('/') else {
@@ -1100,11 +1258,12 @@ impl<'a> ChatCommandExecutor<'a> {
 
     async fn execute_issue_action(
         &self,
-        sender: &InboundSender,
+        message: &InboundChatMessage,
         repo: &str,
         number: u64,
         command: SlashCommand,
     ) -> String {
+        let sender = &message.sender;
         let cmd_name = command.name();
 
         // Check if command is restricted
@@ -1117,22 +1276,12 @@ impl<'a> ChatCommandExecutor<'a> {
             .any(|r| r.trim_start_matches('/').eq_ignore_ascii_case(cmd_name));
 
         if is_restricted {
-            let is_super = self
-                .config
-                .default_rules
-                .commands
-                .super_users
-                .iter()
-                .any(|su| {
-                    let clean = su.trim_start_matches('@');
-                    clean.eq_ignore_ascii_case(&sender.username)
-                        || clean.eq_ignore_ascii_case(&sender.id)
-                });
+            let is_super = self.is_super_user(message.platform, sender);
 
             if !is_super {
                 return format!(
-                    "⛔ Sorry @{}, the command `/{}` is restricted to authorized super users.",
-                    sender.username, cmd_name
+                    "⛔ Sorry @{}, the command `/{}` is restricted to authorized super users.\n\nYour User ID is `{}`.",
+                    sender.username, cmd_name, sender.id
                 );
             }
         }
@@ -1411,5 +1560,84 @@ mod tests {
             assemble_list_message("🐞", "issues", "o/r", "issues", 3, 10, 20, &empty, Some(25)),
             "🐞 No open issues on page 3 of `o/r` (10 per page)."
         );
+    }
+
+    #[test]
+    fn test_is_super_user_platform_matching() {
+        let mut commands_cfg = crate::config::CommandsConfig::default();
+        commands_cfg.super_users = vec!["octocat".to_string(), "discord:global_mod".to_string()];
+        commands_cfg.lark_super_users = vec![
+            "ou_lark_admin".to_string(),
+            "emp_9999".to_string(),
+        ];
+        commands_cfg.discord_super_users = vec![
+            "123456789012345678".to_string(),
+            "discord_mod".to_string(),
+        ];
+        commands_cfg.zulip_super_users = vec![
+            "admin@zulip.org".to_string(),
+        ];
+
+        // Lark sender tests
+        let lark_sender_ok = InboundSender {
+            id: "ou_lark_admin".to_string(),
+            username: "John Doe".to_string(),
+            display_name: None,
+            extra_ids: vec!["emp_1234".to_string()],
+        };
+        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Lark, &lark_sender_ok));
+
+        let lark_sender_extra_match = InboundSender {
+            id: "ou_other".to_string(),
+            username: "Jane Doe".to_string(),
+            display_name: None,
+            extra_ids: vec!["emp_9999".to_string()],
+        };
+        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Lark, &lark_sender_extra_match));
+
+        let lark_sender_fail = InboundSender {
+            id: "ou_regular".to_string(),
+            username: "Regular User".to_string(),
+            display_name: None,
+            extra_ids: vec![],
+        };
+        assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Lark, &lark_sender_fail));
+
+        // Discord sender tests
+        let discord_sender_id_match = InboundSender {
+            id: "123456789012345678".to_string(),
+            username: "coolguy".to_string(),
+            display_name: None,
+            extra_ids: vec![],
+        };
+        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &discord_sender_id_match));
+
+        let discord_sender_user_match = InboundSender {
+            id: "9999999".to_string(),
+            username: "discord_mod".to_string(),
+            display_name: None,
+            extra_ids: vec![],
+        };
+        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &discord_sender_user_match));
+
+        // Platform-prefixed in general super_users: "discord:global_mod"
+        let discord_prefixed_match = InboundSender {
+            id: "888888".to_string(),
+            username: "global_mod".to_string(),
+            display_name: None,
+            extra_ids: vec![],
+        };
+        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &discord_prefixed_match));
+        // Same username on Lark should NOT match "discord:global_mod"
+        assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Lark, &discord_prefixed_match));
+
+        // Fallback super user: "octocat"
+        let github_fallback = InboundSender {
+            id: "octocat".to_string(),
+            username: "octocat".to_string(),
+            display_name: None,
+            extra_ids: vec![],
+        };
+        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &github_fallback));
     }
 }

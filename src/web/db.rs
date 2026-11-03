@@ -2207,6 +2207,7 @@ mod tests {
                 id: format!("{user}-id"),
                 username: user.to_string(),
                 display_name: Some(format!("{user} display")),
+                extra_ids: Vec::new(),
             },
             raw_content: text.to_string(),
             stream_or_channel: Some("stream-1".to_string()),

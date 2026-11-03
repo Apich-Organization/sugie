@@ -324,6 +324,30 @@ top_contributors_limit = 10
 # ------------------------------------------------------------------------------
 [default_rules.commands]
 prefix = "/"
+# When true, only authorized super users can run ANY bot commands (exempts /help, /status, /chatid)
+admin_only = false
+
+# Platform-specific super users (Lark open_id "ou_..." or user_id; Discord snowflake ID or username; Zulip email/id).
+# Tip: Type `/chatid` in Lark/Discord/Zulip to view your exact User ID.
+lark_super_users = ["ou_efa7bf797876cb312be45eb547cd4e7c"]
+discord_super_users = ["123456789012345678"]
+zulip_super_users = ["admin@your-zulip.example.com"]
+
+# General / GitHub maintainers fallback:
+super_users = ["octocat"]
+
+# Commands restricted to super users:
+restricted_commands = [
+    "assign",
+    "unassign",
+    "close",
+    "reopen",
+    "move",
+    "duplicate",
+    "project",
+    "retest"
+]
+
 [default_rules.commands.aliases]
 l = "label"
 a = "assign"

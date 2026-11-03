@@ -12,6 +12,94 @@ pub use crate::config::LarkChannelConfig as LarkChannel;
 
 type HmacSha256 = Hmac<Sha256>;
 
+static LARK_OPEN_ID_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"@(?P<id>ou_[0-9a-zA-Z]+)").unwrap()
+});
+
+/// Replaces Lark Open ID mentions with Lark native `<at>` tag and converts global mentions.
+pub fn convert_lark_mentions(text: &str) -> String {
+    let with_users = LARK_OPEN_ID_RE.replace_all(text, r#"<at id="$id"></at>"#);
+    with_users
+        .replace("@all", "<at id=all></at>")
+        .replace("@everyone", "<at id=all></at>")
+}
+
+/// Normalizes standard markdown into Lark's standard message card markdown (`lark_md`):
+/// - Converts headings (`#`, `##`, `###`, `####`) to bold text (`**Heading**`), because
+///   `lark_md` does not support standard markdown headings and displays raw `#` tags otherwise.
+/// - Converts standard markdown list items (`- `, `* `) to bullets (`• `) with indentation preserved,
+///   providing consistent, clean rendering across all Lark desktop and mobile apps.
+/// - Converts blockquotes (`> `) to visual quote blocks (`▎ `).
+/// - Converts Lark Open ID mentions (`@ou_...`) to native `<at id="ou_..."></at>` tags.
+/// - Preserves code blocks, inline code, bold, italic, and hyperlinks.
+pub fn format_markdown_for_lark(input: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_code_block = false;
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            out.push(line.to_string());
+            continue;
+        }
+
+        if in_code_block {
+            out.push(line.to_string());
+            continue;
+        }
+
+        // Horizontal rules on their own line can stay as is (used for splitting sections into hr tags)
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            out.push("---".to_string());
+            continue;
+        }
+
+        // Convert markdown headings (#, ##, ###, ####, etc.) to bold text
+        if let Some(heading) = trimmed
+            .strip_prefix("#### ")
+            .or_else(|| trimmed.strip_prefix("### "))
+            .or_else(|| trimmed.strip_prefix("## "))
+            .or_else(|| trimmed.strip_prefix("# "))
+        {
+            let clean = heading.trim();
+            if !clean.is_empty() {
+                out.push(format!("**{}**", clean));
+                continue;
+            }
+        }
+
+        // Convert standard markdown list items (- item, * item) to bullet points (• item), preserving indentation
+        let leading_spaces = line.chars().take_while(|c| *c == ' ').count();
+        let after_indent = &line[leading_spaces..];
+        let bullet_line = if let Some(item) = after_indent.strip_prefix("- ") {
+            format!("{}• {}", " ".repeat(leading_spaces), item)
+        } else if let Some(item) = after_indent.strip_prefix("* ") {
+            format!("{}• {}", " ".repeat(leading_spaces), item)
+        } else {
+            line.to_string()
+        };
+
+        // Convert markdown blockquotes (> text) to visual quote blocks (▎ text)
+        let quote_line = {
+            let spaces = bullet_line.chars().take_while(|c| *c == ' ').count();
+            let after = &bullet_line[spaces..];
+            if let Some(q) = after.strip_prefix("> ") {
+                format!("{}▎ {}", " ".repeat(spaces), q)
+            } else {
+                bullet_line
+            }
+        };
+
+        // Convert Lark mentions
+        let processed = convert_lark_mentions(&quote_line);
+        out.push(processed);
+    }
+
+    out.join("\n")
+}
+
 #[derive(Clone)]
 struct LarkTokenCache {
     token: String,
@@ -242,22 +330,83 @@ impl LarkNotifier {
         color_template: &str,
         fields: &[(&str, &str)],
     ) -> serde_json::Value {
+        let mut effective_title = title.trim().to_string();
+        let mut effective_color = color_template.trim().to_string();
+        let mut raw_message = message.trim();
+
+        // If the title is generic (e.g. "🤖 Sugie Bot Response" or empty) and message starts with a markdown header:
+        // Extract the header as the card's title and remove it from the body to avoid awkward duplicates.
+        if (effective_title.is_empty() || effective_title == "🤖 Sugie Bot Response")
+            && (raw_message.starts_with('#'))
+        {
+            if let Some((first_line, rest)) = raw_message.split_once('\n') {
+                let first_trimmed = first_line.trim();
+                if let Some(h) = first_trimmed
+                    .strip_prefix("### ")
+                    .or_else(|| first_trimmed.strip_prefix("## "))
+                    .or_else(|| first_trimmed.strip_prefix("# "))
+                {
+                    effective_title = h.trim().to_string();
+                    raw_message = rest.trim();
+                }
+            }
+        }
+
+        // Adjust color template if message indicates failure / warning and color was default blue
+        if effective_color == "blue" {
+            if raw_message.starts_with("⛔") || raw_message.starts_with("❌") {
+                effective_color = "red".to_string();
+                if effective_title == "🤖 Sugie Bot Response" {
+                    effective_title = "⛔ Action Denied".to_string();
+                }
+            } else if raw_message.starts_with("⚠️") || raw_message.starts_with("❓") {
+                effective_color = "orange".to_string();
+                if effective_title == "🤖 Sugie Bot Response" {
+                    effective_title = "⚠️ Notice".to_string();
+                }
+            } else if raw_message.starts_with("✅") {
+                effective_color = "green".to_string();
+            }
+        }
+
+        let formatted = format_markdown_for_lark(raw_message);
         let mut elements = Vec::new();
 
-        // Main content
-        elements.push(json!({
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": message
+        // Split by horizontal rules `---` to insert native Lark card `hr` dividing lines
+        let sections: Vec<&str> = formatted
+            .split("\n---\n")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if sections.is_empty() {
+            elements.push(json!({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": formatted
+                }
+            }));
+        } else {
+            for (idx, sec) in sections.iter().enumerate() {
+                if idx > 0 {
+                    elements.push(json!({ "tag": "hr" }));
+                }
+                elements.push(json!({
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": sec
+                    }
+                }));
             }
-        }));
+        }
 
         // Key-value fields
         if !fields.is_empty() {
             let fields_md = fields
                 .iter()
-                .map(|(k, v)| format!("**{}**: {}", k, v))
+                .map(|(k, v)| format!("• **{}**: {}", k, v))
                 .collect::<Vec<_>>()
                 .join("\n");
             elements.push(json!({
@@ -294,9 +443,9 @@ impl LarkNotifier {
             "header": {
                 "title": {
                     "tag": "plain_text",
-                    "content": title
+                    "content": effective_title
                 },
-                "template": color_template
+                "template": effective_color
             },
             "elements": elements
         })
@@ -842,5 +991,59 @@ mod tests {
         assert_eq!(whs2[0].secret.as_deref(), Some("sec-devops"));
         assert_eq!(whs2[1].name, "alerts");
         assert_eq!(whs2[1].secret, None);
+    }
+
+    #[test]
+    fn test_lark_markdown_formatting_and_card_enhancements() {
+        let input = "### 🤖 Sugie Bot Status\n\n\
+- **Status**: 🟢 Running\n\
+- **Version**: `v0.1.0`\n  \
+- **Sub-item**: Value\n\
+> Important notice for @ou_test123 and @all\n\n\
+```toml\n\
+# This is a comment\n\
+admin_only = true\n\
+```";
+
+        let formatted = format_markdown_for_lark(input);
+
+        // Heading converted to bold
+        assert!(formatted.contains("**🤖 Sugie Bot Status**"));
+        assert!(!formatted.contains("### 🤖 Sugie Bot Status"));
+
+        // Bullets normalized to • with indentation
+        assert!(formatted.contains("• **Status**: 🟢 Running"));
+        assert!(formatted.contains("• **Version**: `v0.1.0`"));
+        assert!(formatted.contains("  • **Sub-item**: Value"));
+
+        // Blockquote converted to visual quote block
+        assert!(formatted.contains("▎ Important notice for <at id=\"ou_test123\"></at> and <at id=all></at>"));
+
+        // Code block preserves hash comment without converting to bold
+        assert!(formatted.contains("# This is a comment"));
+
+        // Test card title extraction from heading and hr dividers
+        let markdown_with_divider = "### 🤖 Bot Digest\n\nFirst part\n\n---\n\nSecond part";
+        let card = LarkNotifier::build_interactive_card(
+            "🤖 Sugie Bot Response",
+            markdown_with_divider,
+            None,
+            "blue",
+            &[],
+        );
+
+        let header = card.get("header").unwrap();
+        // Dynamic title extracted from heading
+        assert_eq!(
+            header.get("title").and_then(|t| t.get("content")).and_then(|v| v.as_str()),
+            Some("🤖 Bot Digest")
+        );
+
+        let elements = card.get("elements").and_then(|v| v.as_array()).unwrap();
+        // Two text div sections and one hr divider between them
+        assert_eq!(elements.len(), 3);
+        assert_eq!(elements[0].get("tag").and_then(|v| v.as_str()), Some("div"));
+        assert_eq!(elements[1].get("tag").and_then(|v| v.as_str()), Some("hr"));
+        assert_eq!(elements[2].get("tag").and_then(|v| v.as_str()), Some("div"));
     }
 }

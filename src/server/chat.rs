@@ -70,7 +70,9 @@ pub struct ZulipMessageDetails {
     pub content: Option<String>,
     pub sender_email: Option<String>,
     pub sender_full_name: Option<String>,
+    pub sender_id: Option<i64>,
     pub stream_id: Option<i64>,
+    pub display_recipient: Option<serde_json::Value>,
 }
 
 pub async fn zulip_chat_handler(
@@ -160,15 +162,32 @@ pub async fn zulip_chat_handler(
         username, sender_email, raw_content
     );
 
+    let mut extra_ids = Vec::new();
+    if let Some(ref m) = payload.message {
+        if let Some(uid) = m.sender_id {
+            extra_ids.push(uid.to_string());
+        }
+    }
+    if username != sender_email {
+        extra_ids.push(username.clone());
+    }
+
+    let channel = payload
+        .message
+        .as_ref()
+        .and_then(|m| m.display_recipient.as_ref())
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
+
     let inbound = InboundChatMessage {
         platform: ChatPlatform::Zulip,
         sender: InboundSender {
             id: sender_email,
             username,
             display_name: sender_name,
+            extra_ids,
         },
         raw_content,
-        stream_or_channel: None,
+        stream_or_channel: channel,
         message_id: None,
     };
 
@@ -207,6 +226,8 @@ pub struct LarkEvent {
     pub text: Option<String>,
     pub text_without_at_bot: Option<String>,
     pub open_id: Option<String>,
+    pub employee_id: Option<String>,
+    pub union_id: Option<String>,
     pub open_chat_id: Option<String>,
     pub open_message_id: Option<String>,
     pub sender: Option<LarkSender>,
@@ -223,6 +244,7 @@ pub struct LarkSender {
 pub struct LarkSenderId {
     pub open_id: Option<String>,
     pub user_id: Option<String>,
+    pub union_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -420,7 +442,7 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
             return (StatusCode::OK, Json(json!({ "code": 0, "msg": "ignored bot sender" })));
         }
 
-        let (raw_text, sender_id, chat_id, message_id) = if let Some(msg) = event.message {
+        let (raw_text, sender_id, extra_ids, chat_id, message_id) = if let Some(msg) = event.message {
             // Schema 2.0
             let text = if let Some(content_str) = msg.content {
                 if let Ok(json_obj) = serde_json::from_str::<serde_json::Value>(&content_str) {
@@ -436,20 +458,45 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
                 String::new()
             };
 
-            let open_id = event
-                .sender
-                .as_ref()
-                .and_then(|s| s.sender_id.as_ref())
-                .and_then(|id| id.open_id.clone().or_else(|| id.user_id.clone()))
-                .unwrap_or_else(|| "lark_user".to_string());
+            let mut extras = Vec::new();
+            let mut main_id = "lark_user".to_string();
 
-            (text, open_id, msg.chat_id, msg.message_id)
+            if let Some(s) = event.sender.as_ref() {
+                if let Some(sid) = s.sender_id.as_ref() {
+                    if let Some(ref oid) = sid.open_id {
+                        main_id = oid.clone();
+                    }
+                    if let Some(ref uid) = sid.user_id {
+                        if !uid.trim().is_empty() && uid != &main_id {
+                            extras.push(uid.clone());
+                        }
+                    }
+                    if let Some(ref un_id) = sid.union_id {
+                        if !un_id.trim().is_empty() && un_id != &main_id {
+                            extras.push(un_id.clone());
+                        }
+                    }
+                }
+            }
+
+            (text, main_id, extras, msg.chat_id, msg.message_id)
         } else if let Some(text) = event.text_without_at_bot.or(event.text) {
             // Schema 1.0
-            let open_id = event.open_id.unwrap_or_else(|| "lark_user".to_string());
-            (text, open_id, event.open_chat_id, event.open_message_id)
+            let mut extras = Vec::new();
+            let main_id = event.open_id.unwrap_or_else(|| "lark_user".to_string());
+            if let Some(emp_id) = event.employee_id {
+                if !emp_id.trim().is_empty() && emp_id != main_id {
+                    extras.push(emp_id);
+                }
+            }
+            if let Some(un_id) = event.union_id {
+                if !un_id.trim().is_empty() && un_id != main_id {
+                    extras.push(un_id);
+                }
+            }
+            (text, main_id, extras, event.open_chat_id, event.open_message_id)
         } else {
-            (String::new(), String::new(), None, None)
+            (String::new(), String::new(), Vec::new(), None, None)
         };
 
         // Deduplicate: If Lark delivers both Schema 1.0 and 2.0 (or retries), ignore duplicate
@@ -472,6 +519,7 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
                     id: sender_id.clone(),
                     username: sender_id.clone(),
                     display_name: None,
+                    extra_ids,
                 },
                 raw_content: raw_text,
                 stream_or_channel: chat_id,
@@ -610,29 +658,43 @@ pub async fn discord_chat_handler(
         command_text = content.to_string();
     }
 
-    let username = payload
-        .get("member")
-        .and_then(|m| m.get("user"))
-        .or_else(|| payload.get("user"))
-        .and_then(|u| u.get("username"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("discord_user")
-        .to_string();
+    let (user_id, username, display_name) = if let Some(member) = payload.get("member") {
+        let u = member.get("user");
+        let uid = u.and_then(|x| x.get("id")).and_then(|v| v.as_str()).unwrap_or("discord_user");
+        let uname = u.and_then(|x| x.get("username")).and_then(|v| v.as_str()).unwrap_or(uid);
+        let dname = member.get("nick").and_then(|v| v.as_str()).or_else(|| u.and_then(|x| x.get("global_name")).and_then(|v| v.as_str()));
+        (uid.to_string(), uname.to_string(), dname.map(|s| s.to_string()))
+    } else if let Some(u) = payload.get("user") {
+        let uid = u.get("id").and_then(|v| v.as_str()).unwrap_or("discord_user");
+        let uname = u.get("username").and_then(|v| v.as_str()).unwrap_or(uid);
+        let dname = u.get("global_name").and_then(|v| v.as_str());
+        (uid.to_string(), uname.to_string(), dname.map(|s| s.to_string()))
+    } else {
+        ("discord_user".to_string(), "discord_user".to_string(), None)
+    };
+
+    let channel_id = payload.get("channel_id").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     info!(
-        "Received Discord interaction from @{}: {:?}",
-        username, command_text
+        "Received Discord interaction from @{} (id: {}): {:?}",
+        username, user_id, command_text
     );
+
+    let mut extra_ids = Vec::new();
+    if user_id != username {
+        extra_ids.push(username.clone());
+    }
 
     let inbound = InboundChatMessage {
         platform: ChatPlatform::Discord,
         sender: InboundSender {
-            id: username.clone(),
+            id: user_id,
             username,
-            display_name: None,
+            display_name,
+            extra_ids,
         },
         raw_content: command_text,
-        stream_or_channel: None,
+        stream_or_channel: channel_id,
         message_id: None,
     };
 
@@ -776,6 +838,7 @@ pub async fn generic_chat_command_handler(
             id: sender_name.clone(),
             username: sender_name,
             display_name: None,
+            extra_ids: Vec::new(),
         },
         raw_content: payload.command,
         stream_or_channel: None,

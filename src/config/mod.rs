@@ -925,6 +925,18 @@ pub struct CommandsConfig {
     pub super_users: Vec<String>,
     #[serde(default)]
     pub restricted_commands: Vec<String>,
+    /// If true, all bot commands (including read-only queries) require super user / admin permissions
+    #[serde(default)]
+    pub admin_only: bool,
+    /// Platform-specific authorized super user IDs (e.g. open_id/user_id in Lark)
+    #[serde(default)]
+    pub lark_super_users: Vec<String>,
+    /// Platform-specific authorized super user IDs or usernames in Discord
+    #[serde(default)]
+    pub discord_super_users: Vec<String>,
+    /// Platform-specific authorized super user emails or usernames in Zulip
+    #[serde(default)]
+    pub zulip_super_users: Vec<String>,
 }
 
 impl Default for CommandsConfig {
@@ -940,6 +952,10 @@ impl Default for CommandsConfig {
             aliases,
             super_users: Vec::new(),
             restricted_commands: Vec::new(),
+            admin_only: false,
+            lark_super_users: Vec::new(),
+            discord_super_users: Vec::new(),
+            zulip_super_users: Vec::new(),
         }
     }
 }
@@ -1552,6 +1568,48 @@ impl SugieConfig {
                 .collect();
             if !list.is_empty() {
                 config.default_rules.commands.restricted_commands = list;
+            }
+        }
+
+        if let Ok(val) = std::env::var("SUGIE_COMMANDS_ADMIN_ONLY") {
+            let v = val.trim().to_lowercase();
+            if v == "1" || v == "true" || v == "yes" {
+                config.default_rules.commands.admin_only = true;
+            } else if v == "0" || v == "false" || v == "no" {
+                config.default_rules.commands.admin_only = false;
+            }
+        }
+
+        if let Ok(users) = std::env::var("SUGIE_LARK_SUPER_USERS") {
+            let list: Vec<String> = users
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('@').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !list.is_empty() {
+                config.default_rules.commands.lark_super_users = list;
+            }
+        }
+
+        if let Ok(users) = std::env::var("SUGIE_DISCORD_SUPER_USERS") {
+            let list: Vec<String> = users
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('@').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !list.is_empty() {
+                config.default_rules.commands.discord_super_users = list;
+            }
+        }
+
+        if let Ok(users) = std::env::var("SUGIE_ZULIP_SUPER_USERS") {
+            let list: Vec<String> = users
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('@').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !list.is_empty() {
+                config.default_rules.commands.zulip_super_users = list;
             }
         }
 

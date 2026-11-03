@@ -1237,7 +1237,11 @@ fn render_config_response(
             .clone()
             .unwrap_or_default()
             .join("\n"),
+        admin_only: cfg.default_rules.commands.admin_only,
         super_users: cfg.default_rules.commands.super_users.join("\n"),
+        lark_super_users: cfg.default_rules.commands.lark_super_users.join("\n"),
+        discord_super_users: cfg.default_rules.commands.discord_super_users.join("\n"),
+        zulip_super_users: cfg.default_rules.commands.zulip_super_users.join("\n"),
         restricted_commands: cfg.default_rules.commands.restricted_commands.join("\n"),
         stale_enabled: cfg.default_rules.stale.enabled,
         stale_days: cfg.default_rules.stale.warn_days.to_string(),
@@ -3082,8 +3086,24 @@ async fn save_structured(
         ("port".into(), config_store::Patch::Int(port)),
         ("db_path".into(), config_store::Patch::Str(get("db_path"))),
         (
+            "default_rules.commands.admin_only".into(),
+            config_store::Patch::Bool(form.contains_key("admin_only")),
+        ),
+        (
             "default_rules.commands.super_users".into(),
             config_store::Patch::List(lines("super_users")),
+        ),
+        (
+            "default_rules.commands.lark_super_users".into(),
+            config_store::Patch::List(lines("lark_super_users")),
+        ),
+        (
+            "default_rules.commands.discord_super_users".into(),
+            config_store::Patch::List(lines("discord_super_users")),
+        ),
+        (
+            "default_rules.commands.zulip_super_users".into(),
+            config_store::Patch::List(lines("zulip_super_users")),
         ),
         (
             "default_rules.commands.restricted_commands".into(),

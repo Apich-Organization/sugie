@@ -48,7 +48,11 @@ pub struct ConfigForm {
     pub port: String,
     pub db_path: String,
     pub allowed_repositories: String,
+    pub admin_only: bool,
     pub super_users: String,
+    pub lark_super_users: String,
+    pub discord_super_users: String,
+    pub zulip_super_users: String,
     pub restricted_commands: String,
     pub stale_enabled: bool,
     pub stale_days: String,
@@ -1266,13 +1270,29 @@ pub fn config_page(
                         </div>
                         <div class="card">
                             <div class="card-head"><h2>"Access Control"</h2></div>
+                            <label class="pill-check" style="margin-bottom:12px">
+                                <input type="checkbox" name="admin_only" value="1" checked=form.admin_only/>
+                                <span>"Admin Only Mode (only super users can execute bot commands)"</span>
+                            </label>
                             <label class="field">
-                                <span>"Super Users (one per line)"</span>
-                                <textarea name="super_users" rows="4">{form.super_users.clone()}</textarea>
+                                <span>"Lark Super Users (Open ID ou_... or Employee ID, one per line)"</span>
+                                <textarea name="lark_super_users" rows="3">{form.lark_super_users.clone()}</textarea>
+                            </label>
+                            <label class="field">
+                                <span>"Discord Super Users (User Snowflake ID or username, one per line)"</span>
+                                <textarea name="discord_super_users" rows="3">{form.discord_super_users.clone()}</textarea>
+                            </label>
+                            <label class="field">
+                                <span>"Zulip Super Users (User email or ID, one per line)"</span>
+                                <textarea name="zulip_super_users" rows="3">{form.zulip_super_users.clone()}</textarea>
+                            </label>
+                            <label class="field">
+                                <span>"General / GitHub Super Users (one per line)"</span>
+                                <textarea name="super_users" rows="3">{form.super_users.clone()}</textarea>
                             </label>
                             <label class="field">
                                 <span>"Restricted Commands (one per line)"</span>
-                                <textarea name="restricted_commands" rows="8">{form.restricted_commands.clone()}</textarea>
+                                <textarea name="restricted_commands" rows="4">{form.restricted_commands.clone()}</textarea>
                             </label>
                         </div>
                     </div>
