@@ -79,19 +79,66 @@ pub struct NotificationsConfig {
     pub events: NotificationEventsConfig,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscordWebhookChannel {
+    pub name: String,
+    #[serde(alias = "webhook_url")]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscordBotChannel {
+    pub name: String,
+    #[serde(alias = "id")]
+    pub channel_id: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiscordConfig {
+    /// Channel webhook. Kept for existing installs; superseded by `bot_token`.
     #[serde(default)]
     pub webhook_url: String,
     pub reports_webhook_url: Option<String>,
+    /// Bot token, normally supplied as `SUGIE_DISCORD_BOT_TOKEN` in `.env`.
+    ///
+    /// One token covers every channel the bot has been invited to, so there is
+    /// no need for a separate webhook URL per channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_token: Option<String>,
+    /// Channel id for ordinary notifications when posting as a bot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// Channel id for scheduled reports; falls back to `channel_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reports_channel_id: Option<String>,
+    /// Display name, webhook mode only — a bot always posts under its own name.
     #[serde(default = "default_discord_username")]
     pub username: String,
     pub avatar_url: Option<String>,
     pub allowed_repositories: Option<Vec<String>>,
+    /// Multiple named webhook channels.
+    #[serde(default, alias = "webhook_channels")]
+    pub webhooks: Vec<DiscordWebhookChannel>,
+    /// Multiple named bot channels.
+    #[serde(default, alias = "channels")]
+    pub bot_channels: Vec<DiscordBotChannel>,
 }
 
 fn default_discord_username() -> String {
     "sugie-bot".to_string()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZulipChannelConfig {
+    pub name: String,
+    #[serde(alias = "stream")]
+    pub channel: String,
+    #[serde(default = "default_zulip_channel_topic")]
+    pub topic: String,
+}
+
+fn default_zulip_channel_topic() -> String {
+    "announcements".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -102,7 +149,7 @@ pub struct ZulipConfig {
     pub bot_email: String,
     #[serde(default)]
     pub bot_api_key: String,
-    #[serde(default = "default_zulip_stream")]
+    #[serde(default = "default_zulip_stream", alias = "channel")]
     pub stream: String,
     #[serde(default = "default_zulip_topic_triage")]
     pub topic_triage: String,
@@ -113,6 +160,9 @@ pub struct ZulipConfig {
     #[serde(default = "default_zulip_topic_assigns")]
     pub topic_assigns: String,
     pub allowed_repositories: Option<Vec<String>>,
+    /// Multiple named channel + topic destinations.
+    #[serde(default)]
+    pub channels: Vec<ZulipChannelConfig>,
 }
 
 fn default_zulip_stream() -> String {
@@ -135,12 +185,39 @@ fn default_zulip_topic_assigns() -> String {
     "assignments".to_string()
 }
 
+fn default_lark_api_base() -> String {
+    "https://open.larksuite.com".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LarkChannelConfig {
+    pub name: String,
+    pub chat_id: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LarkConfig {
+    /// Custom Robot incoming webhook URL (single group chat)
     #[serde(default)]
     pub webhook_url: String,
+    /// Webhook signature verification secret
     pub secret: Option<String>,
+    /// Lark App ID (e.g. cli_a1b2c3d4e5...), normally from SUGIE_LARK_APP_ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    /// Lark App Secret, normally from SUGIE_LARK_APP_SECRET
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_secret: Option<String>,
+    /// Default group chat ID (e.g. oc_xxx) to send notifications to when no channel is specified
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_chat_id: Option<String>,
+    /// Base URL for Lark Open API (defaults to https://open.larksuite.com, or https://open.feishu.cn for Feishu)
+    #[serde(default = "default_lark_api_base")]
+    pub api_base: String,
     pub allowed_repositories: Option<Vec<String>>,
+    /// Multiple named channel (group chat) destinations
+    #[serde(default)]
+    pub channels: Vec<LarkChannelConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -860,6 +937,15 @@ fn default_command_prefix() -> String {
     "/".to_string()
 }
 
+/// Read an environment variable, treating a blank value as unset so an empty
+/// line in `.env` cannot override a working TOML setting.
+fn env_trimmed(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 pub fn parse_repo_list(val: &str) -> Option<Vec<String>> {
     let trimmed = val.trim();
     if trimmed.is_empty() || trimmed == "*" {
@@ -918,6 +1004,119 @@ pub fn load_dotenv() {
                 }
             }
             break;
+        }
+    }
+}
+
+fn load_discord_env_channels(
+    webhooks: &mut Vec<DiscordWebhookChannel>,
+    bot_channels: &mut Vec<DiscordBotChannel>,
+) {
+    // 1. Scan individual SUGIE_DISCORD_WEBHOOK_<NAME> and SUGIE_DISCORD_BOT_CHANNEL_<NAME> env vars
+    for (k, v) in std::env::vars() {
+        let v = v.trim().to_string();
+        if v.is_empty() {
+            continue;
+        }
+        if let Some(rest) = k.strip_prefix("SUGIE_DISCORD_WEBHOOK_") {
+            if rest == "URL" || rest == "REPORTS_URL" {
+                continue;
+            }
+            let name = rest.to_lowercase().replace('_', "-");
+            if !webhooks.iter().any(|w| w.name == name) {
+                webhooks.push(DiscordWebhookChannel { name, url: v });
+            }
+        } else if let Some(rest) = k.strip_prefix("SUGIE_DISCORD_BOT_CHANNEL_") {
+            let name = rest.to_lowercase().replace('_', "-");
+            if !bot_channels.iter().any(|c| c.name == name) {
+                bot_channels.push(DiscordBotChannel { name, channel_id: v });
+            }
+        }
+    }
+
+    // 2. Scan comma-separated SUGIE_DISCORD_WEBHOOKS (name=url,name2=url2 or name:url)
+    if let Ok(whs) = std::env::var("SUGIE_DISCORD_WEBHOOKS") {
+        for pair in whs.split(',') {
+            let trimmed = pair.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parts = if let Some(p) = trimmed.split_once('=') {
+                Some(p)
+            } else if let Some(p) = trimmed.split_once("https://") {
+                Some((p.0.trim_end_matches(':'), p.1))
+            } else {
+                None
+            };
+            if let Some((name, rest)) = parts {
+                let name = name.trim().to_lowercase().replace('_', "-");
+                let url = if rest.starts_with("https://") || rest.starts_with("http://") {
+                    rest.trim().to_string()
+                } else {
+                    format!("https://{}", rest.trim())
+                };
+                if !name.is_empty() && !webhooks.iter().any(|w| w.name == name) {
+                    webhooks.push(DiscordWebhookChannel { name, url });
+                }
+            }
+        }
+    }
+
+    // 3. Scan comma-separated SUGIE_DISCORD_BOT_CHANNELS (name=id,name2=id2 or name:id)
+    if let Ok(chans) = std::env::var("SUGIE_DISCORD_BOT_CHANNELS") {
+        for pair in chans.split(',') {
+            let trimmed = pair.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parts = trimmed.split_once('=').or_else(|| trimmed.split_once(':'));
+            if let Some((name, id)) = parts {
+                let name = name.trim().to_lowercase().replace('_', "-");
+                let channel_id = id.trim().to_string();
+                if !name.is_empty() && !channel_id.is_empty() && !bot_channels.iter().any(|c| c.name == name) {
+                    bot_channels.push(DiscordBotChannel { name, channel_id });
+                }
+            }
+        }
+    }
+}
+
+fn load_zulip_env_channels(channels: &mut Vec<ZulipChannelConfig>) {
+    // 1. Scan individual SUGIE_ZULIP_CHANNEL_<NAME>="channel:topic" env vars
+    for (k, v) in std::env::vars() {
+        let v = v.trim().to_string();
+        if v.is_empty() {
+            continue;
+        }
+        if let Some(rest) = k.strip_prefix("SUGIE_ZULIP_CHANNEL_") {
+            let name = rest.to_lowercase().replace('_', "-");
+            let (channel, topic) = match v.split_once(':') {
+                Some((ch, tp)) => (ch.trim().to_string(), tp.trim().to_string()),
+                None => (v, default_zulip_channel_topic()),
+            };
+            if !channel.is_empty() && !channels.iter().any(|c| c.name == name) {
+                channels.push(ZulipChannelConfig { name, channel, topic });
+            }
+        }
+    }
+
+    // 2. Scan comma-separated SUGIE_ZULIP_CHANNELS ("name=channel:topic,name2=channel2:topic2")
+    if let Ok(chans) = std::env::var("SUGIE_ZULIP_CHANNELS") {
+        for pair in chans.split(',') {
+            let trimmed = pair.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some((name, rest)) = trimmed.split_once('=') {
+                let name = name.trim().to_lowercase().replace('_', "-");
+                let (channel, topic) = match rest.split_once(':') {
+                    Some((ch, tp)) => (ch.trim().to_string(), tp.trim().to_string()),
+                    None => (rest.trim().to_string(), default_zulip_channel_topic()),
+                };
+                if !name.is_empty() && !channel.is_empty() && !channels.iter().any(|c| c.name == name) {
+                    channels.push(ZulipChannelConfig { name, channel, topic });
+                }
+            }
         }
     }
 }
@@ -1014,26 +1213,47 @@ impl SugieConfig {
                     discord.avatar_url = Some(avatar);
                 }
             }
+            if let Some(token) = env_trimmed("SUGIE_DISCORD_BOT_TOKEN") {
+                discord.bot_token = Some(token);
+            }
+            if let Some(channel) = env_trimmed("SUGIE_DISCORD_CHANNEL_ID") {
+                discord.channel_id = Some(channel);
+            }
+            if let Some(channel) = env_trimmed("SUGIE_DISCORD_REPORTS_CHANNEL_ID") {
+                discord.reports_channel_id = Some(channel);
+            }
             if let Ok(repos) = std::env::var("SUGIE_DISCORD_REPOSITORIES")
                 .or_else(|_| std::env::var("SUGIE_DISCORD_REPOS"))
             {
                 discord.allowed_repositories = parse_repo_list(&repos);
             }
-        } else if let Ok(discord_url) = std::env::var("SUGIE_DISCORD_WEBHOOK_URL") {
-            if !discord_url.trim().is_empty() {
-                let reports_url = std::env::var("SUGIE_DISCORD_REPORTS_WEBHOOK_URL").ok();
-                let username = std::env::var("SUGIE_DISCORD_USERNAME")
-                    .unwrap_or_else(|_| default_discord_username());
+            load_discord_env_channels(&mut discord.webhooks, &mut discord.bot_channels);
+        } else {
+            // No [notifications.discord] section: build one from the environment
+            // when either a webhook or a bot token is configured.
+            let webhook_url = env_trimmed("SUGIE_DISCORD_WEBHOOK_URL").unwrap_or_default();
+            let bot_token = env_trimmed("SUGIE_DISCORD_BOT_TOKEN");
+            let mut webhooks = Vec::new();
+            let mut bot_channels = Vec::new();
+            load_discord_env_channels(&mut webhooks, &mut bot_channels);
+
+            if !webhook_url.is_empty() || bot_token.is_some() || !webhooks.is_empty() || !bot_channels.is_empty() {
                 let allowed_repositories = std::env::var("SUGIE_DISCORD_REPOSITORIES")
                     .or_else(|_| std::env::var("SUGIE_DISCORD_REPOS"))
                     .ok()
                     .and_then(|r| parse_repo_list(&r));
                 config.notifications.discord = Some(DiscordConfig {
-                    webhook_url: discord_url,
-                    reports_webhook_url: reports_url,
-                    username,
-                    avatar_url: std::env::var("SUGIE_DISCORD_AVATAR_URL").ok(),
+                    webhook_url,
+                    reports_webhook_url: env_trimmed("SUGIE_DISCORD_REPORTS_WEBHOOK_URL"),
+                    bot_token,
+                    channel_id: env_trimmed("SUGIE_DISCORD_CHANNEL_ID"),
+                    reports_channel_id: env_trimmed("SUGIE_DISCORD_REPORTS_CHANNEL_ID"),
+                    username: std::env::var("SUGIE_DISCORD_USERNAME")
+                        .unwrap_or_else(|_| default_discord_username()),
+                    avatar_url: env_trimmed("SUGIE_DISCORD_AVATAR_URL"),
                     allowed_repositories,
+                    webhooks,
+                    bot_channels,
                 });
             }
         }
@@ -1055,7 +1275,9 @@ impl SugieConfig {
                     zulip.bot_api_key = key;
                 }
             }
-            if let Ok(stream) = std::env::var("SUGIE_ZULIP_STREAM") {
+            if let Ok(stream) = std::env::var("SUGIE_ZULIP_STREAM")
+                .or_else(|_| std::env::var("SUGIE_ZULIP_CHANNEL"))
+            {
                 if !stream.trim().is_empty() {
                     zulip.stream = stream;
                 }
@@ -1085,18 +1307,22 @@ impl SugieConfig {
             {
                 zulip.allowed_repositories = parse_repo_list(&repos);
             }
+            load_zulip_env_channels(&mut zulip.channels);
         } else if let (Ok(site), Ok(email), Ok(key)) = (
             std::env::var("SUGIE_ZULIP_SITE_URL"),
             std::env::var("SUGIE_ZULIP_BOT_EMAIL"),
             std::env::var("SUGIE_ZULIP_BOT_API_KEY"),
         ) {
             if !site.trim().is_empty() && !email.trim().is_empty() && !key.trim().is_empty() {
-                let stream =
-                    std::env::var("SUGIE_ZULIP_STREAM").unwrap_or_else(|_| default_zulip_stream());
+                let stream = std::env::var("SUGIE_ZULIP_STREAM")
+                    .or_else(|_| std::env::var("SUGIE_ZULIP_CHANNEL"))
+                    .unwrap_or_else(|_| default_zulip_stream());
                 let allowed_repositories = std::env::var("SUGIE_ZULIP_REPOSITORIES")
                     .or_else(|_| std::env::var("SUGIE_ZULIP_REPOS"))
                     .ok()
                     .and_then(|r| parse_repo_list(&r));
+                let mut channels = Vec::new();
+                load_zulip_env_channels(&mut channels);
                 config.notifications.zulip = Some(ZulipConfig {
                     site_url: site,
                     bot_email: email,
@@ -1111,6 +1337,7 @@ impl SugieConfig {
                     topic_assigns: std::env::var("SUGIE_ZULIP_TOPIC_ASSIGNS")
                         .unwrap_or_else(|_| default_zulip_topic_assigns()),
                     allowed_repositories,
+                    channels,
                 });
             }
         }
@@ -1130,26 +1357,71 @@ impl SugieConfig {
                     lark.secret = Some(secret);
                 }
             }
+            if let Ok(app_id) = std::env::var("SUGIE_LARK_APP_ID") {
+                if !app_id.trim().is_empty() {
+                    lark.app_id = Some(app_id);
+                }
+            }
+            if let Ok(app_secret) = std::env::var("SUGIE_LARK_APP_SECRET") {
+                if !app_secret.trim().is_empty() {
+                    lark.app_secret = Some(app_secret);
+                }
+            }
+            if let Ok(chat_id) = std::env::var("SUGIE_LARK_DEFAULT_CHAT_ID")
+                .or_else(|_| std::env::var("SUGIE_LARK_CHAT_ID"))
+            {
+                if !chat_id.trim().is_empty() {
+                    lark.default_chat_id = Some(chat_id);
+                }
+            }
+            if let Ok(api_base) = std::env::var("SUGIE_LARK_API_BASE") {
+                if !api_base.trim().is_empty() {
+                    lark.api_base = api_base;
+                }
+            }
             if let Ok(repos) = std::env::var("SUGIE_LARK_REPOSITORIES")
                 .or_else(|_| std::env::var("SUGIE_LARK_REPOS"))
             {
                 lark.allowed_repositories = parse_repo_list(&repos);
             }
-        } else if let Ok(lark_url) = std::env::var("SUGIE_LARK_WEBHOOK_URL") {
-            if !lark_url.trim().is_empty() {
+        } else {
+            let app_id = std::env::var("SUGIE_LARK_APP_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            let app_secret = std::env::var("SUGIE_LARK_APP_SECRET")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            let lark_url = std::env::var("SUGIE_LARK_WEBHOOK_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+
+            if app_id.is_some() || lark_url.is_some() {
                 let secret = std::env::var("SUGIE_LARK_SignatureVerification")
                     .or_else(|_| std::env::var("SUGIE_LARK_SIGNATURE_VERIFICATION"))
                     .or_else(|_| std::env::var("SUGIE_LARK_SECRET"))
                     .ok()
                     .filter(|s| !s.trim().is_empty());
+                let default_chat_id = std::env::var("SUGIE_LARK_DEFAULT_CHAT_ID")
+                    .or_else(|_| std::env::var("SUGIE_LARK_CHAT_ID"))
+                    .ok()
+                    .filter(|s| !s.trim().is_empty());
+                let api_base = std::env::var("SUGIE_LARK_API_BASE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(default_lark_api_base);
                 let allowed_repositories = std::env::var("SUGIE_LARK_REPOSITORIES")
                     .or_else(|_| std::env::var("SUGIE_LARK_REPOS"))
                     .ok()
                     .and_then(|r| parse_repo_list(&r));
                 config.notifications.lark = Some(LarkConfig {
-                    webhook_url: lark_url,
+                    webhook_url: lark_url.unwrap_or_default(),
                     secret,
+                    app_id,
+                    app_secret,
+                    default_chat_id,
+                    api_base,
                     allowed_repositories,
+                    channels: vec![],
                 });
             }
         }

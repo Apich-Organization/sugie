@@ -11,7 +11,7 @@ use axum::{
     Router,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -19,7 +19,7 @@ pub mod chat;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<SugieConfig>,
+    pub config: Arc<RwLock<SugieConfig>>,
     pub triage: TriageService,
     /// Shared secret for `POST /api/chat/command`. `None` keeps the endpoint
     /// open (the historical behaviour) and is warned about at startup.
@@ -28,6 +28,12 @@ pub struct AppState {
     /// `/admin/chats`. `None` when the admin console is not mounted: the bot
     /// still answers, it just has nowhere to keep the conversation.
     pub web_db: Option<crate::web::db::WebDb>,
+}
+
+impl AppState {
+    pub fn config(&self) -> SugieConfig {
+        self.config.read().map(|c| c.clone()).unwrap_or_default()
+    }
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -211,7 +217,12 @@ async fn github_webhook_handler(
     // A missing secret used to leave this endpoint forgeable: HMAC accepts an
     // empty key, so `sha256=HMAC(key="", body)` would verify. Refuse outright
     // and say why, instead of logging it as an ordinary signature failure.
-    if state.config.github.webhook_secret.is_empty() {
+    let webhook_secret = state
+        .config
+        .read()
+        .map(|c| c.github.webhook_secret.clone())
+        .unwrap_or_default();
+    if webhook_secret.is_empty() {
         warn!(
             "Rejected GitHub webhook: SUGIE_GITHUB_WEBHOOK_SECRET is not configured, \
              so deliveries cannot be authenticated"
@@ -223,7 +234,7 @@ async fn github_webhook_handler(
     }
 
     // Verify HMAC-SHA256 signature
-    if !verify_signature(&state.config.github.webhook_secret, signature, &body) {
+    if !verify_signature(&webhook_secret, signature, &body) {
         warn!("Webhook signature verification failed");
         return (
             StatusCode::UNAUTHORIZED,

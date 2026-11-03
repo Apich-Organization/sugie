@@ -2,19 +2,25 @@ pub mod discord;
 pub mod lark;
 pub mod zulip;
 
-pub use discord::{DiscordEmbedField, DiscordNotifier};
-pub use lark::LarkNotifier;
-pub use zulip::{ZulipNotifier, ZulipTopicCategory};
+pub use discord::{DiscordBotChannel, DiscordEmbedField, DiscordNotifier, DiscordWebhookChannel};
+pub use lark::{LarkChannel, LarkNotifier};
+pub use crate::config::LarkChannelConfig;
+pub use zulip::{ZulipChannelConfig, ZulipNotifier, ZulipTopicCategory};
 
 use crate::config::NotificationsConfig;
+use std::sync::{Arc, RwLock};
 use tracing::{error, info};
 
-#[derive(Clone)]
-pub struct NotificationDispatcher {
+struct DispatcherInner {
     discord: Option<DiscordNotifier>,
     zulip: Option<ZulipNotifier>,
     lark: Option<LarkNotifier>,
     config: NotificationsConfig,
+}
+
+#[derive(Clone)]
+pub struct NotificationDispatcher {
+    inner: Arc<RwLock<DispatcherInner>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,27 +183,57 @@ impl NotificationDispatcher {
         let discord = config
             .discord
             .as_ref()
-            .map(|c| DiscordNotifier::new(c.clone()));
+            .map(|c| DiscordNotifier::new(c.clone()))
+            // A `[notifications.discord]` block with neither a webhook nor a bot
+            // token would otherwise accept every event and fail on each one.
+            .filter(DiscordNotifier::is_configured);
         let zulip = config.zulip.as_ref().map(|c| ZulipNotifier::new(c.clone()));
         let lark = config.lark.as_ref().map(|c| LarkNotifier::new(c.clone()));
         Self {
-            discord,
-            zulip,
-            lark,
-            config: config.clone(),
+            inner: Arc::new(RwLock::new(DispatcherInner {
+                discord,
+                zulip,
+                lark,
+                config: config.clone(),
+            })),
         }
     }
 
-    pub fn discord(&self) -> Option<&DiscordNotifier> {
-        self.discord.as_ref()
+    /// Hot-reload notifiers with new configuration
+    pub fn reload(&self, config: &NotificationsConfig) {
+        let discord = config
+            .discord
+            .as_ref()
+            .map(|c| DiscordNotifier::new(c.clone()))
+            .filter(DiscordNotifier::is_configured);
+        let zulip = config.zulip.as_ref().map(|c| ZulipNotifier::new(c.clone()));
+        let lark = config.lark.as_ref().map(|c| LarkNotifier::new(c.clone()));
+        if let Ok(mut inner) = self.inner.write() {
+            inner.discord = discord;
+            inner.zulip = zulip;
+            inner.lark = lark;
+            inner.config = config.clone();
+            info!("NotificationDispatcher reloaded new destination channels and secrets");
+        }
     }
 
-    pub fn zulip(&self) -> Option<&ZulipNotifier> {
-        self.zulip.as_ref()
+    pub fn discord(&self) -> Option<DiscordNotifier> {
+        self.inner.read().ok().and_then(|i| i.discord.clone())
     }
 
-    pub fn lark(&self) -> Option<&LarkNotifier> {
-        self.lark.as_ref()
+    pub fn zulip(&self) -> Option<ZulipNotifier> {
+        self.inner.read().ok().and_then(|i| i.zulip.clone())
+    }
+
+    pub fn lark(&self) -> Option<LarkNotifier> {
+        self.inner.read().ok().and_then(|i| i.lark.clone())
+    }
+
+    pub fn config(&self) -> NotificationsConfig {
+        self.inner
+            .read()
+            .map(|i| i.config.clone())
+            .unwrap_or_default()
     }
 
     pub async fn dispatch_event(
@@ -209,16 +245,26 @@ impl NotificationDispatcher {
         level: NotificationLevel,
         fields: Vec<DiscordEmbedField>,
     ) {
-        if !event_type.is_enabled(&self.config) {
+        let (discord, zulip, lark, config) = match self.inner.read() {
+            Ok(inner) => (
+                inner.discord.clone(),
+                inner.zulip.clone(),
+                inner.lark.clone(),
+                inner.config.clone(),
+            ),
+            Err(_) => return,
+        };
+
+        if !event_type.is_enabled(&config) {
             return;
         }
 
         let event_repo = extract_repo_from_context(title, url);
 
-        if let Some(ref discord) = self.discord {
+        if let Some(ref discord) = discord {
             if is_repo_allowed(
                 discord.config().allowed_repositories.as_ref(),
-                self.config.allowed_repositories.as_ref(),
+                config.allowed_repositories.as_ref(),
                 event_repo.as_deref(),
             ) {
                 if let Err(e) = discord
@@ -244,10 +290,10 @@ impl NotificationDispatcher {
             }
         }
 
-        if let Some(ref zulip) = self.zulip {
+        if let Some(ref zulip) = zulip {
             if is_repo_allowed(
                 zulip.config().allowed_repositories.as_ref(),
-                self.config.allowed_repositories.as_ref(),
+                config.allowed_repositories.as_ref(),
                 event_repo.as_deref(),
             ) {
                 let mut zulip_text = if let Some(u) = url {
@@ -279,10 +325,10 @@ impl NotificationDispatcher {
             }
         }
 
-        if let Some(ref lark) = self.lark {
+        if let Some(ref lark) = lark {
             if is_repo_allowed(
                 lark.config().allowed_repositories.as_ref(),
-                self.config.allowed_repositories.as_ref(),
+                config.allowed_repositories.as_ref(),
                 event_repo.as_deref(),
             ) {
                 let lark_fields: Vec<(&str, &str)> = fields

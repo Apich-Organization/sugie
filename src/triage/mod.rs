@@ -18,12 +18,12 @@ use crate::notifications::{
 };
 use crate::storage::Storage;
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct TriageService {
-    config: Arc<SugieConfig>,
+    config: Arc<RwLock<SugieConfig>>,
     storage: Storage,
     notifier: NotificationDispatcher,
     auth: Arc<GitHubAuthManager>,
@@ -36,12 +36,37 @@ impl TriageService {
         notifier: NotificationDispatcher,
         auth: Arc<GitHubAuthManager>,
     ) -> Self {
+        Self::with_shared_config(Arc::new(RwLock::new((*config).clone())), storage, notifier, auth)
+    }
+
+    pub fn with_shared_config(
+        config: Arc<RwLock<SugieConfig>>,
+        storage: Storage,
+        notifier: NotificationDispatcher,
+        auth: Arc<GitHubAuthManager>,
+    ) -> Self {
         Self {
             config,
             storage,
             notifier,
             auth,
         }
+    }
+
+    pub fn config(&self) -> SugieConfig {
+        self.config.read().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    pub fn config_lock(&self) -> Arc<RwLock<SugieConfig>> {
+        self.config.clone()
+    }
+
+    pub fn reload_config(&self, new_config: SugieConfig) {
+        if let Ok(mut w) = self.config.write() {
+            *w = new_config.clone();
+        }
+        self.notifier.reload(&new_config.notifications);
+        info!("TriageService and NotificationDispatcher hot-reloaded successfully");
     }
 
     pub fn storage(&self) -> &Storage {
@@ -111,7 +136,7 @@ impl TriageService {
                 Ok(repo_cfg) => {
                     info!("Loaded custom .github/sugie.toml for {}/{}", owner, repo);
                     return self
-                        .config
+                        .config()
                         .default_rules
                         .merge_with_override(Some(repo_cfg));
                 }
@@ -130,7 +155,7 @@ impl TriageService {
                 );
             }
         }
-        self.config.default_rules.clone()
+        self.config().default_rules
     }
 
     // --- Webhook Event Handlers ---
@@ -946,5 +971,41 @@ impl TriageService {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_triage_service_hot_reload() {
+        let mut config = SugieConfig::default();
+        config.host = "127.0.0.1".into();
+        config.port = 8800;
+        config.default_rules.stale.enabled = false;
+
+        let storage = Storage::new_in_memory().unwrap();
+        let auth = Arc::new(GitHubAuthManager::new(1, "key".into()));
+        let notifier = NotificationDispatcher::new(&config.notifications);
+        let triage = TriageService::new(Arc::new(config.clone()), storage, notifier, auth);
+
+        assert!(!triage.config().default_rules.stale.enabled);
+
+        let mut updated_config = config.clone();
+        updated_config.default_rules.stale.enabled = true;
+        updated_config.notifications.discord = Some(crate::config::DiscordConfig {
+            webhook_url: "https://discord.com/api/webhooks/test/123".into(),
+            bot_token: Some("bot-token-xyz".into()),
+            channel_id: Some("11223344".into()),
+            ..Default::default()
+        });
+
+        triage.reload_config(updated_config);
+
+        // Verify config updated in lock
+        assert!(triage.config().default_rules.stale.enabled);
+        // Verify notifier reloaded
+        assert!(triage.notifier().discord().is_some());
     }
 }

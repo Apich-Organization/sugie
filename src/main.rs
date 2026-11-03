@@ -10,7 +10,7 @@ use sugie::triage::TriageService;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::FmtSubscriber;
@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Serve { host, port } => {
             info!("Starting Sugie Triage Bot...");
             let config = SugieConfig::load_from_env_or_file(&cli.config)?;
+            let config_lock = Arc::new(RwLock::new(config.clone()));
             sugie::security_log::init(&config.db_path);
             let private_key = config.github.get_private_key()?;
 
@@ -92,8 +93,8 @@ async fn main() -> anyhow::Result<()> {
             let storage = Storage::new(&config.db_path)?;
             let notifier = NotificationDispatcher::new(&config.notifications);
 
-            let triage = TriageService::new(
-                Arc::new(config.clone()),
+            let triage = TriageService::with_shared_config(
+                config_lock.clone(),
                 storage.clone(),
                 notifier.clone(),
                 auth.clone(),
@@ -160,11 +161,10 @@ async fn main() -> anyhow::Result<()> {
             let listen_port = port.unwrap_or(config.port);
             let addr: SocketAddr = format!("{}:{}", listen_host, listen_port).parse()?;
 
-            let config = Arc::new(config);
             let shutdown = Arc::new(tokio::sync::Notify::new());
 
             let web_state = sugie::web::WebState::new(
-                config.clone(),
+                config_lock.clone(),
                 triage.clone(),
                 sugie::web::config_store::ConfigFiles::new(cli.config.clone(), ".env"),
                 shutdown.clone(),
@@ -251,13 +251,54 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let state = AppState {
-                config: config.clone(),
-                triage,
+                config: config_lock.clone(),
+                triage: triage.clone(),
                 chat_api_token,
                 // Same handle the console uses, so a chat reply is recorded even
                 // when the request is served by a different task.
                 web_db: Some(web_state.db.clone()),
             };
+
+            // Background watcher for external sugie.toml modifications (e.g. vim / nano / git pull)
+            let watcher_path = cli.config.clone();
+            let watcher_triage = triage.clone();
+            let watcher_config_lock = config_lock.clone();
+            tokio::spawn(async move {
+                let mut last_modified = std::fs::metadata(&watcher_path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                let mut interval = tokio::time::interval(Duration::from_secs(3));
+                loop {
+                    interval.tick().await;
+                    if let Ok(m) = std::fs::metadata(&watcher_path) {
+                        if let Ok(mod_time) = m.modified() {
+                            if last_modified.is_some() && Some(mod_time) != last_modified {
+                                info!(
+                                    "Detected disk change in {}; hot-reloading...",
+                                    watcher_path.display()
+                                );
+                                match SugieConfig::load_from_env_or_file(&watcher_path) {
+                                    Ok(new_cfg) => {
+                                        if let Ok(mut w) = watcher_config_lock.write() {
+                                            *w = new_cfg.clone();
+                                        }
+                                        watcher_triage.reload_config(new_cfg);
+                                        info!("Configuration hot-reloaded from disk successfully");
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to hot-reload {}: {}",
+                                            watcher_path.display(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            last_modified = Some(mod_time);
+                        }
+                    }
+                }
+            });
 
             let app = sugie::server::create_router_with_web(state, Some(web_state));
             let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -594,23 +635,30 @@ async fn main() -> anyhow::Result<()> {
             if target == "all" || target == "lark" {
                 if let Some(ref lark_cfg) = config.notifications.lark {
                     any_tested = true;
-                    println!(
-                        "📡 Testing Lark bot webhook (signing: {})...",
-                        if lark_cfg.secret.is_some() {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        }
-                    );
+                    if lark_cfg.app_id.is_some() && lark_cfg.app_secret.is_some() {
+                        println!(
+                            "📡 Testing Lark Bot API (App ID: {})...",
+                            lark_cfg.app_id.as_deref().unwrap_or("")
+                        );
+                    } else {
+                        println!(
+                            "📡 Testing Lark bot webhook (signing: {})...",
+                            if lark_cfg.secret.is_some() {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        );
+                    }
                     let notifier = sugie::notifications::LarkNotifier::new(lark_cfg.clone());
                     let fields = [
-                        ("Channel", "Lark Custom Bot"),
+                        ("Channel", "Lark Notification"),
                         ("Bot Version", env!("CARGO_PKG_VERSION")),
                     ];
                     match notifier
                         .send_notification(
                             "🦀 Sugie Bot: Notification Test",
-                            "This is a test notification from Sugie Triage Bot verifying Lark webhook connectivity and signature verification.",
+                            "This is a test notification from Sugie Triage Bot verifying Lark connectivity.",
                             Some("https://github.com/cn-starlabs"),
                             "green",
                             &fields,
@@ -621,7 +669,7 @@ async fn main() -> anyhow::Result<()> {
                         Err(e) => println!("   ❌ Lark notification failed: {:?}", e),
                     }
                 } else if target == "lark" {
-                    println!("   ⚠️ Lark is not configured (missing SUGIE_LARK_WEBHOOK_URL).");
+                    println!("   ⚠️ Lark is not configured (missing SUGIE_LARK_APP_ID/SUGIE_LARK_APP_SECRET or SUGIE_LARK_WEBHOOK_URL).");
                 }
             }
 

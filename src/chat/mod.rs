@@ -167,6 +167,7 @@ pub enum ChatCommand {
         repo: Option<String>,
     },
     Config,
+    ChatId,
     Stale {
         repo: Option<String>,
     },
@@ -228,6 +229,7 @@ impl ChatCommandParser {
                 ChatCommand::Metrics { repo }
             }
             "config" => ChatCommand::Config,
+            "chatid" | "channel" | "channelid" | "where" | "id" => ChatCommand::ChatId,
             "stats" => {
                 let repo = parts.get(1).map(|r| Self::resolve_repo(r, known_repos));
                 ChatCommand::Stats { repo }
@@ -474,7 +476,8 @@ impl<'a> ChatCommandExecutor<'a> {
 
         match cmd {
             ChatCommand::Help => self.render_help(),
-            ChatCommand::Status => self.render_status().await,
+            ChatCommand::Status => self.render_status(Some(message)).await,
+            ChatCommand::ChatId => self.render_chat_id(message),
             ChatCommand::Repos => self.render_repos(),
             ChatCommand::Workload { repo } => self.render_workload(repo.as_deref()),
             ChatCommand::Users { repo } => self.render_users(repo.as_deref()).await,
@@ -527,53 +530,74 @@ impl<'a> ChatCommandExecutor<'a> {
     }
 
     fn render_help(&self) -> String {
-        r#"
-### 🤖 Sugie Bot Chat Commands Reference
+        r#"### 🤖 Sugie Bot Commands Reference
 
-You can send commands directly to Sugie from this chat:
+**📊 General & Status Commands**
+• `/status` — Bot health, version, and monitored repos
+• `/repos` — List onboarded repositories
+• `/workload [repo]` — Reviewer active review workloads
+• `/users [repo]` — Eligible assignees & reviewer pool
+• `/metrics [repo]` — 7-day issue & PR triage digest
+• `/stats [repo]` — Issue, PR, and commit statistics
+• `/config` — Active configuration summary
+• `/chatid` — Display current group / channel ID
+• `/issues [repo] [count] [page]` — List open issues (e.g. `/issues 10`)
+• `/prs [repo] [count] [page]` — List open PRs with reviewers
+• `/help` — Displays this command reference
 
-#### 📊 General & Status Commands
-| Command | Example | Description |
-| :--- | :--- | :--- |
-| `status` | `@bot status` | Shows bot health, version, and monitored repos |
-| `repos` | `@bot repos` | Lists all onboarded repositories |
-| `workload [repo]` | `@bot workload ensia` | Displays reviewer active review workloads |
-| `users [repo]` | `@bot users ensia` | Lists eligible GitHub assignees & reviewer pool |
-| `metrics [repo]` | `@bot metrics ensia` | Displays 7-day issue & PR triage digest |
-| `stats [repo]` | `@bot stats ensia` | Issue / PR / commit statistics |
-| `config` | `@bot config` | Shows the active configuration summary |
-| `issues [repo] [count] [page]` | `@bot issues ensia 25 2` | Lists open issues (default 10, max 25; page 2 continues) |
-| `prs [repo] [count] [page]` | `@bot prs ensia 25` | Lists open PRs with their requested reviewers (default 10, max 25) |
-| `help` | `@bot help` | Displays this help manual |
-
-#### 🛠️ Repository & Issue/PR Actions
-Format: `<repo>#<number> /command` or `/command <repo>#<number>`
-| Command | Example | Description |
-| :--- | :--- | :--- |
-| `/reviewer` | `/reviewer ensia#12 @alice @bob` | Requests reviewers (PRs only) |
-| `/reviewer` | `/reviewer ensia#12 +@alice -@bob` | Adds & removes reviewers |
-| `/reviewer set` | `/reviewer set ensia#12 @alice @bob` | **Replaces** all requested reviewers with exactly this list |
-| `/reassign` | `/reassign ensia#12 @carol` | Alias of `/reviewer set` (change reviewer) |
-| `/unreviewer` | `/unreviewer ensia#12 @bob` | Removes requested reviewer |
-| `/reviewer` | `/reviewer ensia#12` | Auto-assigns least-busy reviewers |
-| `/assign` | `/assign ensia#12 @alice` | Assigns user(s) to issue or PR |
-| `/unassign` | `/unassign ensia#12 @alice` | Removes assignment |
-| `/label` | `/label ensia#12 +bug -wip` | Adds/removes labels on GitHub |
-| `/comment` | `/comment ensia#12 Fixed in v0.2.1` | Posts a comment (super users only) |
-| `/stale` | `/stale ensia` | Runs a stale sweep on a repo (super users only) |
-| `/unlabel` | `/unlabel ensia#12 wip` | Removes label(s) |
-| `/project` | `/project ensia#12 1 Triage` | Adds to a GitHub Project v2 board |
-| `/move` | `/move ensia#12 org/other-repo` | Moves issue to another repository |
-| `/duplicate` | `/duplicate ensia#12 #5` | Closes as duplicate of #5 |
-| `/close` | `/close ensia#12 completed` | Closes issue or PR |
-| `/reopen` | `/reopen ensia#12` | Reopens issue or PR |
-| `/retest` | `/retest ensia#12` | Retests failed CI checks (PRs only) |
-"#
-        .trim()
-        .to_string()
+**🛠️ Issue & PR Actions** (`<repo>#<num> /command` or `/command <repo>#<num>`)
+• `/assign @user` / `/unassign @user` — Assign / unassign user(s)
+• `/label +bug -wip` / `/unlabel wip` — Add or remove labels
+• `/reviewer @user` / `/unreviewer @user` — Request / remove PR reviewer
+• `/reviewer set @user` — Replace all reviewers
+• `/close [reason]` / `/reopen` — Close or reopen issue/PR
+• `/project <num> <column>` — Add to GitHub Project v2 board
+• `/move <target_repo>` — Move issue to another repository
+• `/duplicate #num` — Close as duplicate
+• `/retest` — Retest failed CI checks (PRs only)
+• `/comment <text>` — Post comment (super users only)
+• `/stale` — Run stale sweep (super users only)"#
+            .to_string()
     }
 
-    async fn render_status(&self) -> String {
+    fn render_chat_id(&self, message: &InboundChatMessage) -> String {
+        let platform_name = match message.platform {
+            ChatPlatform::Lark => "Lark (Feishu)",
+            ChatPlatform::Discord => "Discord",
+            ChatPlatform::Zulip => "Zulip",
+            ChatPlatform::Api => "Generic API",
+        };
+        let channel = message
+            .stream_or_channel
+            .as_deref()
+            .unwrap_or("(direct message / unassigned)");
+
+        let toml_snippet = match message.platform {
+            ChatPlatform::Lark => format!(
+                "\n\n💡 To register this channel in `sugie.toml`:\n```toml\n[[notifications.lark.channels]]\nname = \"my-channel\"\nchat_id = \"{}\"\n```",
+                channel
+            ),
+            ChatPlatform::Discord => format!(
+                "\n\n💡 To register this channel in `sugie.toml`:\n```toml\n[[notifications.discord.bot_channels]]\nname = \"my-channel\"\nchannel_id = \"{}\"\n```",
+                channel
+            ),
+            ChatPlatform::Zulip => format!(
+                "\n\n💡 To register this channel in `sugie.toml`:\n```toml\n[[notifications.zulip.channels]]\nname = \"my-channel\"\nchannel = \"{}\"\ntopic = \"announcements\"\n```",
+                channel
+            ),
+            ChatPlatform::Api => String::new(),
+        };
+
+        format!(
+            "### 📍 Chat / Channel Information\n\n\
+            - **Platform**: {}\n\
+            - **Current Chat ID**: `{}`\
+            {}",
+            platform_name, channel, toml_snippet
+        )
+    }
+
+    async fn render_status(&self, message: Option<&InboundChatMessage>) -> String {
         let repos = self
             .triage
             .storage()
@@ -591,13 +615,23 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
             ch_list.push("Lark");
         }
 
+        let current_chat_info = if let Some(m) = message {
+            if let Some(ref ch) = m.stream_or_channel {
+                format!("- **Current Chat ID**: `{}`\n", ch)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
         format!(
             "### 🤖 Sugie Bot Status\n\n\
             - **Status**: 🟢 Running\n\
             - **Version**: `v{}`\n\
             - **Monitored Repositories**: {}\n\
             - **Notification Channels**: {}\n\
-            - **Super Users**: {}\n\
+            {} - **Super Users**: {}\n\
             - **Restricted Commands**: {}\n",
             env!("CARGO_PKG_VERSION"),
             repos.len(),
@@ -606,6 +640,7 @@ Format: `<repo>#<number> /command` or `/command <repo>#<number>`
             } else {
                 ch_list.join(", ")
             },
+            current_chat_info,
             if self.config.default_rules.commands.super_users.is_empty() {
                 "(None)".to_string()
             } else {

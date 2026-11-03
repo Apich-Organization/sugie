@@ -18,6 +18,24 @@ use tracing::{debug, error, info, warn};
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 
+static LARK_DEDUP_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn is_duplicate_lark_message(msg_id: &str) -> bool {
+    if msg_id.is_empty() {
+        return false;
+    }
+    let mut cache = LARK_DEDUP_CACHE.lock().unwrap();
+    let now = std::time::Instant::now();
+    cache.retain(|_, seen_at| now.duration_since(*seen_at).as_secs() < 120);
+    if cache.contains_key(msg_id) {
+        true
+    } else {
+        cache.insert(msg_id.to_string(), now);
+        false
+    }
+}
+
 /// Answer an inbound command and record the exchange for `/admin/chats`.
 ///
 /// Recording is best-effort and never affects the answer: the calling platform
@@ -60,6 +78,7 @@ pub async fn zulip_chat_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let config = state.config();
     let payload: ZulipWebhookRequest = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -89,10 +108,9 @@ pub async fn zulip_chat_handler(
         });
 
     // Verify token if configured
-    if let Some(ref expected_token) = state.config.chat.zulip_token {
+    if let Some(ref expected_token) = config.chat.zulip_token {
         if !expected_token.is_empty() {
-            let bot_api_key = state
-                .config
+            let bot_api_key = config
                 .notifications
                 .zulip
                 .as_ref()
@@ -154,7 +172,7 @@ pub async fn zulip_chat_handler(
         message_id: None,
     };
 
-    let executor = ChatCommandExecutor::new(&state.config, &state.triage);
+    let executor = ChatCommandExecutor::new(&config, &state.triage);
     let reply = execute_and_record(&executor, &inbound, state.web_db.as_ref()).await;
 
     // Zulip automatically renders JSON `{ "content": "..." }` in the stream or direct message
@@ -278,6 +296,7 @@ pub fn encrypt_lark_challenge(encrypt_key: &str, challenge: &str) -> anyhow::Res
 }
 
 pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+    let config = state.config();
     let raw_payload: LarkCallbackRequest = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -290,7 +309,7 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
     };
 
     let (payload, _was_encrypted) = if let Some(ref enc_str) = raw_payload.encrypt {
-        let encrypt_key = match state.config.chat.lark_encrypt_key.as_deref() {
+        let encrypt_key = match config.chat.lark_encrypt_key.as_deref() {
             Some(k) if !k.is_empty() => k,
             _ => {
                 warn!("Received encrypted Lark callback, but SUGIE_LARK_ENCRYPT_KEY is not configured in .env");
@@ -331,7 +350,7 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
     // 1. Handle URL Verification Challenge from Lark Developer Console
     if payload.r#type.as_deref() == Some("url_verification") {
         if let Some(ref challenge) = payload.challenge {
-            if let Some(ref expected_token) = state.config.chat.lark_verification_token {
+            if let Some(ref expected_token) = config.chat.lark_verification_token {
                 if !expected_token.is_empty() {
                     let matches = payload
                         .token
@@ -367,7 +386,7 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
     info!("Lark callback event received: type='{}'", event_type);
 
     // 2. Token verification for event callbacks
-    if let Some(ref expected_token) = state.config.chat.lark_verification_token {
+    if let Some(ref expected_token) = config.chat.lark_verification_token {
         if !expected_token.is_empty() {
             let token_in_payload = payload
                 .header
@@ -389,6 +408,18 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
 
     // 3. Process Message Event (Schema 2.0 `im.message.receive_v1` or Schema 1.0 `message`)
     if let Some(event) = payload.event {
+        // Ignore events sent by bots (e.g. self-replies or automated bot messages)
+        let is_bot = event
+            .sender
+            .as_ref()
+            .and_then(|s| s.sender_type.as_deref())
+            .map(|st| st.eq_ignore_ascii_case("bot"))
+            .unwrap_or(false);
+        if is_bot {
+            debug!("Ignoring Lark message event from bot sender");
+            return (StatusCode::OK, Json(json!({ "code": 0, "msg": "ignored bot sender" })));
+        }
+
         let (raw_text, sender_id, chat_id, message_id) = if let Some(msg) = event.message {
             // Schema 2.0
             let text = if let Some(content_str) = msg.content {
@@ -421,6 +452,14 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
             (String::new(), String::new(), None, None)
         };
 
+        // Deduplicate: If Lark delivers both Schema 1.0 and 2.0 (or retries), ignore duplicate
+        if let Some(ref mid) = message_id {
+            if is_duplicate_lark_message(mid) {
+                info!("Ignoring duplicate Lark message delivery for message_id={:?}", mid);
+                return (StatusCode::OK, Json(json!({ "code": 0, "msg": "duplicate ignored" })));
+            }
+        }
+
         if !raw_text.trim().is_empty() {
             info!(
                 "Received Lark chat message from @{} (chat_id: {:?}): {:?}",
@@ -439,7 +478,7 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
                 message_id,
             };
 
-            let config = state.config.clone();
+            let config_clone = config.clone();
             let triage = state.triage.clone();
             // The console database handle, cloned so the spawned task can record
             // the exchange without capturing the whole `AppState`.
@@ -447,17 +486,29 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
 
             // Spawn execution and dispatch reply back to Lark
             tokio::spawn(async move {
-                let executor = ChatCommandExecutor::new(&config, &triage);
+                let executor = ChatCommandExecutor::new(&config_clone, &triage);
                 let reply = execute_and_record(&executor, &inbound, chat_db.as_ref()).await;
                 info!("Sending Lark response: {}", reply);
 
                 if let Some(lark) = triage.notifier().lark() {
-                    match lark
-                        .send_notification("🤖 Sugie Bot Response", &reply, None, "blue", &[])
-                        .await
-                    {
-                        Ok(_) => info!("Successfully dispatched Lark response notification"),
-                        Err(e) => error!("Failed to send Lark reply via webhook: {:?}", e),
+                    let result = if lark.has_bot() {
+                        // When Bot credentials are configured:
+                        // First preference: reply directly into the message thread
+                        if let Some(ref mid) = inbound.message_id {
+                            lark.reply_to_message(mid, "🤖 Sugie Bot Response", &reply, None, "blue", &[]).await
+                        } else if let Some(ref cid) = inbound.stream_or_channel {
+                            lark.send_to_chat(cid, "🤖 Sugie Bot Response", &reply, None, "blue", &[]).await
+                        } else {
+                            lark.send_notification("🤖 Sugie Bot Response", &reply, None, "blue", &[]).await
+                        }
+                    } else {
+                        // Fallback to webhook mode
+                        lark.send_notification("🤖 Sugie Bot Response", &reply, None, "blue", &[]).await
+                    };
+
+                    match result {
+                        Ok(_) => info!("Successfully dispatched Lark response"),
+                        Err(e) => error!("Failed to dispatch Lark reply: {:?}", e),
                     }
                 } else {
                     warn!("Lark notifier is not configured; cannot deliver response");
@@ -488,8 +539,9 @@ pub async fn discord_chat_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let config = state.config();
     // 1. Verify Ed25519 signature if Discord public key is configured
-    if let Some(ref pubkey_hex) = state.config.chat.discord_public_key {
+    if let Some(ref pubkey_hex) = config.chat.discord_public_key {
         if !pubkey_hex.is_empty() {
             let sig_header = headers
                 .get("X-Signature-Ed25519")
@@ -584,8 +636,18 @@ pub async fn discord_chat_handler(
         message_id: None,
     };
 
-    let executor = ChatCommandExecutor::new(&state.config, &state.triage);
+    let executor = ChatCommandExecutor::new(&config, &state.triage);
     let reply = execute_and_record(&executor, &inbound, state.web_db.as_ref()).await;
+
+    // Discord hard-caps message content at 2000 characters. If a response exceeds that,
+    // Discord rejects the interaction response and reports "didn't respond in time".
+    let safe_content = if reply.chars().count() > 2000 {
+        let mut truncated: String = reply.chars().take(1950).collect();
+        truncated.push_str("\n... (truncated to fit Discord limit)");
+        truncated
+    } else {
+        reply
+    };
 
     // Discord Type 4: ChannelMessageWithSource
     (
@@ -593,7 +655,7 @@ pub async fn discord_chat_handler(
         Json(json!({
             "type": 4,
             "data": {
-                "content": reply
+                "content": safe_content
             }
         })),
     )
@@ -706,6 +768,7 @@ pub async fn generic_chat_command_handler(
         }
     }
 
+    let config = state.config();
     let sender_name = payload.sender.unwrap_or_else(|| "api_user".to_string());
     let inbound = InboundChatMessage {
         platform: ChatPlatform::Api,
@@ -719,7 +782,7 @@ pub async fn generic_chat_command_handler(
         message_id: None,
     };
 
-    let executor = ChatCommandExecutor::new(&state.config, &state.triage);
+    let executor = ChatCommandExecutor::new(&config, &state.triage);
     let reply = execute_and_record(&executor, &inbound, state.web_db.as_ref()).await;
 
     (

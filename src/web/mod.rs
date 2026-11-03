@@ -36,13 +36,13 @@ use serde_json::json;
 use stats::StatsCache;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use ui::pages;
 
 #[derive(Clone)]
 pub struct WebState {
-    pub config: Arc<SugieConfig>,
+    pub config: Arc<RwLock<SugieConfig>>,
     pub triage: TriageService,
     pub db: WebDb,
     pub files: ConfigFiles,
@@ -58,16 +58,20 @@ pub struct WebState {
 
 impl WebState {
     pub fn new(
-        config: Arc<SugieConfig>,
+        config: Arc<RwLock<SugieConfig>>,
         triage: TriageService,
         files: ConfigFiles,
         shutdown: Arc<tokio::sync::Notify>,
     ) -> anyhow::Result<Self> {
-        let db = WebDb::open(&config.db_path)?;
+        let (db_path, port) = {
+            let c = config.read().map_err(|e| anyhow::anyhow!("RwLock poisoned: {e}"))?;
+            (c.db_path.clone(), c.port)
+        };
+        let db = WebDb::open(&db_path)?;
         // A fresh process has an empty job registry, so any conversation turn
         // still marked `running` in the database was cut off by the last exit.
         db.console_history_mark_interrupted();
-        crate::security_log::init(&config.db_path);
+        crate::security_log::init(&db_path);
         if auth::bootstrap_admin(&db)?.is_some() {
             tracing::warn!(
                 "Admin console bootstrapped an `admin` account with a generated password. \
@@ -75,7 +79,7 @@ impl WebState {
                  the first successful login. Set SUGIE_ADMIN_PASSWORD to choose your own."
             );
         }
-        let passkey = passkey::PasskeyManager::from_env(config.port);
+        let passkey = passkey::PasskeyManager::from_env(port);
         Ok(Self {
             config,
             triage,
@@ -88,6 +92,18 @@ impl WebState {
             shutdown,
             started_at: Utc::now(),
         })
+    }
+
+    pub fn config(&self) -> SugieConfig {
+        self.config.read().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    pub fn reload_config(&self, new_config: SugieConfig) {
+        if let Ok(mut w) = self.config.write() {
+            *w = new_config.clone();
+        }
+        self.triage.reload_config(new_config);
+        tracing::info!("WebState and TriageService configuration hot-reloaded successfully");
     }
 }
 
@@ -109,6 +125,7 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/audit", get(audit_page))
         .route("/admin/notify", get(notify_page))
         .route("/admin/notify/send", post(notify_send))
+        .route("/admin/api/discord/sync-commands", post(sync_discord_commands))
         .route("/admin/audit/settings", post(save_audit_settings))
         .route("/admin/audit/purge", post(purge_audit_logs))
         .route("/admin/audit/export", get(export_audit_csv))
@@ -784,7 +801,7 @@ async fn dashboard(
             .count(),
     };
 
-    let summary = ConfigSummary::from_config(&state.config);
+    let summary = ConfigSummary::from_config(&state.config());
     // Nudge rather than redirect: a fresh install defaults to 2FA off so the
     // first owner can actually use the console, but it must be visible that the
     // installation is unprotected.
@@ -1166,27 +1183,25 @@ async fn chat_retention_save(
     }
 }
 
-async fn config_page(
-    State(state): State<WebState>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
+fn render_config_response(
+    state: &WebState,
+    user: CurrentUser,
+    active_tab: String,
+    override_toml: Option<String>,
+    flash: Option<(bool, String)>,
 ) -> Response {
-    let flash = flash_from(&query);
-    let user = match gate_admin(&state, &headers) {
-        Ok(u) => u,
-        Err(r) => return r,
-    };
-
-    let toml_text = state
-        .files
-        .read_toml()
-        .unwrap_or_else(|e| format!("# Failed to read: {e}\n"));
+    let toml_text = override_toml.unwrap_or_else(|| {
+        state
+            .files
+            .read_toml()
+            .unwrap_or_else(|e| format!("# Failed to read: {e}\n"))
+    });
 
     // The form reflects what is on disk, falling back to the running config.
     let cfg = state
         .files
         .validate_toml(&toml_text)
-        .unwrap_or_else(|_| (*state.config).clone());
+        .unwrap_or_else(|_| state.config());
 
     let mut events = Vec::new();
     let ev = &cfg.notifications.events;
@@ -1235,12 +1250,30 @@ async fn config_page(
 
     html(pages::config_page(
         user,
+        active_tab,
         form,
         toml_text,
         state.files.read_env_entries(),
         state.files.list_backups(),
         flash,
     ))
+}
+
+async fn config_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let flash = flash_from(&query);
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let active_tab = query
+        .get("tab")
+        .cloned()
+        .unwrap_or_else(|| "basic".to_string());
+    render_config_response(&state, user, active_tab, None, flash)
 }
 
 async fn users_page(
@@ -1961,7 +1994,7 @@ async fn audit_page(
         .msg
         .map(|m| (query.ok.as_deref().unwrap_or("1") == "1", m));
     let log_settings = state.db.get_security_log_settings();
-    let log_file_path = crate::security_log::resolve_log_file_path(&state.config.db_path)
+    let log_file_path = crate::security_log::resolve_log_file_path(&state.config().db_path)
         .display()
         .to_string();
 
@@ -2135,11 +2168,35 @@ async fn notify_page(
         Err(r) => return r,
     };
     let n = state.triage.notifier();
+    let discord_opt = match n.discord() {
+        Some(d) => pages::DiscordNotifyOptions {
+            webhook_ok: d.has_webhook(),
+            webhooks: d.webhook_channels(),
+            bot_ok: d.has_bot(),
+            bot_channels: d.bot_channels(),
+        },
+        None => pages::DiscordNotifyOptions::default(),
+    };
+    let lark_opt = match n.lark() {
+        Some(l) => pages::LarkNotifyOptions {
+            webhook_ok: l.has_webhook(),
+            bot_ok: l.has_bot(),
+            bot_channels: l.bot_channels(),
+        },
+        None => pages::LarkNotifyOptions::default(),
+    };
+    let zulip_opt = match n.zulip() {
+        Some(z) => pages::ZulipNotifyOptions {
+            ok: true,
+            channels: z.channels(),
+        },
+        None => pages::ZulipNotifyOptions::default(),
+    };
     html(pages::notify_page(
         user,
-        n.discord().is_some(),
-        n.lark().is_some(),
-        n.zulip().is_some(),
+        discord_opt,
+        lark_opt,
+        zulip_opt,
         flash,
     ))
 }
@@ -2153,7 +2210,7 @@ async fn notify_send(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    use crate::notifications::{DiscordEmbedField, NotificationLevel, ZulipTopicCategory};
+    use crate::notifications::{DiscordEmbedField, NotificationLevel};
     let user = match gate_admin(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
@@ -2184,15 +2241,19 @@ async fn notify_send(
         "error" => NotificationLevel::Error,
         _ => NotificationLevel::Info,
     };
-    let want_lark = form.contains_key("ch_lark");
-    let want_discord = form.contains_key("ch_discord");
+    let want_lark_webhook = form.contains_key("ch_lark_webhook")
+        || (form.contains_key("ch_lark") && !form.contains_key("ch_lark_bot"));
+    let want_lark_bot = form.contains_key("ch_lark_bot");
     let want_zulip = form.contains_key("ch_zulip");
-    if !(want_lark || want_discord || want_zulip) {
+    let want_discord_webhook =
+        form.contains_key("ch_discord_webhook") || form.contains_key("ch_discord");
+    let want_discord_bot = form.contains_key("ch_discord_bot");
+    if !(want_lark_webhook || want_lark_bot || want_zulip || want_discord_webhook || want_discord_bot) {
         return notify_flash(false, "Select at least one channel");
     }
 
     let notifier = state.triage.notifier();
-    let mut sent: Vec<&str> = Vec::new();
+    let mut sent: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let fields: Vec<DiscordEmbedField> = vec![DiscordEmbedField {
         name: "Sent by".into(),
@@ -2200,41 +2261,184 @@ async fn notify_send(
         inline: true,
     }];
 
-    if want_lark {
+    if want_lark_webhook {
         match notifier.lark() {
-            Some(l) => match l
-                .send_notification(
-                    &title,
-                    &message,
-                    url.as_deref(),
-                    level.lark_template(),
-                    &[("Sent by", user.username.as_str())],
-                )
-                .await
-            {
-                Ok(_) => sent.push("Lark"),
-                Err(e) => failed.push(format!("Lark: {e}")),
-            },
-            None => failed.push("Lark: not configured".into()),
+            Some(l) => {
+                if !l.has_webhook() {
+                    failed.push("Lark Webhook: not configured".to_string());
+                } else {
+                    match l
+                        .send_webhook_notification(
+                            &title,
+                            &message,
+                            url.as_deref(),
+                            level.lark_template(),
+                            &[("Sent by", user.username.as_str())],
+                        )
+                        .await
+                    {
+                        Ok(_) => sent.push("Lark (Webhook)".to_string()),
+                        Err(e) => failed.push(format!("Lark (Webhook): {e}")),
+                    }
+                }
+            }
+            None => failed.push("Lark Webhook: not configured".into()),
         }
     }
-    if want_discord {
+    if want_lark_bot {
+        match notifier.lark() {
+            Some(l) => {
+                if !l.has_bot() {
+                    failed.push("Lark Bot: not configured (missing App ID or App Secret)".to_string());
+                } else {
+                    let all_channels = l.bot_channels();
+                    let target_channels: Vec<_> = all_channels
+                        .iter()
+                        .filter(|c| {
+                            let safe = c.name.replace(' ', "_");
+                            form.contains_key(&format!("ch_lark_bot_{safe}"))
+                                || form.contains_key(&format!("ch_lark_bot_{}", c.name))
+                                || form.contains_key(&format!("ch_lark_bot_{}", c.chat_id))
+                        })
+                        .cloned()
+                        .collect();
+
+                    let channels_to_send = if !target_channels.is_empty() {
+                        target_channels
+                    } else if all_channels.len() == 1 {
+                        all_channels.clone()
+                    } else {
+                        Vec::new()
+                    };
+
+                    if channels_to_send.is_empty() {
+                        if all_channels.is_empty() {
+                            failed.push("Lark Bot: no chats configured (set SUGIE_LARK_DEFAULT_CHAT_ID or add channels in sugie.toml)".to_string());
+                        } else {
+                            failed.push("Lark Bot: no chat was selected".to_string());
+                        }
+                    } else {
+                        for ch in channels_to_send {
+                            match l
+                                .send_to_chat(
+                                    &ch.chat_id,
+                                    &title,
+                                    &message,
+                                    url.as_deref(),
+                                    level.lark_template(),
+                                    &[("Sent by", user.username.as_str())],
+                                )
+                                .await
+                            {
+                                Ok(_) => sent.push(format!("Lark Bot ({})", ch.name)),
+                                Err(e) => failed.push(format!("Lark Bot ({}): {e}", ch.name)),
+                            }
+                        }
+                    }
+                }
+            }
+            None => failed.push("Lark Bot: not configured".into()),
+        }
+    }
+    if want_discord_webhook {
         match notifier.discord() {
-            Some(d) => match d
-                .send_embed(
-                    &title,
-                    &message,
-                    url.as_deref(),
-                    level.discord_color(),
-                    fields.clone(),
-                    false,
-                )
-                .await
-            {
-                Ok(_) => sent.push("Discord"),
-                Err(e) => failed.push(format!("Discord: {e}")),
-            },
-            None => failed.push("Discord: not configured".into()),
+            Some(d) => {
+                let all_webhooks = d.webhook_channels();
+                let target_webhooks: Vec<_> = all_webhooks
+                    .iter()
+                    .filter(|w| {
+                        let safe = w.name.replace(' ', "_");
+                        form.contains_key(&format!("ch_discord_wh_{safe}"))
+                            || form.contains_key(&format!("ch_discord_wh_{}", w.name))
+                    })
+                    .cloned()
+                    .collect();
+
+                let webhooks_to_send = if !target_webhooks.is_empty() {
+                    target_webhooks
+                } else if all_webhooks.len() == 1 {
+                    all_webhooks.clone()
+                } else {
+                    Vec::new()
+                };
+
+                if webhooks_to_send.is_empty() {
+                    if all_webhooks.is_empty() {
+                        failed.push("Discord Webhook: no webhook channels configured".to_string());
+                    } else {
+                        failed.push("Discord Webhook: no channel was selected".to_string());
+                    }
+                } else {
+                    for wh in webhooks_to_send {
+                        match d
+                            .send_to_webhook(
+                                &wh.url,
+                                &title,
+                                &message,
+                                url.as_deref(),
+                                level.discord_color(),
+                                fields.clone(),
+                            )
+                            .await
+                        {
+                            Ok(_) => sent.push(format!("Discord Webhook ({})", wh.name)),
+                            Err(e) => failed.push(format!("Discord Webhook ({}): {e}", wh.name)),
+                        }
+                    }
+                }
+            }
+            None => failed.push("Discord Webhook: not configured".into()),
+        }
+    }
+    if want_discord_bot {
+        match notifier.discord() {
+            Some(d) => {
+                let all_bot_channels = d.bot_channels();
+                let target_bot_channels: Vec<_> = all_bot_channels
+                    .iter()
+                    .filter(|bc| {
+                        let safe = bc.name.replace(' ', "_");
+                        form.contains_key(&format!("ch_discord_bot_{safe}"))
+                            || form.contains_key(&format!("ch_discord_bot_{}", bc.name))
+                            || form.contains_key(&format!("ch_discord_bot_{}", bc.channel_id))
+                    })
+                    .cloned()
+                    .collect();
+
+                let channels_to_send = if !target_bot_channels.is_empty() {
+                    target_bot_channels
+                } else if all_bot_channels.len() == 1 {
+                    all_bot_channels.clone()
+                } else {
+                    Vec::new()
+                };
+
+                if channels_to_send.is_empty() {
+                    if all_bot_channels.is_empty() {
+                        failed.push("Discord Bot: no bot channels configured".to_string());
+                    } else {
+                        failed.push("Discord Bot: no channel was selected".to_string());
+                    }
+                } else {
+                    for bc in channels_to_send {
+                        match d
+                            .send_to_channel(
+                                &bc.channel_id,
+                                &title,
+                                &message,
+                                url.as_deref(),
+                                level.discord_color(),
+                                fields.clone(),
+                            )
+                            .await
+                        {
+                            Ok(_) => sent.push(format!("Discord Bot ({})", bc.name)),
+                            Err(e) => failed.push(format!("Discord Bot ({}): {e}", bc.name)),
+                        }
+                    }
+                }
+            }
+            None => failed.push("Discord Bot: not configured".into()),
         }
     }
     if want_zulip {
@@ -2245,12 +2449,39 @@ async fn notify_send(
                     None => format!("### {title}\n\n{message}"),
                 };
                 text.push_str(&format!("\n\n* **Sent by**: {}\n", user.username));
-                match z
-                    .send_message(ZulipTopicCategory::Custom("announcements"), &text)
-                    .await
-                {
-                    Ok(_) => sent.push("Zulip"),
-                    Err(e) => failed.push(format!("Zulip: {e}")),
+
+                let all_channels = z.channels();
+                let target_channels: Vec<_> = all_channels
+                    .iter()
+                    .filter(|zc| {
+                        let safe = zc.name.replace(' ', "_");
+                        form.contains_key(&format!("ch_zulip_ch_{safe}"))
+                            || form.contains_key(&format!("ch_zulip_ch_{}", zc.name))
+                    })
+                    .cloned()
+                    .collect();
+
+                let channels_to_send = if !target_channels.is_empty() {
+                    target_channels
+                } else if all_channels.len() == 1 {
+                    all_channels.clone()
+                } else {
+                    Vec::new()
+                };
+
+                if channels_to_send.is_empty() {
+                    if all_channels.is_empty() {
+                        failed.push("Zulip: no channels configured".to_string());
+                    } else {
+                        failed.push("Zulip: no channel was selected".to_string());
+                    }
+                } else {
+                    for zc in channels_to_send {
+                        match z.send_to_channel(&zc.channel, &zc.topic, &text).await {
+                            Ok(_) => sent.push(format!("Zulip ({} -> #{} > {})", zc.name, zc.channel, zc.topic)),
+                            Err(e) => failed.push(format!("Zulip ({} -> #{}:{}): {e}", zc.name, zc.channel, zc.topic)),
+                        }
+                    }
                 }
             }
             None => failed.push("Zulip: not configured".into()),
@@ -2274,6 +2505,44 @@ async fn notify_send(
         msg.push_str(&format!("Failed: {}", failed.join("; ")));
     }
     notify_flash(ok, msg.trim())
+}
+
+async fn sync_discord_commands(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let notifier = state.triage.notifier();
+    match notifier.discord() {
+        Some(d) => match d.sync_commands().await {
+            Ok(msg) => {
+                state.db.audit(
+                    &user.username,
+                    "discord.sync_commands",
+                    "discord",
+                    &msg,
+                    &auth::client_ip(&headers),
+                    true,
+                );
+                notify_flash(true, &format!("✅ Discord commands synced: {msg}"))
+            }
+            Err(e) => {
+                state.db.audit(
+                    &user.username,
+                    "discord.sync_commands",
+                    "discord",
+                    &format!("error: {e}"),
+                    &auth::client_ip(&headers),
+                    false,
+                );
+                notify_flash(false, &format!("❌ Failed to sync Discord commands: {e}"))
+            }
+        },
+        None => notify_flash(false, "Discord is not configured"),
+    }
 }
 
 async fn purge_audit_logs(
@@ -2867,18 +3136,22 @@ async fn save_structured(
     match config_store::patch_toml(&text, &patches) {
         Ok(patched) => match state.files.save_toml(&patched) {
             Ok(backup) => {
+                if let Ok(new_cfg) = state.files.validate_toml(&patched) {
+                    state.reload_config(new_cfg);
+                }
                 state.db.audit(
                     &user.username,
                     "config.save",
                     "sugie.toml",
-                    "Saved structured settings",
+                    "Saved structured settings (hot-reloaded)",
                     &auth::client_ip(&headers),
                     true,
                 );
-                config_flash(
+                config_tab_flash(
+                    "basic",
                     true,
                     &format!(
-                        "Saved sugie.toml{}",
+                        "Saved sugie.toml — configuration hot-reloaded!{}",
                         if backup.as_os_str().is_empty() {
                             String::new()
                         } else {
@@ -2896,10 +3169,10 @@ async fn save_structured(
                     "-",
                     false,
                 );
-                config_flash(false, &format!("Failed to save: {e}"))
+                config_tab_flash("basic", false, &format!("Failed to save: {e}"))
             }
         },
-        Err(e) => config_flash(false, &format!("Configuration validation failed: {e}")),
+        Err(e) => config_tab_flash("basic", false, &format!("Configuration validation failed: {e}")),
     }
 }
 
@@ -2916,18 +3189,22 @@ async fn save_toml(
 
     match state.files.save_toml(&content) {
         Ok(backup) => {
+            if let Ok(new_cfg) = state.files.validate_toml(&content) {
+                state.reload_config(new_cfg);
+            }
             state.db.audit(
                 &user.username,
                 "config.save",
                 "sugie.toml",
-                "Saved raw TOML",
+                "Saved raw TOML (hot-reloaded)",
                 &auth::client_ip(&headers),
                 true,
             );
-            config_flash(
+            config_tab_flash(
+                "toml",
                 true,
                 &format!(
-                    "Saved sugie.toml{}",
+                    "Saved sugie.toml — configuration hot-reloaded!{}",
                     if backup.as_os_str().is_empty() {
                         String::new()
                     } else {
@@ -2945,7 +3222,15 @@ async fn save_toml(
                 "-",
                 false,
             );
-            config_flash(false, &format!("Failed to save: {e}"))
+            // Validation or write failed: do NOT redirect and lose changes!
+            // Render directly with the user's content kept in the textarea so they can fix it.
+            render_config_response(
+                &state,
+                user,
+                "toml".to_string(),
+                Some(content),
+                Some((false, format!("Validation failed: {e}"))),
+            )
         }
     }
 }
@@ -2967,7 +3252,7 @@ async fn save_env(
         .collect();
 
     if updates.is_empty() {
-        return config_flash(true, "No entries to update");
+        return config_tab_flash("env", true, "No entries to update");
     }
 
     match state.files.save_env(&updates) {
@@ -2980,7 +3265,7 @@ async fn save_env(
                 &auth::client_ip(&headers),
                 true,
             );
-            config_flash(true, "Saved .env; changes will take effect after restart")
+            config_tab_flash("env", true, "Saved .env; changes will take effect after restart")
         }
         Err(e) => {
             state.db.audit(
@@ -2991,7 +3276,7 @@ async fn save_env(
                 "-",
                 false,
             );
-            config_flash(false, &format!("Failed to save .env: {e}"))
+            config_tab_flash("env", false, &format!("Failed to save .env: {e}"))
         }
     }
 }
@@ -3008,17 +3293,22 @@ async fn restore_backup(
     let name = form.get("name").cloned().unwrap_or_default();
     match state.files.restore_backup(&name) {
         Ok(_) => {
+            if let Ok(content) = state.files.read_toml() {
+                if let Ok(new_cfg) = state.files.validate_toml(&content) {
+                    state.reload_config(new_cfg);
+                }
+            }
             state.db.audit(
                 &user.username,
                 "config.restore",
                 &name,
-                "Restore backup",
+                "Restore backup (hot-reloaded)",
                 &auth::client_ip(&headers),
                 true,
             );
-            config_flash(true, &format!("Restored to {name}"))
+            config_tab_flash("backup", true, &format!("Restored to {name} — configuration hot-reloaded!"))
         }
-        Err(e) => config_flash(false, &format!("Failed to restore backup: {e}")),
+        Err(e) => config_tab_flash("backup", false, &format!("Failed to restore backup: {e}")),
     }
 }
 
@@ -3032,7 +3322,8 @@ fn all_repo_rows(state: &WebState) -> Vec<(u64, String, u64)> {
         .storage()
         .list_repositories()
         .unwrap_or_default();
-    if let Some(ref allowed) = state.config.notifications.allowed_repositories {
+    let cfg = state.config();
+    if let Some(ref allowed) = cfg.notifications.allowed_repositories {
         for r in allowed {
             if !repos
                 .iter()
@@ -3440,7 +3731,11 @@ async fn restart(State(state): State<WebState>, headers: HeaderMap) -> Response 
 }
 
 fn config_flash(ok: bool, msg: &str) -> Response {
-    flash_to("/admin/config", ok, msg)
+    config_tab_flash("basic", ok, msg)
+}
+
+fn config_tab_flash(tab: &str, ok: bool, msg: &str) -> Response {
+    flash_to(&format!("/admin/config?tab={tab}"), ok, msg)
 }
 
 fn users_flash(ok: bool, msg: &str) -> Response {

@@ -3,7 +3,7 @@ use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use sugie::config::{
     CommandsConfig, DcoConfig, DuplicateConfig, GrowthConfig, GrowthMilestone, RepoConfig,
     ReviewersConfig, SugieConfig,
@@ -58,7 +58,7 @@ fn create_test_state() -> (AppState, Storage) {
     let triage = TriageService::new(Arc::new(config.clone()), storage.clone(), notifier, auth);
 
     let state = AppState {
-        config: Arc::new(config),
+        config: Arc::new(RwLock::new(config)),
         triage,
         chat_api_token: None,
         // The admin console is not mounted in these tests, so chat exchanges
@@ -682,10 +682,10 @@ async fn test_webhook_rejects_when_secret_is_empty() {
     // `HMAC(key="", body)` and the signature verifies. It must now be refused
     // outright, and with a distinct status so the cause is obvious in logs.
     let (base, _) = create_test_state();
-    let mut config = (*base.config).clone();
+    let mut config = base.config();
     config.github.webhook_secret = String::new();
     let state = AppState {
-        config: Arc::new(config),
+        config: Arc::new(RwLock::new(config)),
         triage: base.triage.clone(),
         chat_api_token: None,
         web_db: None,

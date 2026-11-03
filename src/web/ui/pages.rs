@@ -1,6 +1,9 @@
 //! Page-level Leptos components. Every page is a plain SSR component tree —
 //! no hydration, no client-side router.
 
+use crate::notifications::{
+    DiscordBotChannel, DiscordWebhookChannel, LarkChannelConfig, ZulipChannelConfig,
+};
 use crate::web::config_store::{BackupInfo, EnvEntry};
 use crate::web::db::ConsoleHistoryRow;
 use crate::web::exec::LogLine;
@@ -215,7 +218,7 @@ pub fn login_page(
                 <p class="sub">"Enter your credentials or use a Passkey to access the admin console"</p>
                 {err_view}
                 <div id="passkey-err" class="alert err" style="display:none"></div>
-                <form method="post" action="/admin/login">
+                <form method="post" action="/admin/login" id="login-form">
                     <input type="hidden" name="next" value=next/>
                     <label class="field">
                         <span>"Username"</span>
@@ -1037,6 +1040,11 @@ pub fn chats_page(
                     )}</p>
                 </div>
                 <div class="row">
+                    <form method="post" action="/admin/api/discord/sync-commands" style="display:inline;margin-right:8px">
+                        <button type="submit" class="btn sm secondary" title="Register slash commands with Discord API">
+                            "⚡ Sync Discord Commands"
+                        </button>
+                    </form>
                     <a class="btn sm ghost" href=prev>"Previous"</a>
                     {next_control}
                 </div>
@@ -1122,6 +1130,7 @@ pub fn chats_page(
 
 pub fn config_page(
     user: CurrentUser,
+    active_tab: String,
     form: ConfigForm,
     toml_text: String,
     env_entries: Vec<EnvEntry>,
@@ -1132,6 +1141,11 @@ pub fn config_page(
         Some((ok, text)) => view! { <Flash ok=ok text=text/> }.into_any(),
         None => view! { <span></span> }.into_any(),
     };
+
+    let tab_basic = active_tab != "toml" && active_tab != "env" && active_tab != "backup";
+    let tab_toml = active_tab == "toml";
+    let tab_env = active_tab == "env";
+    let tab_backup = active_tab == "backup";
 
     let event_checks = form
         .events
@@ -1227,16 +1241,16 @@ pub fn config_page(
                 {restart_control}
             </div>
             {flash_view}
-            <div class="alert warn">"Note: Saving writes changes to disk. The running process uses the configuration loaded at startup; restart the service to apply changes."</div>
+            <div class="alert info">"⚡ Live Hot-Reloading Active: Changes to triage rules, notifications, channels, and access control are automatically hot-reloaded into memory upon saving (zero downtime)."</div>
 
             <div class="tabs">
-                <button type="button" data-tab="basic" class="active">"General Settings"</button>
-                <button type="button" data-tab="toml">"sugie.toml Source"</button>
-                <button type="button" data-tab="env">".env Secrets"</button>
-                <button type="button" data-tab="backup">"Backups"</button>
+                <button type="button" data-tab="basic" class=if tab_basic { "active" } else { "" }>"General Settings"</button>
+                <button type="button" data-tab="toml" class=if tab_toml { "active" } else { "" }>"sugie.toml Source"</button>
+                <button type="button" data-tab="env" class=if tab_env { "active" } else { "" }>".env Secrets"</button>
+                <button type="button" data-tab="backup" class=if tab_backup { "active" } else { "" }>"Backups"</button>
             </div>
 
-            <div data-tab-panel="basic" class="active">
+            <div data-tab-panel="basic" class=if tab_basic { "active" } else { "" }>
                 <form method="post" action="/admin/config/structured">
                     <div class="grid cols-2">
                         <div class="card">
@@ -1294,22 +1308,23 @@ pub fn config_page(
                 </form>
             </div>
 
-            <div data-tab-panel="toml">
-                <form method="post" action="/admin/config/toml">
+            <div data-tab-panel="toml" class=if tab_toml { "active" } else { "" }>
+                <form method="post" action="/admin/config/toml" id="config-toml-form">
                     <div class="card">
                         <div class="card-head">
                             <h2>"sugie.toml"</h2>
-                            <span class="hint">"Validated as SugieConfig before saving"</span>
+                            <span class="hint">"Validated as SugieConfig before saving · Ctrl+S to save"</span>
                         </div>
                         <textarea class="code" name="content" spellcheck="false">{toml_text}</textarea>
                         <div class="row" style="margin-top:14px">
                             <button class="btn primary" type="submit">"Validate & Save"</button>
+                            <span class="hint">"Press Ctrl+S (or Cmd+S) to validate and save directly"</span>
                         </div>
                     </div>
                 </form>
             </div>
 
-            <div data-tab-panel="env">
+            <div data-tab-panel="env" class=if tab_env { "active" } else { "" }>
                 <form method="post" action="/admin/config/env">
                     <div class="card tight">
                         <div class="card-head" style="padding:18px 20px 0">
@@ -1327,7 +1342,7 @@ pub fn config_page(
                 </form>
             </div>
 
-            <div data-tab-panel="backup">
+            <div data-tab-panel="backup" class=if tab_backup { "active" } else { "" }>
                 <div class="card tight">
                     <div class="card-head" style="padding:18px 20px 0"><h2>"Configuration Backups"</h2></div>
                     <table style="margin-top:10px">
@@ -2542,11 +2557,32 @@ fn fmt_when(ts: &str) -> String {
 
 // --------------------------------------------------------------------- notify
 
+#[derive(Debug, Clone, Default)]
+pub struct DiscordNotifyOptions {
+    pub webhook_ok: bool,
+    pub webhooks: Vec<DiscordWebhookChannel>,
+    pub bot_ok: bool,
+    pub bot_channels: Vec<DiscordBotChannel>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LarkNotifyOptions {
+    pub webhook_ok: bool,
+    pub bot_ok: bool,
+    pub bot_channels: Vec<LarkChannelConfig>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ZulipNotifyOptions {
+    pub ok: bool,
+    pub channels: Vec<ZulipChannelConfig>,
+}
+
 pub fn notify_page(
     user: CurrentUser,
-    discord_ok: bool,
-    lark_ok: bool,
-    zulip_ok: bool,
+    discord_opt: DiscordNotifyOptions,
+    lark_opt: LarkNotifyOptions,
+    zulip_opt: ZulipNotifyOptions,
     flash: Option<(bool, String)>,
 ) -> impl IntoView {
     let flash_view = match flash {
@@ -2554,15 +2590,142 @@ pub fn notify_page(
         None => view! { <span></span> }.into_any(),
     };
     let status = |ok: bool| if ok { "Configured" } else { "Not configured" };
-    let any_ok = discord_ok || lark_ok || zulip_ok;
+    let any_ok = discord_opt.webhook_ok
+        || discord_opt.bot_ok
+        || lark_opt.webhook_ok
+        || lark_opt.bot_ok
+        || zulip_opt.ok;
+    let bot_default = discord_opt.bot_ok;
+    let wh_default = discord_opt.webhook_ok && !discord_opt.bot_ok;
+    let lark_bot_default = lark_opt.bot_ok;
+    let lark_wh_default = lark_opt.webhook_ok && !lark_opt.bot_ok;
+
+    let lark_bot_channels_view = if lark_opt.bot_ok {
+        let chs = lark_opt.bot_channels.clone();
+        if chs.is_empty() {
+            view! {
+                <div style="margin-top:6px;padding-left:26px">
+                    <span style="font-size:12px;color:var(--text-muted, #888)">
+                        "(No bot channels configured yet — add channels in sugie.toml or set SUGIE_LARK_DEFAULT_CHAT_ID in .env)"
+                    </span>
+                </div>
+            }.into_any()
+        } else {
+            view! {
+                <div style="margin-top:6px;padding-left:26px;display:flex;flex-direction:column;gap:6px">
+                    <span style="font-size:12px;color:var(--text-muted, #888)">"Select Lark Bot Chat(s):"</span>
+                    <div style="display:flex;flex-wrap:wrap;gap:12px">
+                        {chs.into_iter().enumerate().map(|(idx, lc)| {
+                            let name_attr = format!("ch_lark_bot_{}", lc.name.replace(' ', "_"));
+                            let label = format!("{} ({})", lc.name, lc.chat_id);
+                            let is_first = idx == 0;
+                            view! {
+                                <label class="check" style="font-size:13px">
+                                    <input type="checkbox" name=name_attr checked=is_first/>
+                                    <span>{label}</span>
+                                </label>
+                            }
+                        }).collect_view()}
+                    </div>
+                </div>
+            }.into_any()
+        }
+    } else {
+        view! { <span></span> }.into_any()
+    };
+
+    let zulip_channels_view = if zulip_opt.ok {
+        let chs = zulip_opt.channels.clone();
+        view! {
+            <div style="margin-top:6px;padding-left:26px;display:flex;flex-direction:column;gap:6px">
+                <span style="font-size:12px;color:var(--text-muted, #888)">"Select Zulip Destination(s):"</span>
+                <div style="display:flex;flex-wrap:wrap;gap:12px">
+                    {chs.into_iter().enumerate().map(|(idx, zc)| {
+                        let name_attr = format!("ch_zulip_ch_{}", zc.name.replace(' ', "_"));
+                        let label = format!("{} (#{} > {})", zc.name, zc.channel, zc.topic);
+                        let is_first = idx == 0;
+                        view! {
+                            <label class="check" style="font-size:13px">
+                                <input type="checkbox" name=name_attr checked=is_first/>
+                                <span>{label}</span>
+                            </label>
+                        }
+                    }).collect_view()}
+                </div>
+            </div>
+        }.into_any()
+    } else {
+        view! { <span></span> }.into_any()
+    };
+
+    let webhook_channels_view = if discord_opt.webhook_ok {
+        let chs = discord_opt.webhooks.clone();
+        view! {
+            <div style="margin-top:6px;padding-left:26px;display:flex;flex-direction:column;gap:6px">
+                <span style="font-size:12px;color:var(--text-muted, #888)">"Select Webhook Channel(s):"</span>
+                <div style="display:flex;flex-wrap:wrap;gap:12px">
+                    {chs.into_iter().enumerate().map(|(idx, wh)| {
+                        let name_attr = format!("ch_discord_wh_{}", wh.name.replace(' ', "_"));
+                        let label = wh.name.clone();
+                        let is_first = idx == 0;
+                        view! {
+                            <label class="check" style="font-size:13px">
+                                <input type="checkbox" name=name_attr checked=is_first/>
+                                <span>{label}</span>
+                            </label>
+                        }
+                    }).collect_view()}
+                </div>
+            </div>
+        }.into_any()
+    } else {
+        view! { <span></span> }.into_any()
+    };
+
+    let bot_channels_view = if discord_opt.bot_ok {
+        let chs = discord_opt.bot_channels.clone();
+        view! {
+            <div style="margin-top:6px;padding-left:26px;display:flex;flex-direction:column;gap:6px">
+                <span style="font-size:12px;color:var(--text-muted, #888)">"Select Bot Channel(s):"</span>
+                <div style="display:flex;flex-wrap:wrap;gap:12px">
+                    {chs.into_iter().enumerate().map(|(idx, bc)| {
+                        let name_attr = format!("ch_discord_bot_{}", bc.name.replace(' ', "_"));
+                        let label = format!("{} ({})", bc.name, bc.channel_id);
+                        let is_first = idx == 0;
+                        view! {
+                            <label class="check" style="font-size:13px">
+                                <input type="checkbox" name=name_attr checked=is_first/>
+                                <span>{label}</span>
+                            </label>
+                        }
+                    }).collect_view()}
+                </div>
+            </div>
+        }.into_any()
+    } else {
+        view! { <span></span> }.into_any()
+    };
 
     view! {
         <Shell title="Notify".to_string() active="notify".to_string() user=Some(user.clone())>
             <div class="page-head">
-                <div>
-                    <div class="eyebrow">"Broadcast"</div>
-                    <h1>"Send Notification"</h1>
-                    <p>"Send a manual announcement to Lark, Discord and/or Zulip. Bypasses event toggles and repository filters."</p>
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;width:100%">
+                    <div>
+                        <div class="eyebrow">"Broadcast"</div>
+                        <h1>"Send Notification"</h1>
+                        <p>"Send a manual announcement to Lark, Discord and/or Zulip. Bypasses event toggles and repository filters."</p>
+                    </div>
+                    {if discord_opt.bot_ok {
+                        view! {
+                            <form method="post" action="/admin/api/discord/sync-commands">
+                                <button type="submit" class="btn sm secondary" title="Register slash commands with Discord API">
+                                    "⚡ Sync Discord Commands"
+                                </button>
+                            </form>
+                        }.into_any()
+                    } else {
+                        view! { <span></span> }.into_any()
+                    }}
                 </div>
             </div>
             {flash_view}
@@ -2591,19 +2754,45 @@ pub fn notify_page(
                     </label>
                     <div class="span-2" style="margin-bottom:16px">
                         <div class="hint" style="margin-bottom:8px;font-weight:560">"Send to"</div>
-                        <div class="check-grid">
-                            <label class="check">
-                                <input type="checkbox" name="ch_lark" checked=lark_ok disabled=!lark_ok/>
-                                <span>{format!("Lark (Feishu) — {}", status(lark_ok))}</span>
-                            </label>
-                            <label class="check">
-                                <input type="checkbox" name="ch_discord" checked=discord_ok disabled=!discord_ok/>
-                                <span>{format!("Discord — {}", status(discord_ok))}</span>
-                            </label>
-                            <label class="check">
-                                <input type="checkbox" name="ch_zulip" checked=zulip_ok disabled=!zulip_ok/>
-                                <span>{format!("Zulip — {}", status(zulip_ok))}</span>
-                            </label>
+                        <div class="check-grid" style="display:flex;flex-direction:column;gap:12px">
+                            <div>
+                                <label class="check">
+                                    <input type="checkbox" name="ch_lark_webhook" checked=lark_wh_default disabled=!lark_opt.webhook_ok/>
+                                    <span style="font-weight:500">{format!("Lark (Webhook) — {}", status(lark_opt.webhook_ok))}</span>
+                                </label>
+                            </div>
+
+                            <div style="border-top:1px solid var(--border, #333);padding-top:10px">
+                                <label class="check">
+                                    <input type="checkbox" name="ch_lark_bot" checked=lark_bot_default disabled=!lark_opt.bot_ok/>
+                                    <span style="font-weight:500">{format!("Lark (Bot) — {}", status(lark_opt.bot_ok))}</span>
+                                </label>
+                                {lark_bot_channels_view}
+                            </div>
+
+                            <div style="border-top:1px solid var(--border, #333);padding-top:10px">
+                                <label class="check">
+                                    <input type="checkbox" name="ch_zulip" checked=zulip_opt.ok disabled=!zulip_opt.ok/>
+                                    <span style="font-weight:500">{format!("Zulip — {}", status(zulip_opt.ok))}</span>
+                                </label>
+                                {zulip_channels_view}
+                            </div>
+
+                            <div style="border-top:1px solid var(--border, #333);padding-top:10px">
+                                <label class="check">
+                                    <input type="checkbox" name="ch_discord_webhook" checked=wh_default disabled=!discord_opt.webhook_ok/>
+                                    <span style="font-weight:500">{format!("Discord (Webhook) — {}", status(discord_opt.webhook_ok))}</span>
+                                </label>
+                                {webhook_channels_view}
+                            </div>
+
+                            <div style="border-top:1px solid var(--border, #333);padding-top:10px">
+                                <label class="check">
+                                    <input type="checkbox" name="ch_discord_bot" checked=bot_default disabled=!discord_opt.bot_ok/>
+                                    <span style="font-weight:500">{format!("Discord (Bot) — {}", status(discord_opt.bot_ok))}</span>
+                                </label>
+                                {bot_channels_view}
+                            </div>
                         </div>
                     </div>
                     <div class="span-2">

@@ -243,8 +243,8 @@ pub fn dispatch(
     let (raw_cmd, args) = split_command(&raw);
     // Honour `[default_rules.commands.aliases]` from sugie.toml so the console
     // behaves like the bot (`/l 42 bug` → `/label 42 bug`).
-    let cmd = state
-        .config
+    let config = state.config();
+    let cmd = config
         .default_rules
         .commands
         .aliases
@@ -257,7 +257,7 @@ pub fn dispatch(
     if spec.admin_only && !user.is_admin() {
         return Err(format!("/{} is restricted to administrators", spec.name));
     }
-    if !user.can_run(spec.name, &restricted_commands(&state.config)) {
+    if !user.can_run(spec.name, &restricted_commands(&config)) {
         return Err(format!("Permission denied to run /{}", spec.name));
     }
     if !user.can_access_repo(&repo) {
@@ -395,7 +395,8 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
 
     match cmd {
         "help" => {
-            let restricted = restricted_commands(&ctx.state.config);
+            let config = ctx.state.config();
+            let restricted = restricted_commands(&config);
             ctx.info(format!(
                 "Current user @{} · Role {} · Repository {}",
                 ctx.user.username,
@@ -432,7 +433,7 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                 "Configuration: {}",
                 ctx.state.files.toml_path.display()
             ));
-            ctx.out(format!("Database:      {}", ctx.state.config.db_path));
+            ctx.out(format!("Database:      {}", ctx.state.config().db_path));
             for (_, name, inst) in repos.iter().take(20) {
                 ctx.out(format!("  · {name}  (installation {inst})"));
             }
@@ -802,7 +803,8 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
         }
 
         "stale" => {
-            let rules = ctx.state.config.default_rules.stale.clone();
+            let config = ctx.state.config();
+            let rules = config.default_rules.stale.clone();
             if !rules.enabled {
                 ctx.err("Stale lifecycle rules are disabled in config (default_rules.stale.enabled = false)");
                 return false;
@@ -817,7 +819,7 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             let mgr = StaleManager::new(
                 rules,
                 ctx.state.triage.storage().clone(),
-                NotificationDispatcher::new(&ctx.state.config.notifications),
+                NotificationDispatcher::new(&config.notifications),
             );
             ctx.info("Starting stale sweep…");
             match mgr.process_repository(&client, owner, repo).await {
@@ -847,10 +849,11 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
                     return false;
                 }
             };
-            let cfg = ctx.state.config.default_rules.reports.clone();
+            let config = ctx.state.config();
+            let cfg = config.default_rules.reports.clone();
             let reporter = MetricsReporter::new(
                 cfg,
-                NotificationDispatcher::new(&ctx.state.config.notifications),
+                NotificationDispatcher::new(&config.notifications),
             );
             let days = if monthly { 30 } else { 7 };
             let label = if monthly { "Monthly" } else { "Weekly" };
@@ -873,7 +876,7 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
         }
 
         "config" => {
-            let s = ConfigSummary::from_config(&ctx.state.config);
+            let s = ConfigSummary::from_config(&ctx.state.config());
             ctx.out(format!("listen      {}:{}", s.host, s.port));
             ctx.out(format!("db_path     {}", s.db_path));
             ctx.out(format!(
@@ -909,13 +912,13 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match ctx.state.files.validate_toml(&content) {
                     Ok(cfg) => {
+                        ctx.state.reload_config(cfg.clone());
                         ctx.ok(format!(
-                            "{} validation passed (listen {}:{})",
+                            "{} validated and hot-reloaded successfully (listen {}:{})",
                             path.display(),
                             cfg.host,
                             cfg.port
                         ));
-                        ctx.info("Note: Running process uses startup configuration. Restart required to apply changes.");
                         true
                     }
                     Err(e) => {

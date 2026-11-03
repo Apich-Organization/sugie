@@ -22,21 +22,80 @@ private_key_path = "sugie.private-key.pem"
 # 2. Discord & Zulip Integrations & Granular Event Sync
 # ------------------------------------------------------------------------------
 [notifications.discord]
+# Two ways to post. A bot token needs one credential for every channel the bot
+# has been invited to; a webhook needs one URL per channel.
+#
+# Bot mode (SUGIE_DISCORD_BOT_TOKEN in .env):
+#   bot_token           = loaded from .env
+#   channel_id          = "123456789012345678"
+#   reports_channel_id  = "123456789012345678"   # optional, falls back to channel_id
+#
+# Webhook mode (legacy, still supported when no token is set):
 webhook_url = "https://discord.com/api/webhooks/your/main/webhook"
 # Optional dedicated channel for weekly/monthly digests:
 reports_webhook_url = "https://discord.com/api/webhooks/your/reports/webhook"
+# Display name and avatar apply to webhook mode only — a bot always posts under
+# its own name.
+# Multiple named Bot channels (choose which channel receives broadcast notifications):
+# [[notifications.discord.bot_channels]]
+# name = "general"
+# channel_id = "123456789012345678"
+#
+# [[notifications.discord.bot_channels]]
+# name = "announcements"
+# channel_id = "234567890123456789"
+#
+# Multiple named Webhook channels:
+# [[notifications.discord.webhooks]]
+# name = "alerts"
+# url = "https://discord.com/api/webhooks/your/main/webhook"
+#
+# [[notifications.discord.webhooks]]
+# name = "reports"
+# url = "https://discord.com/api/webhooks/your/reports/webhook"
 username = "sugie-bot"
 
 [notifications.zulip]
 site_url = "https://your-zulip.example.com"
 bot_email = "sugie-bot@your-zulip.example.com"
 bot_api_key = "your-zulip-bot-api-key"
-stream = "github-triage"
+channel = "github-triage" # or stream = "github-triage"
 # Specific topic categories:
 topic_triage = "triage"
 topic_reports = "reports"
 topic_alerts = "alerts"
 topic_assigns = "assignments"
+
+# Multiple named channel + topic destinations for broadcasts & notifications:
+# [[notifications.zulip.channels]]
+# name = "general"
+# channel = "general"
+# topic = "announcements"
+#
+# [[notifications.zulip.channels]]
+# name = "alerts"
+# channel = "github-triage"
+# topic = "alerts"
+
+[notifications.lark]
+# 1. Bot Mode (Recommended - single bot send & receive across multiple channels):
+# App credentials can be configured here or in .env (SUGIE_LARK_APP_ID & SUGIE_LARK_APP_SECRET)
+# app_id = "cli_xxxxxxxxxxxx"
+# default_chat_id = "oc_xxxxxxxxxxxxxxxx"
+# api_base = "https://open.larksuite.com" # or "https://open.feishu.cn" for Feishu
+#
+# Register named group chats where the bot is invited:
+# [[notifications.lark.channels]]
+# name = "devops"
+# chat_id = "oc_devops_group_id"
+#
+# [[notifications.lark.channels]]
+# name = "alerts"
+# chat_id = "oc_alerts_group_id"
+#
+# 2. Webhook Mode (Fallback / legacy group custom robot):
+# webhook_url = "https://open.larksuite.com/open-apis/bot/v2/hook/your-webhook-token"
+# secret = "your-webhook-signature-secret"
 
 # Toggles for syncing specific events to Discord and Zulip:
 [notifications.events]

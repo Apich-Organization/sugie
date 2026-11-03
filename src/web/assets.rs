@@ -610,9 +610,26 @@ pub const JS: &str = r#"
         document.querySelectorAll('[data-tab-panel]').forEach(function (panel) {
           panel.classList.toggle('active', panel.getAttribute('data-tab-panel') === name);
         });
+        try {
+          var url = new URL(window.location.href);
+          url.searchParams.set('tab', name);
+          window.history.replaceState({}, '', url.toString());
+        } catch (e) {}
       });
     });
   });
+
+  // Activate tab from URL param if present
+  try {
+    var params = new URLSearchParams(window.location.search);
+    var tabParam = params.get('tab');
+    if (tabParam) {
+      document.querySelectorAll('.tabs').forEach(function (group) {
+        var btn = group.querySelector('button[data-tab="' + tabParam + '"]');
+        if (btn && !btn.classList.contains('active')) btn.click();
+      });
+    }
+  } catch (e) {}
 
   // ---- clearable fields -------------------------------------------------
   // Every `.cf` wrapper renders an input plus a × that appears only when the
@@ -1284,6 +1301,52 @@ pub const JS: &str = r#"
 
     // Track manual submission so a double click cannot queue two requests.
     form.addEventListener('submit', function () { sent = true; });
+  });
+})();
+
+// ---- login / 2FA enter key submission ----
+(function () {
+  document.querySelectorAll('form[action="/admin/login"], form[action="/admin/login/2fa"]').forEach(function (form) {
+    form.querySelectorAll('input').forEach(function (input) {
+      input.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          if (form.requestSubmit) {
+            form.requestSubmit();
+          } else {
+            form.submit();
+          }
+        }
+      });
+    });
+  });
+})();
+
+// ---- Ctrl+S / Cmd+S in sugie.toml config editor ----
+(function () {
+  document.querySelectorAll('form[action="/admin/config/toml"]').forEach(function (form) {
+    var ta = form.querySelector('textarea[name="content"]');
+    if (ta) {
+      ta.addEventListener('keydown', function (e) {
+        if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+          e.preventDefault();
+          if (form.requestSubmit) form.requestSubmit(); else form.submit();
+        }
+      });
+    }
+  });
+
+  window.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+      var tomlPanel = document.querySelector('[data-tab-panel="toml"].active');
+      if (tomlPanel) {
+        var tomlForm = tomlPanel.querySelector('form[action="/admin/config/toml"]');
+        if (tomlForm) {
+          e.preventDefault();
+          if (tomlForm.requestSubmit) tomlForm.requestSubmit(); else tomlForm.submit();
+        }
+      }
+    }
   });
 })();
 "#;

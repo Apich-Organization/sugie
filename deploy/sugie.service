@@ -13,9 +13,11 @@ User=sugie
 Group=sugie
 WorkingDirectory=/opt/sugie
 ExecStart=/opt/sugie/sugie serve --config /opt/sugie/sugie.toml
-# Restart only on real failures. `Restart=always` would also restart a clean
-# exit, which hides a deliberate stop in the logs.
-Restart=on-failure
+# `always` rather than `on-failure`: the console's "Restart service" button shuts
+# the process down cleanly and expects systemd to bring it back. An explicit
+# `systemctl stop` is still honoured — systemd never restarts a unit it stopped
+# itself.
+Restart=always
 RestartSec=5s
 
 # The admin console rewrites `.env` and `sugie.toml` and owns `data/`, so the

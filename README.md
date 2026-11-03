@@ -1,4 +1,4 @@
-# Sugie
+# Sugie (杉枝)
 
 Sugie is a GitHub App that automates routine repository maintenance. It handles
 labeling, reviewer assignment, duplicate detection, stale lifecycle, DCO checks,
@@ -58,13 +58,19 @@ growth_milestone = true   # Contributor reached merged PR threshold
 cross_repo_move = true    # Issue migrated across repos
 ```
 
-Discord supports a main webhook plus a separate reports channel:
+Discord accepts either a bot token (one credential for every channel the bot can
+post in) or a per-channel webhook; the token is used when both are present:
 
 ```toml
 [notifications.discord]
-webhook_url = "https://discord.com/api/webhooks/.../alerts"
-reports_webhook_url = "https://discord.com/api/webhooks/.../reports"
-username = "sugie-bot"
+# Bot mode: token comes from SUGIE_DISCORD_BOT_TOKEN in .env
+channel_id = "123456789012345678"
+reports_channel_id = "123456789012345678"   # optional, falls back to channel_id
+
+# Webhook mode (used only when no token is configured)
+# webhook_url = "https://discord.com/api/webhooks/.../alerts"
+# reports_webhook_url = "https://discord.com/api/webhooks/.../reports"
+# username = "sugie-bot"
 ```
 
 Zulip uses one stream with separate topics:

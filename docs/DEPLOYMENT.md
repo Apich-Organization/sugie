@@ -130,6 +130,47 @@ sudo systemctl stop sugie           # stop (does not disable boot start)
 Logs go to the journal only (`SyslogIdentifier=sugie`); the service does not
 write its own rotating log file, so `journalctl` is the single place to look.
 
+### Switching to a different GitHub App
+
+The App id, webhook secret and private key are read once at startup, and
+installation tokens are cached in memory, so **a restart is required**.
+
+1. On GitHub, configure the new App: same permissions and event subscriptions as
+   the old one, webhook URL pointing at `https://<host>/webhook`, and a webhook
+   secret. Generate a private key and install the App on the target
+   organisation/repositories.
+2. Disable the old App's webhook (or uninstall it). Two Apps delivering to the
+   same URL means every event is processed twice — duplicate comments and
+   labels.
+3. Update `/opt/sugie/.env`:
+
+   ```ini
+   SUGIE_GITHUB_APP_ID=<new id>
+   SUGIE_GITHUB_WEBHOOK_SECRET=<new secret>
+   SUGIE_GITHUB_PRIVATE_KEY_PATH=sugie-<new>.private-key.pem
+   ```
+
+   Copy the new `.pem` into `/opt/sugie`, then
+   `sudo chown sugie:sugie /opt/sugie/*.pem && sudo chmod 600 /opt/sugie/*.pem`.
+4. Restart. On startup the bot re-reads every installation and upserts each
+   repository with its new `installation_id`, so repositories that are installed
+   under the new App repair themselves.
+
+   Repositories that existed only under the old App keep their stale row and
+   will fail with a token error if a command targets them. Clear them once:
+
+   ```bash
+   sudo systemctl stop sugie
+   sudo -u sugie sqlite3 /opt/sugie/data/sugie.db "DELETE FROM repositories;"
+   sudo systemctl start sugie     # the startup sync repopulates the table
+   ```
+
+5. Confirm: the log shows `Successfully synced N repositories into database`, and
+   a redelivery from the new App's *Advanced → Recent Deliveries* returns `200`.
+
+Also check `notifications.allowed_repositories` in `sugie.toml` — entries that
+are not installed under the new App simply never produce notifications.
+
 ---
 
 ## 5. Upgrades and rollback

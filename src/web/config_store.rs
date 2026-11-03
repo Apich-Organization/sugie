@@ -35,8 +35,7 @@ pub fn is_secret_key(key: &str) -> bool {
         "TOKEN",
         "PASSWORD",
         "PASSWD",
-        "API_KEY",
-        "PRIVATE_KEY",
+        "KEY",
         "PEM",
         "SIGNATURE",
         // A webhook URL embeds its own bearer credential; DATABASE_URL often
@@ -48,6 +47,11 @@ pub fn is_secret_key(key: &str) -> bool {
         "DSN",
         "CREDENTIAL",
         "AUTHORIZATION",
+        "AUTH",
+        "CERT",
+        "ENCRYPT",
+        "SALT",
+        "HASH",
     ]
     .iter()
     .any(|needle| k.contains(needle))
@@ -544,5 +548,40 @@ impl ConfigSummary {
             reviewers_enabled: cfg.default_rules.reviewers.enabled,
             labels_enabled: cfg.default_rules.labels.enabled,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_secret_key_detects_all_credentials() {
+        // Keys containing KEY, TOKEN, SECRET, PASSWORD, etc. must all be recognized
+        assert!(is_secret_key("SUGIE_DISCORD_PUBLIC_KEY"));
+        assert!(is_secret_key("SUGIE_LARK_ENCRYPT_KEY"));
+        assert!(is_secret_key("SUGIE_ZULIP_BOT_API_KEY"));
+        assert!(is_secret_key("SUGIE_GITHUB_PRIVATE_KEY_PEM"));
+        assert!(is_secret_key("SUGIE_GITHUB_PRIVATE_KEY_PATH"));
+        assert!(is_secret_key("SUGIE_GITHUB_WEBHOOK_SECRET"));
+        assert!(is_secret_key("SUGIE_DISCORD_BOT_TOKEN"));
+        assert!(is_secret_key("SUGIE_CHAT_API_TOKEN"));
+        assert!(is_secret_key("SUGIE_ZULIP_OUTGOING_TOKEN"));
+        assert!(is_secret_key("SUGIE_LARK_VERIFICATION_TOKEN"));
+        assert!(is_secret_key("SUGIE_LARK_SignatureVerification"));
+        assert!(is_secret_key("SUGIE_LARK_APP_SECRET"));
+        assert!(is_secret_key("SUGIE_DISCORD_WEBHOOK_URL"));
+        assert!(is_secret_key("SUGIE_DISCORD_WEBHOOK_ALERTS"));
+        assert!(is_secret_key("SUGIE_ADMIN_PASSWORD"));
+
+        // Non-secret settings must not be masked
+        assert!(!is_secret_key("SUGIE_HOST"));
+        assert!(!is_secret_key("SUGIE_PORT"));
+        assert!(!is_secret_key("SUGIE_DB_PATH"));
+        assert!(!is_secret_key("SUGIE_DISCORD_CHANNEL_ID"));
+        assert!(!is_secret_key("SUGIE_DISCORD_REPORTS_CHANNEL_ID"));
+        assert!(!is_secret_key("SUGIE_ZULIP_SITE_URL"));
+        assert!(!is_secret_key("SUGIE_ZULIP_BOT_EMAIL"));
+        assert!(!is_secret_key("SUGIE_SUPER_USERS"));
     }
 }

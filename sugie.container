@@ -35,7 +35,9 @@ Environment=SUGIE_DB_PATH=/app/data/sugie.db
 Exec=serve --config /app/sugie.toml
 
 [Service]
-Restart=on-failure
+# The console's "Restart service" button exits cleanly and expects the manager to
+# bring the container back; an explicit `systemctl stop` is still honoured.
+Restart=always
 RestartSec=5s
 # Give the bot time to finish an in-flight GitHub call on stop.
 TimeoutStopSec=30
