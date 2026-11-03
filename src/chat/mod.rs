@@ -210,6 +210,28 @@ pub enum ChatCommand {
     Unknown(String),
 }
 
+impl ChatCommand {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ChatCommand::Help => "help",
+            ChatCommand::Status => "status",
+            ChatCommand::ChatId => "chatid",
+            ChatCommand::Repos => "repos",
+            ChatCommand::Workload { .. } => "workload",
+            ChatCommand::Users { .. } => "users",
+            ChatCommand::Metrics { .. } => "metrics",
+            ChatCommand::Issues { .. } => "issues",
+            ChatCommand::Prs { .. } => "prs",
+            ChatCommand::Stats { .. } => "stats",
+            ChatCommand::Config => "config",
+            ChatCommand::Stale { .. } => "stale",
+            ChatCommand::Comment { .. } => "comment",
+            ChatCommand::IssueAction { command, .. } => command.name(),
+            ChatCommand::Unknown(_) => "unknown",
+        }
+    }
+}
+
 pub struct ChatCommandParser;
 
 impl ChatCommandParser {
@@ -499,16 +521,43 @@ impl<'a> ChatCommandExecutor<'a> {
     pub async fn execute(&self, message: &InboundChatMessage) -> String {
         let known_repos = self.get_known_repositories();
         let cmd = ChatCommandParser::parse(&message.raw_content, &known_repos);
+        let cmd_name = cmd.name();
 
         let is_super = self.is_super_user(message.platform, &message.sender);
-        if self.config.default_rules.commands.admin_only
-            && !is_super
-            && !matches!(cmd, ChatCommand::ChatId | ChatCommand::Help | ChatCommand::Status)
-        {
+
+        // 1. Check if this specific command is restricted in restricted_commands
+        let is_restricted = self
+            .config
+            .default_rules
+            .commands
+            .restricted_commands
+            .iter()
+            .any(|r| {
+                let clean = r.trim().trim_start_matches('/');
+                clean.eq_ignore_ascii_case(cmd_name)
+                    || (cmd_name == "chatid"
+                        && (clean.eq_ignore_ascii_case("chat_id") || clean.eq_ignore_ascii_case("chat-id")))
+            });
+
+        if is_restricted && !is_super {
             return format!(
-                "⛔ Access Denied: Sugie is configured in admin-only mode (`admin_only = true`).\nOnly authorized administrators can run commands.\n\nYour User ID is `{}` (@{}). Type `/chatid` to see how to request access.",
-                message.sender.id, message.sender.username
+                "⛔ Sorry @{}, the command `/{}` is restricted to authorized super users.\n\nYour User ID is `{}`.",
+                message.sender.username, cmd_name, message.sender.id
             );
+        }
+
+        // 2. Check if admin_only mode is enabled
+        // In admin_only mode, only super users can execute commands.
+        // /help and /chatid are exempt so users can discover their ID, UNLESS
+        // they are explicitly placed in restricted_commands.
+        if self.config.default_rules.commands.admin_only && !is_super {
+            let is_exempt = matches!(cmd, ChatCommand::ChatId | ChatCommand::Help) && !is_restricted;
+            if !is_exempt {
+                return format!(
+                    "⛔ Access Denied: Sugie is configured in admin-only mode (`admin_only = true`).\nOnly authorized administrators can run commands.\n\nYour User ID is `{}` (@{}). Type `/chatid` to see how to request access.",
+                    message.sender.id, message.sender.username
+                );
+            }
         }
 
         match cmd {
@@ -1639,5 +1688,67 @@ mod tests {
             extra_ids: vec![],
         };
         assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &github_fallback));
+    }
+
+    #[tokio::test]
+    async fn test_restricted_commands_including_status_and_chatid() {
+        let mut config = SugieConfig::default();
+        config.default_rules.commands.lark_super_users = vec!["ou_admin_ok".to_string()];
+        config.default_rules.commands.restricted_commands = vec!["status".to_string(), "chatid".to_string()];
+
+        let storage = crate::storage::Storage::new_in_memory().unwrap();
+        let auth = std::sync::Arc::new(crate::github::auth::GitHubAuthManager::new(1, "key".into()));
+        let notifier = crate::notifications::NotificationDispatcher::new(&config.notifications);
+        let triage = crate::triage::TriageService::new(std::sync::Arc::new(config.clone()), storage, notifier, auth);
+        let executor = ChatCommandExecutor::new(&config, &triage);
+
+        // Standard user running /status
+        let standard_user_msg = InboundChatMessage {
+            platform: ChatPlatform::Lark,
+            sender: InboundSender {
+                id: "ou_standard_user".to_string(),
+                username: "Support".to_string(),
+                display_name: None,
+                extra_ids: vec![],
+            },
+            raw_content: "@apichtopbot status".to_string(),
+            stream_or_channel: Some("oc_123".to_string()),
+            message_id: Some("om_123".to_string()),
+        };
+
+        let reply = executor.execute(&standard_user_msg).await;
+        assert!(reply.contains("⛔ Sorry @Support, the command `/status` is restricted to authorized super users."));
+
+        // Standard user running /chatid
+        let chatid_msg = InboundChatMessage {
+            platform: ChatPlatform::Lark,
+            sender: InboundSender {
+                id: "ou_standard_user".to_string(),
+                username: "Support".to_string(),
+                display_name: None,
+                extra_ids: vec![],
+            },
+            raw_content: "@apichtopbot chatid".to_string(),
+            stream_or_channel: Some("oc_123".to_string()),
+            message_id: Some("om_123".to_string()),
+        };
+        let reply_chatid = executor.execute(&chatid_msg).await;
+        assert!(reply_chatid.contains("⛔ Sorry @Support, the command `/chatid` is restricted to authorized super users."));
+
+        // Authorized super user running /status
+        let super_user_msg = InboundChatMessage {
+            platform: ChatPlatform::Lark,
+            sender: InboundSender {
+                id: "ou_admin_ok".to_string(),
+                username: "Support".to_string(),
+                display_name: None,
+                extra_ids: vec![],
+            },
+            raw_content: "@apichtopbot status".to_string(),
+            stream_or_channel: Some("oc_123".to_string()),
+            message_id: Some("om_123".to_string()),
+        };
+        let super_reply = executor.execute(&super_user_msg).await;
+        assert!(super_reply.contains("Sugie Bot Status"));
     }
 }
