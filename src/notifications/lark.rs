@@ -41,7 +41,14 @@ pub fn format_markdown_for_lark(input: &str) -> String {
 
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
-            out.push(line.to_string());
+            // Lark's code highlighter recognizes json, yaml, bash, python, etc. but not toml.
+            // Map toml code blocks to yaml for syntax highlighting and reliable rendering.
+            let fence = if trimmed.eq_ignore_ascii_case("```toml") {
+                "```yaml".to_string()
+            } else {
+                trimmed.to_string()
+            };
+            out.push(fence);
             continue;
         }
 
@@ -381,11 +388,8 @@ impl LarkNotifier {
 
         if sections.is_empty() {
             elements.push(json!({
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": formatted
-                }
+                "tag": "markdown",
+                "content": formatted
             }));
         } else {
             for (idx, sec) in sections.iter().enumerate() {
@@ -393,11 +397,8 @@ impl LarkNotifier {
                     elements.push(json!({ "tag": "hr" }));
                 }
                 elements.push(json!({
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": sec
-                    }
+                    "tag": "markdown",
+                    "content": sec
                 }));
             }
         }
@@ -410,33 +411,31 @@ impl LarkNotifier {
                 .collect::<Vec<_>>()
                 .join("\n");
             elements.push(json!({
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": fields_md
-                }
+                "tag": "markdown",
+                "content": fields_md
             }));
         }
 
-        // Action button for GitHub URL
+        // Action button for GitHub URL (Schema 2.0 uses button with open_url behavior)
         if let Some(target_url) = url {
             elements.push(json!({
-                "tag": "action",
-                "actions": [
+                "tag": "button",
+                "text": {
+                    "tag": "plain_text",
+                    "content": "View on GitHub ↗"
+                },
+                "type": "primary",
+                "behaviors": [
                     {
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": "View on GitHub ↗"
-                        },
-                        "type": "primary",
-                        "url": target_url
+                        "type": "open_url",
+                        "default_url": target_url
                     }
                 ]
             }));
         }
 
         json!({
+            "schema": "2.0",
             "config": {
                 "wide_screen_mode": true
             },
@@ -447,7 +446,9 @@ impl LarkNotifier {
                 },
                 "template": effective_color
             },
-            "elements": elements
+            "body": {
+                "elements": elements
+            }
         })
     }
 
@@ -937,8 +938,12 @@ mod tests {
             Some("Test Card")
         );
 
-        let elements = card.get("elements").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(elements.len(), 3); // Main text, fields div, and button action
+        let elements = card
+            .get("body")
+            .and_then(|b| b.get("elements"))
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(elements.len(), 3); // Main text, fields, and button
     }
 
     #[test]
@@ -1019,8 +1024,9 @@ admin_only = true\n\
         // Blockquote converted to visual quote block
         assert!(formatted.contains("▎ Important notice for <at id=\"ou_test123\"></at> and <at id=all></at>"));
 
-        // Code block preserves hash comment without converting to bold
+        // Code block preserves hash comment without converting to bold and maps toml to yaml
         assert!(formatted.contains("# This is a comment"));
+        assert!(formatted.contains("```yaml"));
 
         // Test card title extraction from heading and hr dividers
         let markdown_with_divider = "### 🤖 Bot Digest\n\nFirst part\n\n---\n\nSecond part";
@@ -1039,11 +1045,15 @@ admin_only = true\n\
             Some("🤖 Bot Digest")
         );
 
-        let elements = card.get("elements").and_then(|v| v.as_array()).unwrap();
-        // Two text div sections and one hr divider between them
+        let elements = card
+            .get("body")
+            .and_then(|b| b.get("elements"))
+            .and_then(|v| v.as_array())
+            .unwrap();
+        // Two markdown sections and one hr divider between them
         assert_eq!(elements.len(), 3);
-        assert_eq!(elements[0].get("tag").and_then(|v| v.as_str()), Some("div"));
+        assert_eq!(elements[0].get("tag").and_then(|v| v.as_str()), Some("markdown"));
         assert_eq!(elements[1].get("tag").and_then(|v| v.as_str()), Some("hr"));
-        assert_eq!(elements[2].get("tag").and_then(|v| v.as_str()), Some("div"));
+        assert_eq!(elements[2].get("tag").and_then(|v| v.as_str()), Some("markdown"));
     }
 }
