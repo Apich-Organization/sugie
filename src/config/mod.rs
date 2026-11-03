@@ -195,6 +195,14 @@ pub struct LarkChannelConfig {
     pub chat_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LarkWebhookChannel {
+    pub name: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LarkConfig {
     /// Custom Robot incoming webhook URL (single group chat)
@@ -215,9 +223,12 @@ pub struct LarkConfig {
     #[serde(default = "default_lark_api_base")]
     pub api_base: String,
     pub allowed_repositories: Option<Vec<String>>,
-    /// Multiple named channel (group chat) destinations
+    /// Multiple named channel (group chat) destinations for Lark App Bot
     #[serde(default)]
     pub channels: Vec<LarkChannelConfig>,
+    /// Multiple named custom robot webhook destinations for different groups
+    #[serde(default)]
+    pub webhooks: Vec<LarkWebhookChannel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1121,6 +1132,93 @@ fn load_zulip_env_channels(channels: &mut Vec<ZulipChannelConfig>) {
     }
 }
 
+fn load_lark_env_channels(
+    webhooks: &mut Vec<LarkWebhookChannel>,
+    channels: &mut Vec<LarkChannelConfig>,
+) {
+    // 1. Scan individual SUGIE_LARK_WEBHOOK_<NAME>, SUGIE_LARK_SECRET_<NAME>, and SUGIE_LARK_CHANNEL_<NAME>
+    let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+    for (k, v) in &vars {
+        let v = v.trim().to_string();
+        if v.is_empty() {
+            continue;
+        }
+        if let Some(rest) = k.strip_prefix("SUGIE_LARK_WEBHOOK_") {
+            if rest == "URL" {
+                continue;
+            }
+            let name = rest.to_lowercase().replace('_', "-");
+            let secret_key = format!("SUGIE_LARK_SECRET_{rest}");
+            let secret = vars.get(&secret_key).cloned().filter(|s| !s.trim().is_empty());
+            if !webhooks.iter().any(|w| w.name == name) {
+                webhooks.push(LarkWebhookChannel { name, url: v, secret });
+            }
+        } else if let Some(rest) = k.strip_prefix("SUGIE_LARK_CHANNEL_") {
+            let name = rest.to_lowercase().replace('_', "-");
+            if !channels.iter().any(|c| c.name == name) {
+                channels.push(LarkChannelConfig { name, chat_id: v });
+            }
+        }
+    }
+
+    // 2. Scan comma-separated SUGIE_LARK_WEBHOOKS (name=url, name=url#secret, or name:url)
+    if let Ok(whs) = std::env::var("SUGIE_LARK_WEBHOOKS") {
+        for pair in whs.split(',') {
+            let trimmed = pair.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parts = if let Some(p) = trimmed.split_once('=') {
+                Some(p)
+            } else if let Some(p) = trimmed.split_once("https://") {
+                Some((p.0.trim_end_matches(':'), p.1))
+            } else {
+                None
+            };
+            if let Some((name, rest)) = parts {
+                let name = name.trim().to_lowercase().replace('_', "-");
+                let (url_part, secret) = if let Some((u, s)) = rest.split_once('#') {
+                    (u.trim(), Some(s.trim().to_string()).filter(|s| !s.is_empty()))
+                } else {
+                    (rest.trim(), None)
+                };
+                let url = if url_part.starts_with("https://") || url_part.starts_with("http://") {
+                    url_part.to_string()
+                } else {
+                    format!("https://{}", url_part)
+                };
+                if !name.is_empty() && !webhooks.iter().any(|w| w.name == name) {
+                    webhooks.push(LarkWebhookChannel { name, url, secret });
+                }
+            }
+        }
+    }
+
+    // 3. Scan comma-separated SUGIE_LARK_CHANNELS (name=oc_xxx or name:oc_xxx)
+    if let Ok(chs) = std::env::var("SUGIE_LARK_CHANNELS") {
+        for pair in chs.split(',') {
+            let trimmed = pair.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let (name, chat_id) = if let Some((n, c)) = trimmed.split_once('=') {
+                (n.trim(), c.trim())
+            } else if let Some((n, c)) = trimmed.split_once(':') {
+                (n.trim(), c.trim())
+            } else {
+                continue;
+            };
+            let name = name.to_lowercase().replace('_', "-");
+            if !name.is_empty() && !chat_id.is_empty() && !channels.iter().any(|c| c.name == name) {
+                channels.push(LarkChannelConfig {
+                    name,
+                    chat_id: chat_id.to_string(),
+                });
+            }
+        }
+    }
+}
+
 impl SugieConfig {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
         let content = std::fs::read_to_string(path)?;
@@ -1384,6 +1482,7 @@ impl SugieConfig {
             {
                 lark.allowed_repositories = parse_repo_list(&repos);
             }
+            load_lark_env_channels(&mut lark.webhooks, &mut lark.channels);
         } else {
             let app_id = std::env::var("SUGIE_LARK_APP_ID")
                 .ok()
@@ -1395,7 +1494,11 @@ impl SugieConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty());
 
-            if app_id.is_some() || lark_url.is_some() {
+            let mut webhooks = Vec::new();
+            let mut channels = Vec::new();
+            load_lark_env_channels(&mut webhooks, &mut channels);
+
+            if app_id.is_some() || lark_url.is_some() || !webhooks.is_empty() || !channels.is_empty() {
                 let secret = std::env::var("SUGIE_LARK_SignatureVerification")
                     .or_else(|_| std::env::var("SUGIE_LARK_SIGNATURE_VERIFICATION"))
                     .or_else(|_| std::env::var("SUGIE_LARK_SECRET"))
@@ -1421,7 +1524,8 @@ impl SugieConfig {
                     default_chat_id,
                     api_base,
                     allowed_repositories,
-                    channels: vec![],
+                    channels,
+                    webhooks,
                 });
             }
         }

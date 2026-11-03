@@ -93,9 +93,21 @@ topic_assigns = "assignments"
 # name = "alerts"
 # chat_id = "oc_alerts_group_id"
 #
-# 2. Webhook Mode (Fallback / legacy group custom robot):
+# 2. Webhook Mode (Group Custom Robots):
+# Default fallback webhook (or configure via SUGIE_LARK_WEBHOOK_URL in .env):
 # webhook_url = "https://open.larksuite.com/open-apis/bot/v2/hook/your-webhook-token"
 # secret = "your-webhook-signature-secret"
+#
+# Register multiple named group custom robot webhooks:
+# [[notifications.lark.webhooks]]
+# name = "devops"
+# url = "https://open.larksuite.com/open-apis/bot/v2/hook/token1"
+# secret = "secret1" # optional signature verification secret
+#
+# [[notifications.lark.webhooks]]
+# name = "alerts"
+# url = "https://open.larksuite.com/open-apis/bot/v2/hook/token2"
+# secret = "secret2" # optional
 
 # Toggles for syncing specific events to Discord and Zulip:
 [notifications.events]

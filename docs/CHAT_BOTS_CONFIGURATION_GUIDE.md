@@ -242,20 +242,54 @@ chat_id = "oc_alerts_group_id"
 
 ---
 
-### 2.3 Setup Option B: Custom Group Bot Webhook (Legacy / Single Group Fallback)
+### 2.3 Setup Option B: Custom Group Bot Webhook (Single or Multiple Groups)
 
-If you only need simple one-way outbound alerts to a single group chat without interactive bot commands:
+If you only need outbound alerts to one or more group chats without interactive `@bot` commands:
 1. In a Lark chat group, click **Group Settings (•••) ➔ Bots ➔ Add Bot ➔ Custom Bot**.
 2. Name the bot (e.g. `Sugie Alert Bot`).
 3. Under **Security Settings**:
    - Check **Signature verification** and copy the secret.
 4. Copy the **Webhook URL**.
-5. Add to `.env`:
-   ```env
-   SUGIE_LARK_WEBHOOK_URL=https://open.larksuite.com/open-apis/bot/v2/hook/90829cb3-d395-4838-b76b-1093f819a814
-   SUGIE_LARK_SignatureVerification=your-lark-secret
-   ```
-6. Notifications sent in this mode will appear in the chat from the **Custom Bot**. No incoming chat commands or thread replies can be processed by a webhook bot.
+5. Repeat for any other groups where you want alerts delivered.
+
+#### Single Group Setup
+Add to `.env`:
+```env
+SUGIE_LARK_WEBHOOK_URL=https://open.larksuite.com/open-apis/bot/v2/hook/90829cb3-d395-4838-b76b-1093f819a814
+SUGIE_LARK_SignatureVerification=your-lark-secret
+```
+
+#### Multiple Groups Setup
+You can register multiple named webhooks either in `sugie.toml` or `.env`:
+
+**Option 1: In `sugie.toml`**
+```toml
+[[notifications.lark.webhooks]]
+name = "devops"
+url = "https://open.larksuite.com/open-apis/bot/v2/hook/uuid1"
+secret = "secret1" # optional signature secret
+
+[[notifications.lark.webhooks]]
+name = "alerts"
+url = "https://open.larksuite.com/open-apis/bot/v2/hook/uuid2"
+secret = "secret2" # optional signature secret
+```
+
+**Option 2: In `.env`**
+```env
+# Individual named webhooks and matching secrets:
+SUGIE_LARK_WEBHOOK_DEVOPS=https://open.larksuite.com/open-apis/bot/v2/hook/uuid1
+SUGIE_LARK_SECRET_DEVOPS=secret1
+
+SUGIE_LARK_WEBHOOK_ALERTS=https://open.larksuite.com/open-apis/bot/v2/hook/uuid2
+SUGIE_LARK_SECRET_ALERTS=secret2
+
+# Or comma-separated:
+# SUGIE_LARK_WEBHOOKS="devops=https://...#secret1,alerts=https://...#secret2"
+```
+
+In the Web Admin Console (`/admin/notify`), checking **Lark (Webhook)** will show checkboxes for every registered webhook, allowing you to broadcast to one, multiple, or all groups!
+Notifications sent in this mode appear in the chat from the **Custom Bot**. (No incoming chat commands or thread replies can be processed by a webhook bot).
 
 ---
 

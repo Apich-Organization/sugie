@@ -2180,6 +2180,7 @@ async fn notify_page(
     let lark_opt = match n.lark() {
         Some(l) => pages::LarkNotifyOptions {
             webhook_ok: l.has_webhook(),
+            webhooks: l.webhook_channels(),
             bot_ok: l.has_bot(),
             bot_channels: l.bot_channels(),
         },
@@ -2264,21 +2265,48 @@ async fn notify_send(
     if want_lark_webhook {
         match notifier.lark() {
             Some(l) => {
-                if !l.has_webhook() {
-                    failed.push("Lark Webhook: not configured".to_string());
+                let all_webhooks = l.webhook_channels();
+                let target_webhooks: Vec<_> = all_webhooks
+                    .iter()
+                    .filter(|w| {
+                        let safe = w.name.replace(' ', "_");
+                        form.contains_key(&format!("ch_lark_wh_{safe}"))
+                            || form.contains_key(&format!("ch_lark_wh_{}", w.name))
+                    })
+                    .cloned()
+                    .collect();
+
+                let webhooks_to_send = if !target_webhooks.is_empty() {
+                    target_webhooks
+                } else if all_webhooks.len() == 1 {
+                    all_webhooks.clone()
                 } else {
-                    match l
-                        .send_webhook_notification(
-                            &title,
-                            &message,
-                            url.as_deref(),
-                            level.lark_template(),
-                            &[("Sent by", user.username.as_str())],
-                        )
-                        .await
-                    {
-                        Ok(_) => sent.push("Lark (Webhook)".to_string()),
-                        Err(e) => failed.push(format!("Lark (Webhook): {e}")),
+                    Vec::new()
+                };
+
+                if webhooks_to_send.is_empty() {
+                    if all_webhooks.is_empty() {
+                        failed.push("Lark Webhook: no webhooks configured".to_string());
+                    } else {
+                        failed.push("Lark Webhook: no webhook was selected".to_string());
+                    }
+                } else {
+                    for wh in webhooks_to_send {
+                        match l
+                            .send_to_webhook(
+                                &wh.url,
+                                wh.secret.as_deref(),
+                                &title,
+                                &message,
+                                url.as_deref(),
+                                level.lark_template(),
+                                &[("Sent by", user.username.as_str())],
+                            )
+                            .await
+                        {
+                            Ok(_) => sent.push(format!("Lark Webhook ({})", wh.name)),
+                            Err(e) => failed.push(format!("Lark Webhook ({}): {e}", wh.name)),
+                        }
                     }
                 }
             }

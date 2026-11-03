@@ -4,7 +4,7 @@ pub mod zulip;
 
 pub use discord::{DiscordBotChannel, DiscordEmbedField, DiscordNotifier, DiscordWebhookChannel};
 pub use lark::{LarkChannel, LarkNotifier};
-pub use crate::config::LarkChannelConfig;
+pub use crate::config::{LarkChannelConfig, LarkWebhookChannel};
 pub use zulip::{ZulipChannelConfig, ZulipNotifier, ZulipTopicCategory};
 
 use crate::config::NotificationsConfig;

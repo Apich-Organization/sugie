@@ -2,7 +2,8 @@
 //! no hydration, no client-side router.
 
 use crate::notifications::{
-    DiscordBotChannel, DiscordWebhookChannel, LarkChannelConfig, ZulipChannelConfig,
+    DiscordBotChannel, DiscordWebhookChannel, LarkChannelConfig, LarkWebhookChannel,
+    ZulipChannelConfig,
 };
 use crate::web::config_store::{BackupInfo, EnvEntry};
 use crate::web::db::ConsoleHistoryRow;
@@ -2568,6 +2569,7 @@ pub struct DiscordNotifyOptions {
 #[derive(Debug, Clone, Default)]
 pub struct LarkNotifyOptions {
     pub webhook_ok: bool,
+    pub webhooks: Vec<LarkWebhookChannel>,
     pub bot_ok: bool,
     pub bot_channels: Vec<LarkChannelConfig>,
 }
@@ -2599,6 +2601,30 @@ pub fn notify_page(
     let wh_default = discord_opt.webhook_ok && !discord_opt.bot_ok;
     let lark_bot_default = lark_opt.bot_ok;
     let lark_wh_default = lark_opt.webhook_ok && !lark_opt.bot_ok;
+
+    let lark_webhook_channels_view = if lark_opt.webhook_ok {
+        let chs = lark_opt.webhooks.clone();
+        view! {
+            <div style="margin-top:6px;padding-left:26px;display:flex;flex-direction:column;gap:6px">
+                <span style="font-size:12px;color:var(--text-muted, #888)">"Select Lark Webhook(s):"</span>
+                <div style="display:flex;flex-wrap:wrap;gap:12px">
+                    {chs.into_iter().enumerate().map(|(idx, wh)| {
+                        let name_attr = format!("ch_lark_wh_{}", wh.name.replace(' ', "_"));
+                        let label = wh.name.clone();
+                        let is_first = idx == 0;
+                        view! {
+                            <label class="check" style="font-size:13px">
+                                <input type="checkbox" name=name_attr checked=is_first/>
+                                <span>{label}</span>
+                            </label>
+                        }
+                    }).collect_view()}
+                </div>
+            </div>
+        }.into_any()
+    } else {
+        view! { <span></span> }.into_any()
+    };
 
     let lark_bot_channels_view = if lark_opt.bot_ok {
         let chs = lark_opt.bot_channels.clone();
@@ -2760,6 +2786,7 @@ pub fn notify_page(
                                     <input type="checkbox" name="ch_lark_webhook" checked=lark_wh_default disabled=!lark_opt.webhook_ok/>
                                     <span style="font-weight:500">{format!("Lark (Webhook) — {}", status(lark_opt.webhook_ok))}</span>
                                 </label>
+                                {lark_webhook_channels_view}
                             </div>
 
                             <div style="border-top:1px solid var(--border, #333);padding-top:10px">

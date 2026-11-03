@@ -1,4 +1,4 @@
-use crate::config::{LarkChannelConfig, LarkConfig};
+use crate::config::{LarkChannelConfig, LarkConfig, LarkWebhookChannel};
 use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::Utc;
@@ -53,9 +53,25 @@ impl LarkNotifier {
                 .unwrap_or(false)
     }
 
+    /// Return all configured webhook channels, falling back to default webhook_url.
+    pub fn webhook_channels(&self) -> Vec<LarkWebhookChannel> {
+        if !self.config.webhooks.is_empty() {
+            return self.config.webhooks.clone();
+        }
+        let mut list = Vec::new();
+        if !self.config.webhook_url.trim().is_empty() {
+            list.push(LarkWebhookChannel {
+                name: "default".to_string(),
+                url: self.config.webhook_url.trim().to_string(),
+                secret: self.config.secret.clone(),
+            });
+        }
+        list
+    }
+
     /// Whether an incoming webhook URL is configured.
     pub fn has_webhook(&self) -> bool {
-        !self.config.webhook_url.trim().is_empty()
+        !self.webhook_channels().is_empty()
     }
 
     /// Whether Lark can send notifications at all (either as bot or via webhook).
@@ -449,16 +465,19 @@ impl LarkNotifier {
         Ok(())
     }
 
-    /// Send notification via legacy/custom incoming webhook URL.
-    pub async fn send_webhook_notification(
+    /// Send notification to a specific Lark incoming webhook URL with optional secret.
+    pub async fn send_to_webhook(
         &self,
+        webhook_url: &str,
+        secret: Option<&str>,
         title: &str,
         message: &str,
         url: Option<&str>,
         color_template: &str,
         fields: &[(&str, &str)],
     ) -> Result<()> {
-        if self.config.webhook_url.trim().is_empty() {
+        let url_str = webhook_url.trim();
+        if url_str.is_empty() {
             anyhow::bail!("Lark webhook URL is not configured");
         }
 
@@ -470,9 +489,10 @@ impl LarkNotifier {
             "card": card
         });
 
-        if let Some(ref secret) = self.config.secret {
-            if !secret.trim().is_empty() {
-                let sign = Self::generate_signature(now, secret)?;
+        if let Some(sec) = secret {
+            let s = sec.trim();
+            if !s.is_empty() {
+                let sign = Self::generate_signature(now, s)?;
                 payload["timestamp"] = json!(now.to_string());
                 payload["sign"] = json!(sign);
             }
@@ -481,7 +501,7 @@ impl LarkNotifier {
         let started = std::time::Instant::now();
         let send_res = self
             .http
-            .post(&self.config.webhook_url)
+            .post(url_str)
             .json(&payload)
             .send()
             .await;
@@ -493,7 +513,7 @@ impl LarkNotifier {
                 crate::security_log::log_notification_request(
                     "lark",
                     "POST",
-                    &self.config.webhook_url,
+                    url_str,
                     0,
                     duration_ms,
                     &format!("title={title} error={e}"),
@@ -509,7 +529,7 @@ impl LarkNotifier {
             crate::security_log::log_notification_request(
                 "lark",
                 "POST",
-                &self.config.webhook_url,
+                url_str,
                 status.as_u16(),
                 duration_ms,
                 &format!("title={title} http_error={body_text}"),
@@ -527,7 +547,7 @@ impl LarkNotifier {
                     crate::security_log::log_notification_request(
                         "lark",
                         "POST",
-                        &self.config.webhook_url,
+                        url_str,
                         status.as_u16(),
                         duration_ms,
                         &format!("title={title} lark_code={code} msg={msg}"),
@@ -540,12 +560,40 @@ impl LarkNotifier {
         crate::security_log::log_notification_request(
             "lark",
             "POST",
-            &self.config.webhook_url,
+            url_str,
             status.as_u16(),
             duration_ms,
             &format!("title={title} template={color_template}"),
         );
 
+        Ok(())
+    }
+
+    /// Send notification via all configured incoming webhook URLs.
+    pub async fn send_webhook_notification(
+        &self,
+        title: &str,
+        message: &str,
+        url: Option<&str>,
+        color_template: &str,
+        fields: &[(&str, &str)],
+    ) -> Result<()> {
+        let whs = self.webhook_channels();
+        if whs.is_empty() {
+            anyhow::bail!("Lark webhook URL is not configured");
+        }
+        for wh in whs {
+            self.send_to_webhook(
+                &wh.url,
+                wh.secret.as_deref(),
+                title,
+                message,
+                url,
+                color_template,
+                fields,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -605,6 +653,13 @@ impl LarkNotifier {
         color_template: &str,
         fields: &[(&str, &str)],
     ) -> Result<()> {
+        if let Some(target) = target_channel {
+            // Check if target matches a configured webhook channel
+            if let Some(wh) = self.webhook_channels().iter().find(|w| w.name.eq_ignore_ascii_case(target)) {
+                return self.send_to_webhook(&wh.url, wh.secret.as_deref(), title, message, url, color_template, fields).await;
+            }
+        }
+
         if self.has_bot() {
             let chat_id = self
                 .resolve_chat_id(target_channel)
@@ -746,5 +801,46 @@ mod tests {
         // Verify deterministic output
         let sig2 = LarkNotifier::generate_signature(timestamp, secret).unwrap();
         assert_eq!(sig, sig2);
+    }
+
+    #[test]
+    fn test_lark_multiple_webhooks_and_fallback() {
+        // 1. Single webhook fallback
+        let cfg1 = LarkConfig {
+            webhook_url: "https://open.larksuite.com/open-apis/bot/v2/hook/wh1".into(),
+            secret: Some("sec1".into()),
+            ..Default::default()
+        };
+        let n1 = LarkNotifier::new(cfg1);
+        let whs1 = n1.webhook_channels();
+        assert_eq!(whs1.len(), 1);
+        assert_eq!(whs1[0].name, "default");
+        assert_eq!(whs1[0].url, "https://open.larksuite.com/open-apis/bot/v2/hook/wh1");
+        assert_eq!(whs1[0].secret.as_deref(), Some("sec1"));
+
+        // 2. Multiple named webhooks
+        let cfg2 = LarkConfig {
+            webhooks: vec![
+                LarkWebhookChannel {
+                    name: "devops".into(),
+                    url: "https://open.larksuite.com/open-apis/bot/v2/hook/wh-devops".into(),
+                    secret: Some("sec-devops".into()),
+                },
+                LarkWebhookChannel {
+                    name: "alerts".into(),
+                    url: "https://open.larksuite.com/open-apis/bot/v2/hook/wh-alerts".into(),
+                    secret: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let n2 = LarkNotifier::new(cfg2);
+        let whs2 = n2.webhook_channels();
+        assert_eq!(whs2.len(), 2);
+        assert_eq!(whs2[0].name, "devops");
+        assert_eq!(whs2[0].url, "https://open.larksuite.com/open-apis/bot/v2/hook/wh-devops");
+        assert_eq!(whs2[0].secret.as_deref(), Some("sec-devops"));
+        assert_eq!(whs2[1].name, "alerts");
+        assert_eq!(whs2[1].secret, None);
     }
 }
