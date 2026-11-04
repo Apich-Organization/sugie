@@ -2212,6 +2212,7 @@ mod tests {
             raw_content: text.to_string(),
             stream_or_channel: Some("stream-1".to_string()),
             message_id: Some("m-1".to_string()),
+            extra_channel_ids: Vec::new(),
         }
     }
 

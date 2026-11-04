@@ -162,6 +162,8 @@ pub struct InboundChatMessage {
     pub raw_content: String,
     pub stream_or_channel: Option<String>,
     pub message_id: Option<String>,
+    #[serde(default)]
+    pub extra_channel_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,6 +521,34 @@ impl<'a> ChatCommandExecutor<'a> {
     }
 
     pub async fn execute(&self, message: &InboundChatMessage) -> String {
+        // 0. Channel / Group Whitelist Authorization Gate
+        if !self.is_channel_allowed(message) {
+            let ch_display = message
+                .stream_or_channel
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("unknown");
+
+            return match message.platform {
+                ChatPlatform::Lark => format!(
+                    "⛔ This chat group is not authorized to interact with Sugie Bot.\n\n\
+                     📍 **Chat ID**: `{ch_display}`\n\n\
+                     To authorize this group, an administrator must add this Chat ID to `lark_allowed_chats`."
+                ),
+                ChatPlatform::Discord => format!(
+                    "⛔ This channel is not authorized to interact with Sugie Bot.\n\n\
+                     📍 **Channel ID**: `{ch_display}`\n\n\
+                     To authorize this channel, an administrator must add this Channel ID to `discord_allowed_channels`."
+                ),
+                ChatPlatform::Zulip => format!(
+                    "⛔ This stream/channel is not authorized to interact with Sugie Bot.\n\n\
+                     📍 **Stream / Channel**: `{ch_display}`\n\n\
+                     To authorize this stream, an administrator must add it to `zulip_allowed_channels`."
+                ),
+                ChatPlatform::Api => "⛔ Unauthorized API channel.".to_string(),
+            };
+        }
+
         let known_repos = self.get_known_repositories();
         let cmd = ChatCommandParser::parse(&message.raw_content, &known_repos);
         let cmd_name = cmd.name();
@@ -787,6 +817,22 @@ impl<'a> ChatCommandExecutor<'a> {
             format!("/{}", cmd_cfg.restricted_commands.join(", /"))
         };
 
+        let mut ch_whitelist_summary = Vec::new();
+        if !cmd_cfg.lark_allowed_chats.is_empty() {
+            ch_whitelist_summary.push(format!("Lark: {} groups", cmd_cfg.lark_allowed_chats.len()));
+        }
+        if !cmd_cfg.discord_allowed_channels.is_empty() {
+            ch_whitelist_summary.push(format!("Discord: {} channels", cmd_cfg.discord_allowed_channels.len()));
+        }
+        if !cmd_cfg.zulip_allowed_channels.is_empty() {
+            ch_whitelist_summary.push(format!("Zulip: {} streams", cmd_cfg.zulip_allowed_channels.len()));
+        }
+        let ch_whitelist_str = if ch_whitelist_summary.is_empty() {
+            "Open (all groups/channels permitted)".to_string()
+        } else {
+            ch_whitelist_summary.join(" | ")
+        };
+
         format!(
             "### 🤖 Sugie Bot Status\n\n\
             - **Status**: 🟢 Running\n\
@@ -794,7 +840,8 @@ impl<'a> ChatCommandExecutor<'a> {
             - **Monitored Repositories**: {}\n\
             - **Notification Channels**: {}\n\
             {} - **Super Users**: {}\n\
-            - **Restricted Commands**: {}\n",
+            - **Restricted Commands**: {}\n\
+            - **Channel Whitelist**: {}\n",
             env!("CARGO_PKG_VERSION"),
             repos.len(),
             if ch_list.is_empty() {
@@ -805,6 +852,7 @@ impl<'a> ChatCommandExecutor<'a> {
             current_chat_info,
             super_str,
             mode_str,
+            ch_whitelist_str,
         )
     }
 
@@ -937,6 +985,47 @@ impl<'a> ChatCommandExecutor<'a> {
         }
 
         commands_cfg.super_users.iter().any(|su| matches_user(su))
+    }
+
+    pub fn is_channel_allowed(&self, message: &InboundChatMessage) -> bool {
+        Self::check_channel_allowed(
+            &self.config.default_rules.commands,
+            message.platform,
+            message.stream_or_channel.as_deref(),
+            &message.extra_channel_ids,
+        )
+    }
+
+    pub fn check_channel_allowed(
+        commands_cfg: &crate::config::CommandsConfig,
+        platform: ChatPlatform,
+        channel: Option<&str>,
+        extra_channel_ids: &[String],
+    ) -> bool {
+        let allowed_list: &[String] = match platform {
+            ChatPlatform::Lark => &commands_cfg.lark_allowed_chats,
+            ChatPlatform::Discord => &commands_cfg.discord_allowed_channels,
+            ChatPlatform::Zulip => &commands_cfg.zulip_allowed_channels,
+            ChatPlatform::Api => &[],
+        };
+
+        // If no whitelist is configured for this platform, all channels/groups are allowed
+        if allowed_list.is_empty() {
+            return true;
+        }
+
+        let ch = match channel {
+            Some(c) if !c.trim().is_empty() => c.trim(),
+            _ => return false,
+        };
+
+        allowed_list.iter().any(|allowed| {
+            let clean = allowed.trim();
+            clean.eq_ignore_ascii_case(ch)
+                || extra_channel_ids
+                    .iter()
+                    .any(|extra| clean.eq_ignore_ascii_case(extra.trim()))
+        })
     }
 
     async fn client_for(&self, repo: &str) -> Result<GitHubClient> {
@@ -1084,6 +1173,7 @@ impl<'a> ChatCommandExecutor<'a> {
             - Admin-only mode: {}\n\
             - Super users (GitHub): {}\n\
             - Platform admins: Lark ({}) · Discord ({}) · Zulip ({})\n\
+            - Whitelisted channels: Lark ({}) · Discord ({}) · Zulip ({})\n\
             - Restricted commands: {}\n\
             - Stale sweep: {} · Auto reviewers: {} · Auto labels: {}",
             s.host,
@@ -1107,6 +1197,9 @@ impl<'a> ChatCommandExecutor<'a> {
             if cmd_cfg.lark_super_users.is_empty() { "none".to_string() } else { cmd_cfg.lark_super_users.join(", ") },
             if cmd_cfg.discord_super_users.is_empty() { "none".to_string() } else { cmd_cfg.discord_super_users.join(", ") },
             if cmd_cfg.zulip_super_users.is_empty() { "none".to_string() } else { cmd_cfg.zulip_super_users.join(", ") },
+            if cmd_cfg.lark_allowed_chats.is_empty() { "all".to_string() } else { format!("{} chats", cmd_cfg.lark_allowed_chats.len()) },
+            if cmd_cfg.discord_allowed_channels.is_empty() { "all".to_string() } else { format!("{} channels", cmd_cfg.discord_allowed_channels.len()) },
+            if cmd_cfg.zulip_allowed_channels.is_empty() { "all".to_string() } else { format!("{} streams", cmd_cfg.zulip_allowed_channels.len()) },
             if s.restricted_commands.is_empty() {
                 "(none)".to_string()
             } else {
@@ -1780,6 +1873,7 @@ mod tests {
             raw_content: "@apichtopbot status".to_string(),
             stream_or_channel: Some("oc_123".to_string()),
             message_id: Some("om_123".to_string()),
+            extra_channel_ids: vec![],
         };
 
         let reply = executor.execute(&standard_user_msg).await;
@@ -1797,6 +1891,7 @@ mod tests {
             raw_content: "@apichtopbot chatid".to_string(),
             stream_or_channel: Some("oc_123".to_string()),
             message_id: Some("om_123".to_string()),
+            extra_channel_ids: vec![],
         };
         let reply_chatid = executor.execute(&chatid_msg).await;
         assert!(reply_chatid.contains("⛔ Sorry @Support, the command `/chatid` is restricted to authorized super users."));
@@ -1813,8 +1908,111 @@ mod tests {
             raw_content: "@apichtopbot status".to_string(),
             stream_or_channel: Some("oc_123".to_string()),
             message_id: Some("om_123".to_string()),
+            extra_channel_ids: vec![],
         };
         let super_reply = executor.execute(&super_user_msg).await;
         assert!(super_reply.contains("Sugie Bot Status"));
+    }
+
+    #[tokio::test]
+    async fn test_channel_whitelist_authorization() {
+        let mut config = SugieConfig::default();
+        config.default_rules.commands.lark_allowed_chats = vec!["oc_allowed_group".to_string()];
+        config.default_rules.commands.discord_allowed_channels = vec!["111222333".to_string(), "guild_999".to_string()];
+        config.default_rules.commands.zulip_allowed_channels = vec!["authorized_stream".to_string()];
+
+        let storage = crate::storage::Storage::new_in_memory().unwrap();
+        let auth = std::sync::Arc::new(crate::github::auth::GitHubAuthManager::new(1, "key".into()));
+        let notifier = crate::notifications::NotificationDispatcher::new(&config.notifications);
+        let triage = crate::triage::TriageService::new(std::sync::Arc::new(config.clone()), storage, notifier, auth);
+        let executor = ChatCommandExecutor::new(&config, &triage);
+
+        // 1. Lark in unauthorized group
+        let lark_blocked = InboundChatMessage {
+            platform: ChatPlatform::Lark,
+            sender: InboundSender {
+                id: "ou_user1".to_string(),
+                username: "User1".to_string(),
+                display_name: None,
+                extra_ids: vec![],
+            },
+            raw_content: "@bot help".to_string(),
+            stream_or_channel: Some("oc_unauthorized_group".to_string()),
+            message_id: None,
+            extra_channel_ids: vec![],
+        };
+        let reply1 = executor.execute(&lark_blocked).await;
+        assert!(reply1.contains("⛔ This chat group is not authorized to interact with Sugie Bot."));
+        assert!(reply1.contains("oc_unauthorized_group"));
+        assert!(reply1.contains("lark_allowed_chats"));
+
+        // 2. Lark in authorized group
+        let lark_allowed = InboundChatMessage {
+            platform: ChatPlatform::Lark,
+            sender: InboundSender {
+                id: "ou_user1".to_string(),
+                username: "User1".to_string(),
+                display_name: None,
+                extra_ids: vec![],
+            },
+            raw_content: "@bot help".to_string(),
+            stream_or_channel: Some("oc_allowed_group".to_string()),
+            message_id: None,
+            extra_channel_ids: vec![],
+        };
+        let reply2 = executor.execute(&lark_allowed).await;
+        assert!(reply2.contains("Sugie Bot Commands Reference"));
+
+        // 3. Discord in unauthorized channel and unauthorized guild
+        let discord_blocked = InboundChatMessage {
+            platform: ChatPlatform::Discord,
+            sender: InboundSender {
+                id: "123".to_string(),
+                username: "duser".to_string(),
+                display_name: None,
+                extra_ids: vec![],
+            },
+            raw_content: "/help".to_string(),
+            stream_or_channel: Some("888888".to_string()),
+            message_id: None,
+            extra_channel_ids: vec!["guild_other".to_string()],
+        };
+        let reply3 = executor.execute(&discord_blocked).await;
+        assert!(reply3.contains("⛔ This channel is not authorized to interact with Sugie Bot."));
+        assert!(reply3.contains("888888"));
+
+        // 4. Discord matched via guild_id in extra_channel_ids
+        let discord_guild_allowed = InboundChatMessage {
+            platform: ChatPlatform::Discord,
+            sender: InboundSender {
+                id: "123".to_string(),
+                username: "duser".to_string(),
+                display_name: None,
+                extra_ids: vec![],
+            },
+            raw_content: "/help".to_string(),
+            stream_or_channel: Some("888888".to_string()),
+            message_id: None,
+            extra_channel_ids: vec!["guild_999".to_string()],
+        };
+        let reply4 = executor.execute(&discord_guild_allowed).await;
+        assert!(reply4.contains("Sugie Bot Commands Reference"));
+
+        // 5. Zulip in authorized stream
+        let zulip_allowed = InboundChatMessage {
+            platform: ChatPlatform::Zulip,
+            sender: InboundSender {
+                id: "zuser@domain.com".to_string(),
+                username: "zuser".to_string(),
+                display_name: None,
+                extra_ids: vec![],
+            },
+            raw_content: "help".to_string(),
+            stream_or_channel: Some("authorized_stream".to_string()),
+            message_id: None,
+            extra_channel_ids: vec![],
+        };
+        let reply5 = executor.execute(&zulip_allowed).await;
+        assert!(reply5.contains("Sugie Bot Commands Reference"));
     }
 }

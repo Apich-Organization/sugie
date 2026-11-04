@@ -1242,6 +1242,9 @@ fn render_config_response(
         lark_super_users: cfg.default_rules.commands.lark_super_users.join("\n"),
         discord_super_users: cfg.default_rules.commands.discord_super_users.join("\n"),
         zulip_super_users: cfg.default_rules.commands.zulip_super_users.join("\n"),
+        lark_allowed_chats: cfg.default_rules.commands.lark_allowed_chats.join("\n"),
+        discord_allowed_channels: cfg.default_rules.commands.discord_allowed_channels.join("\n"),
+        zulip_allowed_channels: cfg.default_rules.commands.zulip_allowed_channels.join("\n"),
         restricted_commands: cfg.default_rules.commands.restricted_commands.join("\n"),
         stale_enabled: cfg.default_rules.stale.enabled,
         stale_days: cfg.default_rules.stale.warn_days.to_string(),
@@ -3104,6 +3107,18 @@ async fn save_structured(
         (
             "default_rules.commands.zulip_super_users".into(),
             config_store::Patch::List(lines("zulip_super_users")),
+        ),
+        (
+            "default_rules.commands.lark_allowed_chats".into(),
+            config_store::Patch::List(lines("lark_allowed_chats")),
+        ),
+        (
+            "default_rules.commands.discord_allowed_channels".into(),
+            config_store::Patch::List(lines("discord_allowed_channels")),
+        ),
+        (
+            "default_rules.commands.zulip_allowed_channels".into(),
+            config_store::Patch::List(lines("zulip_allowed_channels")),
         ),
         (
             "default_rules.commands.restricted_commands".into(),

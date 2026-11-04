@@ -190,6 +190,13 @@ pub async fn zulip_chat_handler(
         .and_then(|m| m.display_recipient.as_ref())
         .and_then(|v| v.as_str().map(|s| s.to_string()));
 
+    let mut extra_channel_ids = Vec::new();
+    if let Some(ref m) = payload.message {
+        if let Some(sid) = m.stream_id {
+            extra_channel_ids.push(sid.to_string());
+        }
+    }
+
     let inbound = InboundChatMessage {
         platform: ChatPlatform::Zulip,
         sender: InboundSender {
@@ -201,6 +208,7 @@ pub async fn zulip_chat_handler(
         raw_content,
         stream_or_channel: channel,
         message_id: None,
+        extra_channel_ids,
     };
 
     let executor = ChatCommandExecutor::new(&config, &state.triage);
@@ -549,6 +557,7 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
                 raw_content: raw_text,
                 stream_or_channel: chat_id,
                 message_id,
+                extra_channel_ids: Vec::new(),
             };
 
             let config_clone = config.clone();
@@ -713,6 +722,7 @@ pub async fn discord_chat_handler(
     };
 
     let channel_id = payload.get("channel_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let guild_id = payload.get("guild_id").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     info!(
         "Received Discord interaction from @{} (id: {}): {:?}",
@@ -722,6 +732,11 @@ pub async fn discord_chat_handler(
     let mut extra_ids = Vec::new();
     if user_id != username {
         extra_ids.push(username.clone());
+    }
+
+    let mut extra_channel_ids = Vec::new();
+    if let Some(gid) = guild_id {
+        extra_channel_ids.push(gid);
     }
 
     let inbound = InboundChatMessage {
@@ -735,6 +750,7 @@ pub async fn discord_chat_handler(
         raw_content: command_text,
         stream_or_channel: channel_id,
         message_id: None,
+        extra_channel_ids,
     };
 
     let executor = ChatCommandExecutor::new(&config, &state.triage);
@@ -894,6 +910,7 @@ pub async fn generic_chat_command_handler(
         raw_content: payload.command,
         stream_or_channel: None,
         message_id: None,
+        extra_channel_ids: Vec::new(),
     };
 
     let executor = ChatCommandExecutor::new(&config, &state.triage);

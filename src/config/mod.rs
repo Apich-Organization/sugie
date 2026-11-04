@@ -937,6 +937,15 @@ pub struct CommandsConfig {
     /// Platform-specific authorized super user emails or usernames in Zulip
     #[serde(default)]
     pub zulip_super_users: Vec<String>,
+    /// Whitelisted channel / group IDs for Lark (e.g. chat_id "oc_..."). If empty, all chats are allowed.
+    #[serde(default)]
+    pub lark_allowed_chats: Vec<String>,
+    /// Whitelisted channel or guild IDs for Discord. If empty, all channels are allowed.
+    #[serde(default)]
+    pub discord_allowed_channels: Vec<String>,
+    /// Whitelisted stream names or IDs for Zulip. If empty, all streams are allowed.
+    #[serde(default)]
+    pub zulip_allowed_channels: Vec<String>,
 }
 
 impl Default for CommandsConfig {
@@ -956,6 +965,9 @@ impl Default for CommandsConfig {
             lark_super_users: Vec::new(),
             discord_super_users: Vec::new(),
             zulip_super_users: Vec::new(),
+            lark_allowed_chats: Vec::new(),
+            discord_allowed_channels: Vec::new(),
+            zulip_allowed_channels: Vec::new(),
         }
     }
 }
@@ -1610,6 +1622,44 @@ impl SugieConfig {
                 .collect();
             if !list.is_empty() {
                 config.default_rules.commands.zulip_super_users = list;
+            }
+        }
+
+        // Whitelisted channels / groups for chat platforms
+        if let Ok(chats) = std::env::var("SUGIE_LARK_ALLOWED_CHATS")
+            .or_else(|_| std::env::var("SUGIE_LARK_ALLOWED_CHANNELS"))
+        {
+            let list: Vec<String> = chats
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !list.is_empty() {
+                config.default_rules.commands.lark_allowed_chats = list;
+            }
+        }
+
+        if let Ok(channels) = std::env::var("SUGIE_DISCORD_ALLOWED_CHANNELS") {
+            let list: Vec<String> = channels
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !list.is_empty() {
+                config.default_rules.commands.discord_allowed_channels = list;
+            }
+        }
+
+        if let Ok(channels) = std::env::var("SUGIE_ZULIP_ALLOWED_CHANNELS")
+            .or_else(|_| std::env::var("SUGIE_ZULIP_ALLOWED_STREAMS"))
+        {
+            let list: Vec<String> = channels
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !list.is_empty() {
+                config.default_rules.commands.zulip_allowed_channels = list;
             }
         }
 

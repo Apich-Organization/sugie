@@ -53,6 +53,9 @@ pub struct ConfigForm {
     pub lark_super_users: String,
     pub discord_super_users: String,
     pub zulip_super_users: String,
+    pub lark_allowed_chats: String,
+    pub discord_allowed_channels: String,
+    pub zulip_allowed_channels: String,
     pub restricted_commands: String,
     pub stale_enabled: bool,
     pub stale_days: String,
@@ -1285,6 +1288,18 @@ pub fn config_page(
                             <label class="field">
                                 <span>"Zulip Super Users (User email or ID, one per line)"</span>
                                 <textarea name="zulip_super_users" rows="3">{form.zulip_super_users.clone()}</textarea>
+                            </label>
+                            <label class="field">
+                                <span>"Lark Allowed Chats (Open Chat ID oc_..., one per line; empty for all)"</span>
+                                <textarea name="lark_allowed_chats" rows="2">{form.lark_allowed_chats.clone()}</textarea>
+                            </label>
+                            <label class="field">
+                                <span>"Discord Allowed Channels (Channel ID or Server ID, one per line; empty for all)"</span>
+                                <textarea name="discord_allowed_channels" rows="2">{form.discord_allowed_channels.clone()}</textarea>
+                            </label>
+                            <label class="field">
+                                <span>"Zulip Allowed Streams (Stream name or ID, one per line; empty for all)"</span>
+                                <textarea name="zulip_allowed_channels" rows="2">{form.zulip_allowed_channels.clone()}</textarea>
                             </label>
                             <label class="field">
                                 <span>"General / GitHub Super Users (one per line)"</span>
