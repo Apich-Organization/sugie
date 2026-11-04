@@ -183,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(|v| Arc::from(v.as_str()));
             match chat_api_token.as_deref() {
                 None => warn!(
-                    "POST /api/chat/command is unauthenticated — anyone who can reach this port can run chat commands. Set SUGIE_CHAT_API_TOKEN to require a shared secret."
+                    "SUGIE_CHAT_API_TOKEN is not set — POST /api/chat/command will reject unauthenticated calls. Set SUGIE_CHAT_API_TOKEN to require a shared secret."
                 ),
                 Some(t) if t.chars().count() < 16 => warn!(
                     "SUGIE_CHAT_API_TOKEN is shorter than 16 characters; use a long random value (e.g. `openssl rand -hex 32`)."
@@ -191,9 +191,8 @@ async fn main() -> anyhow::Result<()> {
                 Some(_) => {}
             }
 
-            // The platform webhooks authenticate with their own credentials, not
-            // with SUGIE_CHAT_API_TOKEN. Each one silently stops verifying when
-            // its secret is unset, so say so at boot rather than at incident time.
+            // The platform webhooks authenticate with their own credentials.
+            // Each one rejects deliveries when its secret is unset.
             if config.github.webhook_secret.trim().is_empty() {
                 warn!(
                     "SUGIE_GITHUB_WEBHOOK_SECRET is not set — /webhook rejects every delivery \
@@ -209,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
                 .is_empty()
             {
                 warn!(
-                    "SUGIE_ZULIP_OUTGOING_TOKEN is not set — POST /api/chat/zulip accepts unverified requests."
+                    "SUGIE_ZULIP_OUTGOING_TOKEN is not set — POST /api/chat/zulip will reject inbound requests."
                 );
             }
             if config
@@ -221,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
                 .is_empty()
             {
                 warn!(
-                    "SUGIE_LARK_VERIFICATION_TOKEN is not set — POST /api/chat/lark accepts unverified requests."
+                    "SUGIE_LARK_VERIFICATION_TOKEN is not set — POST /api/chat/lark will reject unauthenticated callbacks."
                 );
             }
             if config
@@ -246,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
                 .is_empty()
             {
                 warn!(
-                    "SUGIE_DISCORD_PUBLIC_KEY is not set — POST /api/chat/discord accepts unverified requests."
+                    "SUGIE_DISCORD_PUBLIC_KEY is not set — POST /api/chat/discord will reject unauthenticated interactions."
                 );
             }
 

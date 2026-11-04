@@ -342,6 +342,15 @@ impl<'a> CommandExecutor<'a> {
     }
 
     pub fn is_authorized(&self, command: &SlashCommand, sender: &User) -> bool {
+        let is_super = self.config.super_users.iter().any(|su| {
+            su.trim_start_matches('@')
+                .eq_ignore_ascii_case(&sender.login)
+        });
+
+        if self.config.admin_only && !is_super {
+            return false;
+        }
+
         let cmd_name = command.name();
 
         let is_restricted = self
@@ -350,15 +359,11 @@ impl<'a> CommandExecutor<'a> {
             .iter()
             .any(|r| r.trim_start_matches('/').eq_ignore_ascii_case(cmd_name));
 
-        if !is_restricted {
-            return true;
+        if is_restricted && !is_super {
+            return false;
         }
 
-        // If restricted, sender MUST be in super_users list
-        self.config.super_users.iter().any(|su| {
-            su.trim_start_matches('@')
-                .eq_ignore_ascii_case(&sender.login)
-        })
+        true
     }
 
     pub async fn execute(
@@ -1289,6 +1294,7 @@ fn normalize_lock_reason(raw: Option<&str>) -> std::result::Result<Option<&'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_command_parser_with_prefix_and_alias() {
@@ -1441,5 +1447,47 @@ mod tests {
         );
         assert_eq!(normalize_lock_reason(Some("spam")), Ok(Some("spam")));
         assert!(normalize_lock_reason(Some("because")).is_err());
+    }
+
+    #[test]
+    fn test_command_authorization_admin_only_and_restricted() {
+        let mut config = CommandsConfig::default();
+        config.super_users = vec!["admin_user".to_string()];
+        config.restricted_commands = vec!["close".to_string()];
+        config.admin_only = false;
+
+        let dummy_client = Arc::new(GitHubClient::new(
+            "test_token".to_string(),
+            Some("https://api.github.com".to_string()),
+        ));
+        let projects = ProjectsService::new(crate::config::ProjectsConfig::default());
+        let notifier = NotificationDispatcher::new(&crate::config::NotificationsConfig::default());
+        let executor = CommandExecutor::new(&dummy_client, &projects, &notifier, &config, None);
+
+        let regular_user = User {
+            login: "regular_user".to_string(),
+            id: 1,
+            r#type: None,
+        };
+        let admin_user = User {
+            login: "admin_user".to_string(),
+            id: 2,
+            r#type: None,
+        };
+
+        // Open command (/label) allowed for regular user when admin_only=false
+        assert!(executor.is_authorized(&SlashCommand::Label { add: vec!["bug".to_string()], remove: vec![] }, &regular_user));
+        // Restricted command (/close) denied for regular user
+        assert!(!executor.is_authorized(&SlashCommand::Close(None), &regular_user));
+        // Restricted command (/close) allowed for super user
+        assert!(executor.is_authorized(&SlashCommand::Close(None), &admin_user));
+
+        // When admin_only is enabled, even open commands require super user
+        let mut admin_only_config = config.clone();
+        admin_only_config.admin_only = true;
+        let executor_admin_only = CommandExecutor::new(&dummy_client, &projects, &notifier, &admin_only_config, None);
+
+        assert!(!executor_admin_only.is_authorized(&SlashCommand::Label { add: vec!["bug".to_string()], remove: vec![] }, &regular_user));
+        assert!(executor_admin_only.is_authorized(&SlashCommand::Label { add: vec!["bug".to_string()], remove: vec![] }, &admin_user));
     }
 }

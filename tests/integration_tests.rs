@@ -31,6 +31,15 @@ fn generate_test_signature(secret: &str, body: &[u8]) -> String {
     format!("sha256={}", hex::encode(result.into_bytes()))
 }
 
+fn test_discord_signing_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
+}
+
+fn test_discord_public_key_hex() -> String {
+    let key = test_discord_signing_key();
+    hex::encode(key.verifying_key().as_bytes())
+}
+
 fn create_test_state() -> (AppState, Storage) {
     let config = SugieConfig {
         host: "127.0.0.1".to_string(),
@@ -47,7 +56,7 @@ fn create_test_state() -> (AppState, Storage) {
             zulip_token: Some("test-zulip-token".to_string()),
             lark_verification_token: Some("test-lark-token".to_string()),
             lark_encrypt_key: Some("test-lark-encrypt-key-123456789".to_string()),
-            discord_public_key: None,
+            discord_public_key: Some(test_discord_public_key_hex()),
         },
         default_rules: RepoConfig::default(),
     };
@@ -60,7 +69,7 @@ fn create_test_state() -> (AppState, Storage) {
     let state = AppState {
         config: Arc::new(RwLock::new(config)),
         triage,
-        chat_api_token: None,
+        chat_api_token: Some(Arc::from("test-chat-token")),
         // The admin console is not mounted in these tests, so chat exchanges
         // have nowhere to be recorded — exactly the `create_router` case.
         web_db: None,
@@ -582,12 +591,23 @@ async fn test_inbound_discord_ping_interaction() {
     let ping_payload = serde_json::json!({
         "type": 1
     });
+    let body = serde_json::to_vec(&ping_payload).unwrap();
+    let timestamp = "1620000000";
+
+    use ed25519_dalek::Signer;
+    let signing_key = test_discord_signing_key();
+    let mut message = timestamp.as_bytes().to_vec();
+    message.extend_from_slice(&body);
+    let signature = signing_key.sign(&message);
+    let signature_hex = hex::encode(signature.to_bytes());
 
     let request = Request::builder()
         .method("POST")
         .uri("/api/chat/discord")
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&ping_payload).unwrap()))
+        .header("X-Signature-Ed25519", signature_hex)
+        .header("X-Signature-Timestamp", timestamp)
+        .body(Body::from(body))
         .unwrap();
 
     let response = app.oneshot(request).await.unwrap();
@@ -617,6 +637,7 @@ async fn test_generic_chat_command_endpoint() {
         .method("POST")
         .uri("/api/chat/command")
         .header("content-type", "application/json")
+        .header("x-sugie-chat-token", "test-chat-token")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
 
@@ -750,4 +771,67 @@ async fn test_status_does_not_disclose_repository_names() {
         "the anonymous status endpoint must not list repository names"
     );
     assert!(!String::from_utf8_lossy(&bytes).contains("private-repo"));
+}
+
+#[tokio::test]
+async fn test_unconfigured_chat_webhook_endpoints_reject_requests() {
+    let (mut state, _) = create_test_state();
+    state.chat_api_token = None;
+    let mut empty_config = state.config();
+    empty_config.chat.zulip_token = None;
+    empty_config.notifications.zulip = None;
+    empty_config.chat.discord_public_key = None;
+    empty_config.chat.lark_verification_token = None;
+    empty_config.chat.lark_encrypt_key = None;
+    *state.config.write().unwrap() = empty_config;
+
+    let app = create_router(state);
+
+    // 1. Generic chat API
+    let req_generic = Request::builder()
+        .uri("/api/chat/command")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"command":"status"}"#))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req_generic).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // 2. Discord interaction
+    let req_discord = Request::builder()
+        .uri("/api/chat/discord")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"type":1}"#))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req_discord).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // 3. Zulip webhook
+    let req_zulip = Request::builder()
+        .uri("/api/chat/zulip")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"data":"status"}"#))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req_zulip).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // 4. Lark callback (unencrypted)
+    let req_lark = Request::builder()
+        .uri("/api/chat/lark")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"type":"url_verification","challenge":"xyz"}"#))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(req_lark).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }

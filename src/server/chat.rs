@@ -109,30 +109,42 @@ pub async fn zulip_chat_handler(
                 .map(|v| v.trim_start_matches("Bearer ").trim())
         });
 
-    // Verify token if configured
-    if let Some(ref expected_token) = config.chat.zulip_token {
-        if !expected_token.is_empty() {
-            let bot_api_key = config
+    // Mandatory token verification
+    let expected_token = config
+        .chat
+        .zulip_token
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            config
                 .notifications
                 .zulip
                 .as_ref()
-                .map(|z| z.bot_api_key.as_str());
+                .map(|z| z.bot_api_key.as_str())
+                .filter(|k| !k.trim().is_empty())
+        });
 
-            let is_match = received_token == Some(expected_token.as_str())
-                || (bot_api_key.is_some() && received_token == bot_api_key);
-
-            if !is_match {
-                warn!(
-                    "Zulip webhook authentication failed: token mismatch! Expected: {:?}, received: {:?}. (Hint: verify SUGIE_ZULIP_OUTGOING_TOKEN in .env matches the bot token in Zulip)",
-                    expected_token,
-                    received_token
-                );
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({ "error": "Unauthorized: invalid Zulip token" })),
-                );
-            }
+    let expected_token = match expected_token {
+        Some(t) => t,
+        None => {
+            warn!(
+                "Rejected Zulip webhook: SUGIE_ZULIP_OUTGOING_TOKEN is not configured in .env, \
+                 so inbound requests cannot be authenticated"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "Zulip token is not configured" })),
+            );
         }
+    };
+
+    let is_match = received_token.map_or(false, |tok| secret_matches(tok, expected_token));
+    if !is_match {
+        warn!("Zulip webhook authentication failed: invalid Zulip token");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Unauthorized: invalid Zulip token" })),
+        );
     }
 
     let raw_content = payload
@@ -330,7 +342,7 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
         }
     };
 
-    let (payload, _was_encrypted) = if let Some(ref enc_str) = raw_payload.encrypt {
+    let (payload, was_encrypted) = if let Some(ref enc_str) = raw_payload.encrypt {
         let encrypt_key = match config.chat.lark_encrypt_key.as_deref() {
             Some(k) if !k.is_empty() => k,
             _ => {
@@ -369,23 +381,37 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
         (raw_payload, false)
     };
 
+    let expected_token = config
+        .chat
+        .lark_verification_token
+        .as_deref()
+        .filter(|t| !t.trim().is_empty());
+
+    // If payload is unencrypted, verification token is mandatory
+    if !was_encrypted && expected_token.is_none() {
+        warn!(
+            "Rejected unencrypted Lark callback: SUGIE_LARK_VERIFICATION_TOKEN is not configured in .env"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Lark verification token is not configured" })),
+        );
+    }
+
     // 1. Handle URL Verification Challenge from Lark Developer Console
     if payload.r#type.as_deref() == Some("url_verification") {
         if let Some(ref challenge) = payload.challenge {
-            if let Some(ref expected_token) = config.chat.lark_verification_token {
-                if !expected_token.is_empty() {
-                    let matches = payload
-                        .token
-                        .as_deref()
-                        .map(|t| t == expected_token)
-                        .unwrap_or(false);
-                    if !matches {
-                        warn!("Lark challenge verification token mismatch");
-                        return (
-                            StatusCode::UNAUTHORIZED,
-                            Json(json!({ "error": "Invalid Lark verification token" })),
-                        );
-                    }
+            if let Some(expected) = expected_token {
+                let matches = payload
+                    .token
+                    .as_deref()
+                    .map_or(false, |tok| secret_matches(tok, expected));
+                if !matches {
+                    warn!("Lark challenge verification token mismatch");
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "error": "Invalid Lark verification token" })),
+                    );
                 }
             }
             info!(
@@ -408,23 +434,22 @@ pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> im
     info!("Lark callback event received: type='{}'", event_type);
 
     // 2. Token verification for event callbacks
-    if let Some(ref expected_token) = config.chat.lark_verification_token {
-        if !expected_token.is_empty() {
-            let token_in_payload = payload
-                .header
-                .as_ref()
-                .and_then(|h| h.token.as_deref())
-                .or(payload.token.as_deref());
-            if token_in_payload != Some(expected_token.as_str()) {
-                warn!(
-                    "Lark event callback token verification failed: expected {:?}, got {:?}",
-                    expected_token, token_in_payload
-                );
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({ "error": "Invalid Lark token" })),
-                );
-            }
+    if let Some(expected) = expected_token {
+        let token_in_payload = payload
+            .header
+            .as_ref()
+            .and_then(|h| h.token.as_deref())
+            .or(payload.token.as_deref());
+        let matches = token_in_payload.map_or(false, |tok| secret_matches(tok, expected));
+        if !matches {
+            warn!(
+                "Lark event callback token verification failed: got {:?}",
+                token_in_payload
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Invalid Lark token" })),
+            );
         }
     }
 
@@ -588,34 +613,48 @@ pub async fn discord_chat_handler(
     body: Bytes,
 ) -> impl IntoResponse {
     let config = state.config();
-    // 1. Verify Ed25519 signature if Discord public key is configured
-    if let Some(ref pubkey_hex) = config.chat.discord_public_key {
-        if !pubkey_hex.is_empty() {
-            let sig_header = headers
-                .get("X-Signature-Ed25519")
-                .and_then(|v| v.to_str().ok());
-            let time_header = headers
-                .get("X-Signature-Timestamp")
-                .and_then(|v| v.to_str().ok());
+    // 1. Verify Ed25519 signature with configured Discord public key
+    let pubkey_hex = match config
+        .chat
+        .discord_public_key
+        .as_deref()
+        .filter(|k| !k.trim().is_empty())
+    {
+        Some(k) => k,
+        None => {
+            warn!(
+                "Rejected Discord interaction: SUGIE_DISCORD_PUBLIC_KEY is not configured in .env"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "Discord public key is not configured" })),
+            );
+        }
+    };
 
-            match (sig_header, time_header) {
-                (Some(sig), Some(time)) => {
-                    if !verify_discord_signature(pubkey_hex, sig, time, &body) {
-                        warn!("Discord signature verification failed");
-                        return (
-                            StatusCode::UNAUTHORIZED,
-                            Json(json!({ "error": "Invalid Discord signature" })),
-                        );
-                    }
-                }
-                _ => {
-                    warn!("Missing Discord signature headers");
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(json!({ "error": "Missing signature headers" })),
-                    );
-                }
+    let sig_header = headers
+        .get("X-Signature-Ed25519")
+        .and_then(|v| v.to_str().ok());
+    let time_header = headers
+        .get("X-Signature-Timestamp")
+        .and_then(|v| v.to_str().ok());
+
+    match (sig_header, time_header) {
+        (Some(sig), Some(time)) => {
+            if !verify_discord_signature(pubkey_hex, sig, time, &body) {
+                warn!("Discord signature verification failed");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Invalid Discord signature" })),
+                );
             }
+        }
+        _ => {
+            warn!("Missing Discord signature headers");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Missing signature headers" })),
+            );
         }
     }
 
@@ -805,40 +844,52 @@ pub async fn generic_chat_command_handler(
     headers: HeaderMap,
     Json(payload): Json<GenericCommandRequest>,
 ) -> impl IntoResponse {
-    // This endpoint can run `/comment`, `/assign`, `/close` and the rest of the
-    // chat command surface, so it must not stay open when a secret is
-    // configured. When none is configured the historical behaviour is kept and
-    // startup logs a warning.
-    if let Some(expected) = state.chat_api_token.as_deref() {
-        let provided = headers
-            .get("x-sugie-chat-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !secret_matches(provided, expected) {
-            // `{:?}` escapes control characters and the value is truncated, so a
-            // caller cannot forge or flood log lines through the sender field.
-            let claimed: Option<String> = payload
-                .sender
-                .as_deref()
-                .map(|s| s.chars().take(64).collect());
-            warn!("Rejected unauthenticated /api/chat/command call (sender={claimed:?})");
+    let expected = match state.chat_api_token.as_deref().filter(|t| !t.trim().is_empty()) {
+        Some(t) => t,
+        None => {
+            warn!("Rejected /api/chat/command: SUGIE_CHAT_API_TOKEN is not configured in .env");
             return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "Missing or invalid X-Sugie-Chat-Token"})),
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "Chat API token is not configured (set SUGIE_CHAT_API_TOKEN)" })),
             )
                 .into_response();
         }
+    };
+
+    let provided = headers
+        .get("x-sugie-chat-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !secret_matches(provided, expected) {
+        // `{:?}` escapes control characters and the value is truncated, so a
+        // caller cannot forge or flood log lines through the sender field.
+        let claimed: Option<String> = payload
+            .sender
+            .as_deref()
+            .map(|s| s.chars().take(64).collect());
+        warn!("Rejected unauthenticated /api/chat/command call (sender={claimed:?})");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Missing or invalid X-Sugie-Chat-Token"})),
+        )
+            .into_response();
     }
 
     let config = state.config();
     let sender_name = payload.sender.unwrap_or_else(|| "api_user".to_string());
+    // Prefix sender ID with api: so generic API requests cannot spoof GitHub or other platform identities
+    let sender_id = if sender_name.starts_with("api:") {
+        sender_name.clone()
+    } else {
+        format!("api:{}", sender_name)
+    };
     let inbound = InboundChatMessage {
         platform: ChatPlatform::Api,
         sender: InboundSender {
-            id: sender_name.clone(),
+            id: sender_id.clone(),
             username: sender_name,
             display_name: None,
-            extra_ids: Vec::new(),
+            extra_ids: vec![sender_id],
         },
         raw_content: payload.command,
         stream_or_channel: None,

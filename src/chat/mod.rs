@@ -564,7 +564,7 @@ impl<'a> ChatCommandExecutor<'a> {
             ChatCommand::Help => self.render_help(),
             ChatCommand::Status => self.render_status(Some(message)).await,
             ChatCommand::ChatId => self.render_chat_id(message),
-            ChatCommand::Repos => self.render_repos(),
+            ChatCommand::Repos => self.render_repos(is_super),
             ChatCommand::Workload { repo } => self.render_workload(repo.as_deref()),
             ChatCommand::Users { repo } => self.render_users(repo.as_deref()).await,
             ChatCommand::Metrics { repo } => self.render_metrics(repo.as_deref()).await,
@@ -598,10 +598,21 @@ impl<'a> ChatCommandExecutor<'a> {
         }
     }
 
+    pub fn is_repo_allowed(&self, repo: &str) -> bool {
+        if let Some(ref allowed) = self.config.notifications.allowed_repositories {
+            if !allowed.is_empty() {
+                return allowed.iter().any(|r| r.eq_ignore_ascii_case(repo));
+            }
+        }
+        true
+    }
+
     fn get_known_repositories(&self) -> Vec<String> {
         let mut repos = Vec::new();
         if let Some(ref allowed) = self.config.notifications.allowed_repositories {
-            repos.extend(allowed.clone());
+            if !allowed.is_empty() {
+                return allowed.clone();
+            }
         }
         if let Ok(db_repos) = self.triage.storage().list_repositories() {
             for (_, name, _) in db_repos {
@@ -797,27 +808,44 @@ impl<'a> ChatCommandExecutor<'a> {
         )
     }
 
-    fn render_repos(&self) -> String {
-        let repos = self
+    fn render_repos(&self, is_super: bool) -> String {
+        let mut repos = self
             .triage
             .storage()
             .list_repositories()
             .unwrap_or_default();
+
+        if let Some(ref allowed) = self.config.notifications.allowed_repositories {
+            if !allowed.is_empty() {
+                repos.retain(|(_, name, _)| allowed.iter().any(|a| a.eq_ignore_ascii_case(name)));
+            }
+        }
+
         if repos.is_empty() {
             return "📦 No repositories currently onboarded in local storage.".to_string();
         }
 
         let mut lines = vec![format!("📦 **Onboarded Repositories ({})**:", repos.len())];
         for (id, name, inst_id) in repos {
-            lines.push(format!(
-                "- `{}` (ID: {}, Installation: {})",
-                name, id, inst_id
-            ));
+            if is_super {
+                lines.push(format!(
+                    "- `{}` (ID: {}, Installation: {})",
+                    name, id, inst_id
+                ));
+            } else {
+                lines.push(format!("- `{}`", name));
+            }
         }
         lines.join("\n")
     }
 
     fn render_workload(&self, target_repo: Option<&str>) -> String {
+        if let Some(r) = target_repo {
+            if !self.is_repo_allowed(r) {
+                return format!("⛔ Access to repository `{r}` is not permitted by configuration.");
+            }
+        }
+
         let workloads = match self
             .triage
             .storage()
@@ -872,29 +900,32 @@ impl<'a> ChatCommandExecutor<'a> {
             if clean.is_empty() {
                 return false;
             }
-            let target = if let Some((p, rest)) = clean.split_once(':') {
-                let p_matches = match platform {
-                    ChatPlatform::Lark => {
-                        p.eq_ignore_ascii_case("lark") || p.eq_ignore_ascii_case("feishu")
-                    }
-                    ChatPlatform::Discord => p.eq_ignore_ascii_case("discord"),
-                    ChatPlatform::Zulip => p.eq_ignore_ascii_case("zulip"),
-                    ChatPlatform::Api => p.eq_ignore_ascii_case("api"),
-                };
-                if !p_matches {
-                    return false;
-                }
-                rest.trim()
-            } else {
-                clean
+            let (prefix_opt, target) = match clean.split_once(':') {
+                Some((p, rest)) => (Some(p), rest.trim()),
+                None => (None, clean),
             };
 
+            let platform_matches = match (prefix_opt, platform) {
+                (Some(p), ChatPlatform::Lark) => {
+                    p.eq_ignore_ascii_case("lark") || p.eq_ignore_ascii_case("feishu")
+                }
+                (Some(p), ChatPlatform::Discord) => p.eq_ignore_ascii_case("discord"),
+                (Some(p), ChatPlatform::Zulip) => p.eq_ignore_ascii_case("zulip"),
+                (Some(p), ChatPlatform::Api) => p.eq_ignore_ascii_case("api"),
+                // Unprefixed entries in super_users apply to GitHub and interactive platforms,
+                // but NOT to generic API requests (which require explicit api: prefix).
+                (None, ChatPlatform::Api) => false,
+                (None, _) => true,
+            };
+
+            if !platform_matches {
+                return false;
+            }
+
+            // Strictly check immutable IDs (id, unique username, extra_ids).
+            // Do NOT check display_name / nick, which can be modified by untrusted users.
             target.eq_ignore_ascii_case(&sender.id)
                 || target.eq_ignore_ascii_case(&sender.username)
-                || sender
-                    .display_name
-                    .as_deref()
-                    .map_or(false, |dn| target.eq_ignore_ascii_case(dn))
                 || sender
                     .extra_ids
                     .iter()
@@ -915,15 +946,22 @@ impl<'a> ChatCommandExecutor<'a> {
         }
     }
 
-    fn default_repo(&self, target: Option<&str>) -> Option<String> {
-        target
+    fn resolve_target_repo(&self, target: Option<&str>, cmd_hint: &str) -> Result<String, String> {
+        let repo = target
             .map(|s| s.to_string())
             .or_else(|| self.get_known_repositories().first().cloned())
+            .ok_or_else(|| format!("⚠️ Please specify repository: `{cmd_hint} <owner/repo>`."))?;
+
+        if !self.is_repo_allowed(&repo) {
+            return Err(format!("⛔ Access to repository `{repo}` is not permitted by configuration."));
+        }
+        Ok(repo)
     }
 
     async fn render_users(&self, target_repo: Option<&str>) -> String {
-        let Some(repo) = self.default_repo(target_repo) else {
-            return "⚠️ Please specify repository: `users <owner/repo>`.".to_string();
+        let repo = match self.resolve_target_repo(target_repo, "users") {
+            Ok(r) => r,
+            Err(e) => return e,
         };
         let Some((owner, repo_name)) = repo.split_once('/') else {
             return format!("⚠️ Invalid repository format `{}`.", repo);
@@ -1020,8 +1058,9 @@ impl<'a> ChatCommandExecutor<'a> {
     }
 
     async fn render_stats(&self, target_repo: Option<&str>) -> String {
-        let Some(repo) = self.default_repo(target_repo) else {
-            return "⚠️ Please specify repository: `stats <owner/repo>`.".to_string();
+        let repo = match self.resolve_target_repo(target_repo, "stats") {
+            Ok(r) => r,
+            Err(e) => return e,
         };
         let cache = crate::web::stats::StatsCache::default();
         let s = crate::web::stats::fetch(self.triage, &cache, &repo, true).await;
@@ -1090,8 +1129,9 @@ impl<'a> ChatCommandExecutor<'a> {
         if !rules.enabled {
             return "⚠️ Stale lifecycle rules are disabled (`default_rules.stale.enabled = false`).".to_string();
         }
-        let Some(repo) = self.default_repo(target_repo) else {
-            return "⚠️ Please specify repository: `stale <owner/repo>`.".to_string();
+        let repo = match self.resolve_target_repo(target_repo, "stale") {
+            Ok(r) => r,
+            Err(e) => return e,
         };
         let Some((owner, repo_name)) = repo.split_once('/') else {
             return format!("⚠️ Invalid repository format `{}`.", repo);
@@ -1127,6 +1167,9 @@ impl<'a> ChatCommandExecutor<'a> {
                 "⛔ Sorry @{}, `/comment` is restricted to authorized super users.\n\nYour User ID is `{}`.",
                 sender.username, sender.id
             );
+        }
+        if !self.is_repo_allowed(repo) {
+            return format!("⛔ Access to repository `{repo}` is not permitted by configuration.");
         }
         let Some((owner, repo_name)) = repo.split_once('/') else {
             return format!(
@@ -1172,12 +1215,9 @@ impl<'a> ChatCommandExecutor<'a> {
         page: usize,
     ) -> String {
         let cmd = if prs { "prs" } else { "issues" };
-        let repo = match target_repo {
-            Some(r) => r.to_string(),
-            None => match self.get_known_repositories().first() {
-                Some(first) => first.clone(),
-                None => return format!("⚠️ Please specify repository: `{cmd} <owner/repo>`."),
-            },
+        let repo = match self.resolve_target_repo(target_repo, cmd) {
+            Ok(r) => r,
+            Err(e) => return e,
         };
         let Some((owner, repo_name)) = repo.split_once('/') else {
             return format!("⚠️ Invalid repository format `{}`.", repo);
@@ -1269,16 +1309,9 @@ impl<'a> ChatCommandExecutor<'a> {
     }
 
     async fn render_metrics(&self, target_repo: Option<&str>) -> String {
-        let repo = match target_repo {
-            Some(r) => r.to_string(),
-            None => {
-                let known = self.get_known_repositories();
-                if let Some(first) = known.first() {
-                    first.clone()
-                } else {
-                    return "⚠️ Please specify repository: `metrics <owner/repo>`.".to_string();
-                }
-            }
+        let repo = match self.resolve_target_repo(target_repo, "metrics") {
+            Ok(r) => r,
+            Err(e) => return e,
         };
 
         let client = match self.triage.get_client_for_repo(&repo).await {
@@ -1333,6 +1366,10 @@ impl<'a> ChatCommandExecutor<'a> {
                     sender.username, cmd_name, sender.id
                 );
             }
+        }
+
+        if !self.is_repo_allowed(repo) {
+            return format!("⛔ Access to repository `{repo}` is not permitted by configuration.");
         }
 
         let (owner, repo_name) = match repo.split_once('/') {
@@ -1688,6 +1725,35 @@ mod tests {
             extra_ids: vec![],
         };
         assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &github_fallback));
+
+        // SECURITY: Attempting to spoof super user via mutable display_name / nickname MUST fail
+        let display_name_spoof_attempt = InboundSender {
+            id: "999999999".to_string(),
+            username: "attacker".to_string(),
+            display_name: Some("discord_mod".to_string()),
+            extra_ids: vec![],
+        };
+        assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &display_name_spoof_attempt));
+
+        // SECURITY: Generic API caller cannot spoof GitHub super_users ("octocat") without explicit api: prefix
+        let api_caller_spoof = InboundSender {
+            id: "api:octocat".to_string(),
+            username: "octocat".to_string(),
+            display_name: None,
+            extra_ids: vec!["api:octocat".to_string()],
+        };
+        assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Api, &api_caller_spoof));
+
+        // When explicitly configured with "api:service_bot", it matches
+        let mut api_super_cfg = commands_cfg.clone();
+        api_super_cfg.super_users.push("api:service_bot".to_string());
+        let api_caller_ok = InboundSender {
+            id: "api:service_bot".to_string(),
+            username: "service_bot".to_string(),
+            display_name: None,
+            extra_ids: vec!["api:service_bot".to_string()],
+        };
+        assert!(ChatCommandExecutor::check_super_user(&api_super_cfg, ChatPlatform::Api, &api_caller_ok));
     }
 
     #[tokio::test]
