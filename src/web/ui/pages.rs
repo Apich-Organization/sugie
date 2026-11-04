@@ -1200,16 +1200,20 @@ pub fn config_page(
         .iter()
         .map(|b| {
             let name = b.name.clone();
+            let download_url = format!("/admin/config/backup/download?name={}", urlencode(&name));
             view! {
                 <tr>
                     <td class="mono">{name.clone()}</td>
                     <td class="num">{format!("{} B", b.size)}</td>
                     <td class="hint">{b.modified.clone()}</td>
                     <td>
-                        <form method="post" action="/admin/config/restore" data-confirm="Restore this backup? Current configuration will be backed up first.">
-                            <input type="hidden" name="name" value=name.clone()/>
-                            <button class="btn sm ghost" type="submit">"Restore"</button>
-                        </form>
+                        <div style="display:flex;gap:6px;align-items:center">
+                            <a class="btn sm ghost" href=download_url download=name.clone() title="Download backup file">"Download"</a>
+                            <form method="post" action="/admin/config/restore" data-confirm="Restore this backup? Current configuration will be backed up first.">
+                                <input type="hidden" name="name" value=name.clone()/>
+                                <button class="btn sm ghost" type="submit">"Restore"</button>
+                            </form>
+                        </div>
                     </td>
                 </tr>
             }
@@ -2633,9 +2637,9 @@ pub fn notify_page(
         || lark_opt.bot_ok
         || zulip_opt.ok;
     let bot_default = discord_opt.bot_ok;
-    let wh_default = discord_opt.webhook_ok && !discord_opt.bot_ok;
+    let wh_default = discord_opt.webhook_ok;
     let lark_bot_default = lark_opt.bot_ok;
-    let lark_wh_default = lark_opt.webhook_ok && !lark_opt.bot_ok;
+    let lark_wh_default = lark_opt.webhook_ok;
 
     let lark_webhook_channels_view = if lark_opt.webhook_ok {
         let chs = lark_opt.webhooks.clone();
@@ -2643,13 +2647,12 @@ pub fn notify_page(
             <div style="margin-top:6px;padding-left:26px;display:flex;flex-direction:column;gap:6px">
                 <span style="font-size:12px;color:var(--text-muted, #888)">"Select Lark Webhook(s):"</span>
                 <div style="display:flex;flex-wrap:wrap;gap:12px">
-                    {chs.into_iter().enumerate().map(|(idx, wh)| {
+                    {chs.into_iter().map(|wh| {
                         let name_attr = format!("ch_lark_wh_{}", wh.name.replace(' ', "_"));
                         let label = wh.name.clone();
-                        let is_first = idx == 0;
                         view! {
                             <label class="check" style="font-size:13px">
-                                <input type="checkbox" name=name_attr checked=is_first/>
+                                <input type="checkbox" name=name_attr checked=true/>
                                 <span>{label}</span>
                             </label>
                         }
@@ -2676,13 +2679,12 @@ pub fn notify_page(
                 <div style="margin-top:6px;padding-left:26px;display:flex;flex-direction:column;gap:6px">
                     <span style="font-size:12px;color:var(--text-muted, #888)">"Select Lark Bot Chat(s):"</span>
                     <div style="display:flex;flex-wrap:wrap;gap:12px">
-                        {chs.into_iter().enumerate().map(|(idx, lc)| {
+                        {chs.into_iter().map(|lc| {
                             let name_attr = format!("ch_lark_bot_{}", lc.name.replace(' ', "_"));
                             let label = format!("{} ({})", lc.name, lc.chat_id);
-                            let is_first = idx == 0;
                             view! {
                                 <label class="check" style="font-size:13px">
-                                    <input type="checkbox" name=name_attr checked=is_first/>
+                                    <input type="checkbox" name=name_attr checked=true/>
                                     <span>{label}</span>
                                 </label>
                             }
@@ -2701,13 +2703,12 @@ pub fn notify_page(
             <div style="margin-top:6px;padding-left:26px;display:flex;flex-direction:column;gap:6px">
                 <span style="font-size:12px;color:var(--text-muted, #888)">"Select Zulip Destination(s):"</span>
                 <div style="display:flex;flex-wrap:wrap;gap:12px">
-                    {chs.into_iter().enumerate().map(|(idx, zc)| {
+                    {chs.into_iter().map(|zc| {
                         let name_attr = format!("ch_zulip_ch_{}", zc.name.replace(' ', "_"));
                         let label = format!("{} (#{} > {})", zc.name, zc.channel, zc.topic);
-                        let is_first = idx == 0;
                         view! {
                             <label class="check" style="font-size:13px">
-                                <input type="checkbox" name=name_attr checked=is_first/>
+                                <input type="checkbox" name=name_attr checked=true/>
                                 <span>{label}</span>
                             </label>
                         }
@@ -2725,13 +2726,12 @@ pub fn notify_page(
             <div style="margin-top:6px;padding-left:26px;display:flex;flex-direction:column;gap:6px">
                 <span style="font-size:12px;color:var(--text-muted, #888)">"Select Webhook Channel(s):"</span>
                 <div style="display:flex;flex-wrap:wrap;gap:12px">
-                    {chs.into_iter().enumerate().map(|(idx, wh)| {
+                    {chs.into_iter().map(|wh| {
                         let name_attr = format!("ch_discord_wh_{}", wh.name.replace(' ', "_"));
                         let label = wh.name.clone();
-                        let is_first = idx == 0;
                         view! {
                             <label class="check" style="font-size:13px">
-                                <input type="checkbox" name=name_attr checked=is_first/>
+                                <input type="checkbox" name=name_attr checked=true/>
                                 <span>{label}</span>
                             </label>
                         }
@@ -2749,13 +2749,12 @@ pub fn notify_page(
             <div style="margin-top:6px;padding-left:26px;display:flex;flex-direction:column;gap:6px">
                 <span style="font-size:12px;color:var(--text-muted, #888)">"Select Bot Channel(s):"</span>
                 <div style="display:flex;flex-wrap:wrap;gap:12px">
-                    {chs.into_iter().enumerate().map(|(idx, bc)| {
+                    {chs.into_iter().map(|bc| {
                         let name_attr = format!("ch_discord_bot_{}", bc.name.replace(' ', "_"));
                         let label = format!("{} ({})", bc.name, bc.channel_id);
-                        let is_first = idx == 0;
                         view! {
                             <label class="check" style="font-size:13px">
-                                <input type="checkbox" name=name_attr checked=is_first/>
+                                <input type="checkbox" name=name_attr checked=true/>
                                 <span>{label}</span>
                             </label>
                         }
@@ -2895,5 +2894,109 @@ mod tests {
             html.contains(r#"maxlength="8""#),
             "auto-submit length and maxlength must agree"
         );
+    }
+
+    #[test]
+    fn test_notify_page_defaults_all_chats_and_channels_selected() {
+        let user = CurrentUser {
+            id: 1,
+            username: "admin".to_string(),
+            display_name: "Admin".to_string(),
+            role: crate::web::perms::Role::Owner,
+            repos: vec![],
+            commands: vec![],
+            two_fa_policy: "none".to_string(),
+            totp_enabled: false,
+            passkey_count: 0,
+            needs_2fa_setup: false,
+        };
+        let discord_opt = DiscordNotifyOptions {
+            webhook_ok: true,
+            webhooks: vec![crate::notifications::discord::DiscordWebhookChannel {
+                name: "dev-alerts".into(),
+                url: "https://discord.com/api/webhooks/1/abc".into(),
+            }],
+            bot_ok: true,
+            bot_channels: vec![crate::notifications::discord::DiscordBotChannel {
+                name: "announcements".into(),
+                channel_id: "123456789".into(),
+            }],
+        };
+        let lark_opt = LarkNotifyOptions {
+            webhook_ok: true,
+            webhooks: vec![crate::config::LarkWebhookChannel {
+                name: "eng-team".into(),
+                url: "https://open.larksuite.com/open-apis/bot/v2/hook/abc".into(),
+                secret: None,
+            }],
+            bot_ok: true,
+            bot_channels: vec![crate::notifications::LarkChannelConfig {
+                name: "general-bot".into(),
+                chat_id: "oc_123".into(),
+            }],
+        };
+        let zulip_opt = ZulipNotifyOptions {
+            ok: true,
+            channels: vec![crate::notifications::zulip::ZulipChannelConfig {
+                name: "zulip-alerts".into(),
+                channel: "alerts".into(),
+                topic: "general".into(),
+            }],
+        };
+
+        let html = crate::web::ui::render(notify_page(
+            user,
+            discord_opt,
+            lark_opt,
+            zulip_opt,
+            None,
+        ));
+
+        // All platform checkboxes must be checked
+        assert!(html.contains(r#"name="ch_lark_webhook" checked"#));
+        assert!(html.contains(r#"name="ch_lark_bot" checked"#));
+        assert!(html.contains(r#"name="ch_zulip" checked"#));
+        assert!(html.contains(r#"name="ch_discord_webhook" checked"#));
+        assert!(html.contains(r#"name="ch_discord_bot" checked"#));
+
+        // All channels must be checked by default
+        assert!(html.contains(r#"name="ch_lark_wh_eng-team" checked"#));
+        assert!(html.contains(r#"name="ch_lark_bot_general-bot" checked"#));
+        assert!(html.contains(r#"name="ch_zulip_ch_zulip-alerts" checked"#));
+        assert!(html.contains(r#"name="ch_discord_wh_dev-alerts" checked"#));
+        assert!(html.contains(r#"name="ch_discord_bot_announcements" checked"#));
+    }
+
+    #[test]
+    fn test_config_backup_download_link_rendered() {
+        let user = CurrentUser {
+            id: 1,
+            username: "admin".to_string(),
+            display_name: "Admin".to_string(),
+            role: crate::web::perms::Role::Owner,
+            repos: vec![],
+            commands: vec![],
+            two_fa_policy: "none".to_string(),
+            totp_enabled: false,
+            passkey_count: 0,
+            needs_2fa_setup: false,
+        };
+        let backups = vec![crate::web::config_store::BackupInfo {
+            name: "sugie.toml.2026-11-04T12-00-00".into(),
+            size: 1024,
+            modified: "2026-11-04 12:00:00".into(),
+        }];
+        let html = crate::web::ui::render(config_page(
+            user,
+            "backup".into(),
+            ConfigForm::default(),
+            "".into(),
+            vec![],
+            backups,
+            None,
+        ));
+        assert!(html.contains(r#"href="/admin/config/backup/download?name=sugie.toml.2026-11-04T12-00-00""#));
+        assert!(html.contains(r#"download="sugie.toml.2026-11-04T12-00-00""#));
+        assert!(html.contains("Restore"));
     }
 }

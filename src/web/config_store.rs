@@ -333,6 +333,19 @@ impl ConfigFiles {
         atomic_write(target, &content)?;
         Ok(())
     }
+
+    pub fn read_backup(&self, name: &str) -> Result<Vec<u8>> {
+        // Reject traversal: backups are flat file names only.
+        if name.contains('/') || name.contains('\\') || name.contains("..") || name.is_empty() {
+            return Err(anyhow!("Invalid backup filename"));
+        }
+        let src = self.backup_dir.join(name);
+        if !src.is_file() {
+            return Err(anyhow!("Backup does not exist: {name}"));
+        }
+        let bytes = std::fs::read(&src)?;
+        Ok(bytes)
+    }
 }
 
 /// A single value change applied to `sugie.toml` while preserving comments and
@@ -583,5 +596,40 @@ mod tests {
         assert!(!is_secret_key("SUGIE_ZULIP_SITE_URL"));
         assert!(!is_secret_key("SUGIE_ZULIP_BOT_EMAIL"));
         assert!(!is_secret_key("SUGIE_SUPER_USERS"));
+    }
+
+    #[test]
+    fn test_read_backup_security_and_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join("config-backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        let toml_file = tmp.path().join("sugie.toml");
+        let env_file = tmp.path().join(".env");
+        std::fs::write(&toml_file, "[server]\nport = 8080\n").unwrap();
+        std::fs::write(&env_file, "FOO=BAR\n").unwrap();
+
+        let files = ConfigFiles {
+            toml_path: toml_file,
+            env_path: env_file,
+            backup_dir: backup_dir.clone(),
+        };
+
+        // Write a test backup
+        let backup_file = backup_dir.join("sugie.toml.2026-11-04");
+        std::fs::write(&backup_file, "BACKUP_CONTENT").unwrap();
+
+        // Path traversal attempts must be rejected
+        assert!(files.read_backup("../etc/passwd").is_err());
+        assert!(files.read_backup("..\\windows\\system32").is_err());
+        assert!(files.read_backup("sub/file").is_err());
+        assert!(files.read_backup("").is_err());
+
+        // Valid read
+        let bytes = files.read_backup("sugie.toml.2026-11-04").unwrap();
+        assert_eq!(bytes, b"BACKUP_CONTENT");
+
+        // Missing file
+        assert!(files.read_backup("nonexistent").is_err());
     }
 }

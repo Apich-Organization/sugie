@@ -159,6 +159,8 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/config/toml", post(save_toml))
         .route("/admin/config/env", post(save_env))
         .route("/admin/config/restore", post(restore_backup))
+        .route("/admin/config/backup/download", get(download_backup))
+        .route("/admin/config/download", get(download_backup))
         .route("/admin/users/create", post(create_user))
         .route("/admin/users/update", post(update_user))
         .route("/admin/users/delete", post(delete_user))
@@ -3372,6 +3374,67 @@ async fn restore_backup(
             config_tab_flash("backup", true, &format!("Restored to {name} — configuration hot-reloaded!"))
         }
         Err(e) => config_tab_flash("backup", false, &format!("Failed to restore backup: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct DownloadBackupQuery {
+    #[serde(default)]
+    name: String,
+}
+
+async fn download_backup(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<DownloadBackupQuery>,
+) -> Response {
+    let user = match gate_admin(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let name = query.name.trim();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Missing backup name").into_response();
+    }
+    match state.files.read_backup(name) {
+        Ok(bytes) => {
+            state.db.audit(
+                &user.username,
+                "config.backup_download",
+                name,
+                "Download config backup",
+                &auth::client_ip(&headers),
+                true,
+            );
+            let safe_filename = name.replace(['"', '\r', '\n', '/', '\\'], "");
+            let disposition = format!("attachment; filename=\"{safe_filename}\"");
+            (
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    ),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        HeaderValue::try_from(disposition)
+                            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => {
+            state.db.audit(
+                &user.username,
+                "config.backup_download",
+                name,
+                &format!("Download failed: {e}"),
+                &auth::client_ip(&headers),
+                false,
+            );
+            (StatusCode::NOT_FOUND, format!("Backup not found: {e}")).into_response()
+        }
     }
 }
 
