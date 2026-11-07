@@ -194,8 +194,8 @@ async fn require_same_origin(req: Request, next: Next) -> Response {
 
     let host = req
         .headers()
-        .get("x-forwarded-host")
-        .or_else(|| req.headers().get(header::HOST))
+        .get(header::HOST)
+        .or_else(|| req.headers().get("x-forwarded-host"))
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .trim()
@@ -1923,12 +1923,7 @@ async fn api_passkey_auth_finish(
                 true,
             );
             let next_raw = req.next.unwrap_or_else(|| "/admin".to_string());
-            let redirect_url =
-                if next_raw.starts_with("/admin") && !next_raw.starts_with("/admin/login") {
-                    next_raw
-                } else {
-                    "/admin".to_string()
-                };
+            let redirect_url = safe_next(&next_raw);
             let mut resp = Json(json!({ "ok": true, "redirect": redirect_url })).into_response();
             if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(
                 &session_token,
@@ -2539,7 +2534,11 @@ async fn notify_send(
         msg.push_str(&format!("Sent to {}. ", sent.join(", ")));
     }
     if !failed.is_empty() {
-        msg.push_str(&format!("Failed: {}", failed.join("; ")));
+        let clean_failed: Vec<_> = failed
+            .iter()
+            .map(|f| crate::notifications::sanitize_error_str(f))
+            .collect();
+        msg.push_str(&format!("Failed: {}", clean_failed.join("; ")));
     }
     notify_flash(ok, msg.trim())
 }
@@ -2638,8 +2637,9 @@ async fn purge_audit_logs(
 
 fn csv_cell(v: &str) -> String {
     let mut s = v.to_string();
+    let trimmed = s.trim_start();
     // Neutralise spreadsheet formula injection.
-    if matches!(s.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r')) {
+    if matches!(trimmed.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r')) {
         s.insert(0, '\'');
     }
     format!("\"{}\"", s.replace('"', "\"\""))
@@ -3356,6 +3356,9 @@ async fn restore_backup(
         Err(r) => return r,
     };
     let name = form.get("name").cloned().unwrap_or_default();
+    if name.starts_with(".env") && !user.is_owner() {
+        return config_tab_flash("backup", false, "Restoring .env backups containing secrets requires Owner role.");
+    }
     match state.files.restore_backup(&name) {
         Ok(_) => {
             if let Ok(content) = state.files.read_toml() {
@@ -3395,6 +3398,22 @@ async fn download_backup(
     let name = query.name.trim();
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "Missing backup name").into_response();
+    }
+    // .env backups contain plaintext production secrets; only workspace Owners may download them.
+    if name.starts_with(".env") && !user.is_owner() {
+        state.db.audit(
+            &user.username,
+            "config.backup_download",
+            name,
+            "Blocked download of .env backup (Owner role required)",
+            &auth::client_ip(&headers),
+            false,
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "Downloading .env backups with plaintext secrets requires Owner role.",
+        )
+            .into_response();
     }
     match state.files.read_backup(name) {
         Ok(bytes) => {

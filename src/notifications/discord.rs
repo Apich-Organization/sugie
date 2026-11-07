@@ -53,7 +53,7 @@ impl DiscordNotifier {
     pub fn new(config: DiscordConfig) -> Self {
         Self {
             config,
-            http: Client::new(),
+            http: crate::notifications::create_notification_http_client(),
         }
     }
 
@@ -219,6 +219,10 @@ impl DiscordNotifier {
         title: &str,
         is_report: bool,
     ) -> Result<()> {
+        if !crate::notifications::is_safe_webhook_url(target_url) {
+            anyhow::bail!("Blocked unsafe or non-HTTPS webhook destination (SSRF protection)");
+        }
+
         let mut request = self.http.post(target_url).json(payload);
         if let Some(auth) = auth {
             request = request.header(reqwest::header::AUTHORIZATION, auth);
@@ -231,13 +235,14 @@ impl DiscordNotifier {
         let resp = match send_res {
             Ok(r) => r,
             Err(e) => {
+                let safe_err = crate::notifications::sanitize_error_str(&e);
                 crate::security_log::log_notification_request(
                     "discord",
                     "POST",
                     target_url,
                     0,
                     duration_ms,
-                    &format!("title={title} error={e}"),
+                    &format!("title={title} error={safe_err}"),
                 );
                 return Err(e).context("Failed to send webhook to Discord");
             }
@@ -246,13 +251,14 @@ impl DiscordNotifier {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            let safe_body = crate::notifications::sanitize_error_str(&body);
             crate::security_log::log_notification_request(
                 "discord",
                 "POST",
                 target_url,
                 status.as_u16(),
                 duration_ms,
-                &format!("title={title} error={body}"),
+                &format!("title={title} error={safe_body}"),
             );
             let hint = match status.as_u16() {
                 401 => " (bot token rejected)",

@@ -27,7 +27,7 @@ fn is_duplicate_lark_message(msg_id: &str) -> bool {
     }
     let mut cache = LARK_DEDUP_CACHE.lock().unwrap();
     let now = std::time::Instant::now();
-    cache.retain(|_, seen_at| now.duration_since(*seen_at).as_secs() < 120);
+    cache.retain(|_, seen_at| now.duration_since(*seen_at).as_secs() < 600);
     if cache.contains_key(msg_id) {
         true
     } else {
@@ -109,20 +109,13 @@ pub async fn zulip_chat_handler(
                 .map(|v| v.trim_start_matches("Bearer ").trim())
         });
 
-    // Mandatory token verification
+    // Mandatory token verification: strictly require SUGIE_ZULIP_OUTGOING_TOKEN.
+    // Do NOT fall back to outbound bot_api_key to prevent credential cross-contamination.
     let expected_token = config
         .chat
         .zulip_token
         .as_deref()
-        .filter(|t| !t.trim().is_empty())
-        .or_else(|| {
-            config
-                .notifications
-                .zulip
-                .as_ref()
-                .map(|z| z.bot_api_key.as_str())
-                .filter(|k| !k.trim().is_empty())
-        });
+        .filter(|t| !t.trim().is_empty());
 
     let expected_token = match expected_token {
         Some(t) => t,
@@ -337,8 +330,32 @@ pub fn encrypt_lark_challenge(encrypt_key: &str, challenge: &str) -> anyhow::Res
     encrypt_lark_payload(encrypt_key, &plaintext)
 }
 
-pub async fn lark_chat_handler(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+pub async fn lark_chat_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
     let config = state.config();
+
+    // Check timestamp freshness if Lark timestamp header is present (replay attack defense)
+    if let Some(ts_str) = headers
+        .get("X-Lark-Request-Timestamp")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Ok(ts_sec) = ts_str.trim().parse::<i64>() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if (now - ts_sec).abs() > 300 {
+                warn!("Rejected Lark callback: timestamp is outside +/- 300s window");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Lark timestamp out of range" })),
+                );
+            }
+        }
+    }
     let raw_payload: LarkCallbackRequest = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -784,6 +801,29 @@ fn verify_discord_signature(
     timestamp: &str,
     body: &[u8],
 ) -> bool {
+    // Validate timestamp freshness (within +/- 300 seconds of current system time)
+    // to prevent replay attacks of captured interactions.
+    let ts_num: i64 = match timestamp.trim().parse() {
+        Ok(t) => t,
+        Err(_) => {
+            warn!("Discord signature verification rejected: invalid timestamp integer '{}'", timestamp);
+            return false;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if (now - ts_num).abs() > 300 {
+        warn!(
+            "Discord signature timestamp rejected (replay attack prevention): timestamp {} is {}s from current time {}",
+            ts_num,
+            now - ts_num,
+            now
+        );
+        return false;
+    }
+
     let pk_clean = public_key_hex.trim();
     let pk_bytes = match hex::decode(pk_clean) {
         Ok(b) if b.len() == 32 => {

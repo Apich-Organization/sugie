@@ -11,6 +11,66 @@ use crate::config::NotificationsConfig;
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
 
+pub fn create_notification_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+pub fn is_safe_webhook_url(raw_url: &str) -> bool {
+    let parsed = match url::Url::parse(raw_url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let host = match parsed.host() {
+        Some(h) => h,
+        None => return false,
+    };
+    match host {
+        url::Host::Ipv4(ip) => {
+            if ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+            {
+                return false;
+            }
+        }
+        url::Host::Ipv6(ip) => {
+            if ip.is_loopback() || ip.is_unspecified() {
+                return false;
+            }
+        }
+        url::Host::Domain(d) => {
+            let lower = d.to_ascii_lowercase();
+            if lower == "localhost"
+                || lower.ends_with(".localhost")
+                || lower.ends_with(".local")
+                || lower == "metadata.google.internal"
+                || lower == "instance-data"
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+pub fn sanitize_error_str(err: &dyn std::fmt::Display) -> String {
+    let s = err.to_string();
+    if let Some(idx) = s.find("for url (") {
+        format!("{} (URL redacted)", &s[..idx])
+    } else {
+        s
+    }
+}
+
 struct DispatcherInner {
     discord: Option<DiscordNotifier>,
     zulip: Option<ZulipNotifier>,
@@ -350,5 +410,39 @@ impl NotificationDispatcher {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_webhook_url() {
+        // Safe HTTPS URLs
+        assert!(is_safe_webhook_url("https://discord.com/api/webhooks/123/token"));
+        assert!(is_safe_webhook_url("https://open.larksuite.com/open-apis/bot/v2/hook/abc"));
+        assert!(is_safe_webhook_url("https://zulip.example.com/api/v1/messages"));
+
+        // Insecure scheme
+        assert!(!is_safe_webhook_url("http://discord.com/api/webhooks/123/token"));
+        assert!(!is_safe_webhook_url("ftp://example.com"));
+
+        // Loopback and private / link-local addresses (SSRF)
+        assert!(!is_safe_webhook_url("https://127.0.0.1/webhook"));
+        assert!(!is_safe_webhook_url("https://localhost/webhook"));
+        assert!(!is_safe_webhook_url("https://169.254.169.254/latest/meta-data"));
+        assert!(!is_safe_webhook_url("https://10.0.0.1/admin"));
+        assert!(!is_safe_webhook_url("https://192.168.1.1/internal"));
+        assert!(!is_safe_webhook_url("https://172.16.0.1/secret"));
+        assert!(!is_safe_webhook_url("https://metadata.google.internal/computeMetadata"));
+    }
+
+    #[test]
+    fn test_sanitize_error_str() {
+        let err_with_url = "error sending request for url (https://discord.com/api/webhooks/123/SECRET_KEY): connection timeout";
+        let cleaned = sanitize_error_str(&err_with_url);
+        assert!(!cleaned.contains("SECRET_KEY"));
+        assert!(cleaned.contains("(URL redacted)"));
     }
 }

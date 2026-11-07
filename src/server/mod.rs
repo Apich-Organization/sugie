@@ -70,6 +70,14 @@ pub fn create_router_with_web(state: AppState, web: Option<crate::web::WebState>
         .layer(TraceLayer::new_for_http())
 }
 
+fn sanitize_log_val(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() || c == '\r' || c == '\n' { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 async fn security_http_log_middleware(
     State(web_db): State<Option<crate::web::db::WebDb>>,
     req: axum::extract::Request,
@@ -87,20 +95,21 @@ async fn security_http_log_middleware(
         .unwrap_or_else(|| path.clone());
 
     let headers = req.headers();
-    let ip = crate::web::auth::client_ip(headers);
-    let ua = headers
-        .get(axum::http::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    let ip = sanitize_log_val(&crate::web::auth::client_ip(headers));
+    let ua = sanitize_log_val(
+        headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-"),
+    );
     let gh_event = headers
         .get("X-GitHub-Event")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .map(|s| sanitize_log_val(s));
     let gh_delivery = headers
         .get("X-GitHub-Delivery")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .map(|s| sanitize_log_val(s));
 
     // One session lookup for the whole request: the audit log needs the actor
     // and the page handlers need the principal.
@@ -117,11 +126,12 @@ async fn security_http_log_middleware(
     } else if path.starts_with("/api/chat/zulip") {
         "zulip-webhook".to_string()
     } else if web_db.is_some() {
-        principal
-            .as_ref()
-            .and_then(|p| p.username())
-            .unwrap_or("anonymous")
-            .to_string()
+        sanitize_log_val(
+            principal
+                .as_ref()
+                .and_then(|p| p.username())
+                .unwrap_or("anonymous"),
+        )
     } else {
         "anonymous".to_string()
     };
@@ -194,6 +204,29 @@ async fn status_check(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+static GITHUB_DEDUP_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn is_duplicate_github_delivery(delivery_id: &str) -> bool {
+    let clean = delivery_id.trim();
+    if clean.is_empty() {
+        return false;
+    }
+    let mut cache = match GITHUB_DEDUP_CACHE.lock() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let now = std::time::Instant::now();
+    cache.retain(|_, seen_at| now.duration_since(*seen_at).as_secs() < 600);
+    if cache.contains_key(clean) {
+        true
+    } else {
+        cache.insert(clean.to_string(), now);
+        false
+    }
+}
+
 async fn github_webhook_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -240,6 +273,20 @@ async fn github_webhook_handler(
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "Invalid webhook signature" })),
         );
+    }
+
+    // Deduplicate deliveries using X-GitHub-Delivery (replay attack prevention)
+    if let Some(delivery) = headers
+        .get("X-GitHub-Delivery")
+        .and_then(|v| v.to_str().ok())
+    {
+        if is_duplicate_github_delivery(delivery) {
+            info!("Ignoring replayed GitHub webhook delivery: {}", delivery);
+            return (
+                StatusCode::OK,
+                Json(json!({ "message": "Duplicate delivery ignored" })),
+            );
+        }
     }
 
     if event_name == "ping" {

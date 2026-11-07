@@ -943,7 +943,7 @@ impl<'a> ChatCommandExecutor<'a> {
             ChatPlatform::Api => &[],
         };
 
-        let matches_user = |su: &str| {
+        let matches_user = |su: &str, is_platform_specific: bool| {
             let clean = su.trim().trim_start_matches('@');
             if clean.is_empty() {
                 return false;
@@ -960,10 +960,10 @@ impl<'a> ChatCommandExecutor<'a> {
                 (Some(p), ChatPlatform::Discord) => p.eq_ignore_ascii_case("discord"),
                 (Some(p), ChatPlatform::Zulip) => p.eq_ignore_ascii_case("zulip"),
                 (Some(p), ChatPlatform::Api) => p.eq_ignore_ascii_case("api"),
-                // Unprefixed entries in super_users apply to GitHub and interactive platforms,
-                // but NOT to generic API requests (which require explicit api: prefix).
-                (None, ChatPlatform::Api) => false,
-                (None, _) => true,
+                // Unprefixed entries from platform-specific lists (lark_super_users, etc.) match their platform.
+                // But unprefixed entries from the general `super_users` list belong strictly to GitHub
+                // and must NOT match chat platforms to prevent cross-platform username spoofing.
+                (None, _) => is_platform_specific,
             };
 
             if !platform_matches {
@@ -980,11 +980,11 @@ impl<'a> ChatCommandExecutor<'a> {
                     .any(|eid| target.eq_ignore_ascii_case(eid))
         };
 
-        if platform_super_users.iter().any(|su| matches_user(su)) {
+        if platform_super_users.iter().any(|su| matches_user(su, true)) {
             return true;
         }
 
-        commands_cfg.super_users.iter().any(|su| matches_user(su))
+        commands_cfg.super_users.iter().any(|su| matches_user(su, false))
     }
 
     pub fn is_channel_allowed(&self, message: &InboundChatMessage) -> bool {
@@ -1021,10 +1021,16 @@ impl<'a> ChatCommandExecutor<'a> {
 
         allowed_list.iter().any(|allowed| {
             let clean = allowed.trim();
-            clean.eq_ignore_ascii_case(ch)
-                || extra_channel_ids
+            if clean.eq_ignore_ascii_case(ch) {
+                return true;
+            }
+            // Explicit guild whitelist (e.g. "guild:123456789") to avoid channel ID confusion
+            if let Some(target_guild) = clean.strip_prefix("guild:") {
+                return extra_channel_ids
                     .iter()
-                    .any(|extra| clean.eq_ignore_ascii_case(extra.trim()))
+                    .any(|extra| extra.trim().eq_ignore_ascii_case(target_guild.trim()));
+            }
+            false
         })
     }
 
@@ -1810,14 +1816,15 @@ mod tests {
         // Same username on Lark should NOT match "discord:global_mod"
         assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Lark, &discord_prefixed_match));
 
-        // Fallback super user: "octocat"
+        // Unprefixed entry in general super_users: "octocat"
+        // Must NOT match on Discord because unprefixed general super_users is reserved for GitHub.
         let github_fallback = InboundSender {
             id: "octocat".to_string(),
             username: "octocat".to_string(),
             display_name: None,
             extra_ids: vec![],
         };
-        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &github_fallback));
+        assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &github_fallback));
 
         // SECURITY: Attempting to spoof super user via mutable display_name / nickname MUST fail
         let display_name_spoof_attempt = InboundSender {
@@ -1918,7 +1925,7 @@ mod tests {
     async fn test_channel_whitelist_authorization() {
         let mut config = SugieConfig::default();
         config.default_rules.commands.lark_allowed_chats = vec!["oc_allowed_group".to_string()];
-        config.default_rules.commands.discord_allowed_channels = vec!["111222333".to_string(), "guild_999".to_string()];
+        config.default_rules.commands.discord_allowed_channels = vec!["111222333".to_string(), "guild:guild_999".to_string()];
         config.default_rules.commands.zulip_allowed_channels = vec!["authorized_stream".to_string()];
 
         let storage = crate::storage::Storage::new_in_memory().unwrap();

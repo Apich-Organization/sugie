@@ -313,7 +313,7 @@ impl ConfigFiles {
 
     pub fn restore_backup(&self, name: &str) -> Result<()> {
         // Reject traversal: backups are flat file names only.
-        if name.contains('/') || name.contains("..") {
+        if name.contains('/') || name.contains('\\') || name.contains("..") || name.trim().is_empty() {
             return Err(anyhow!("Invalid backup filename"));
         }
         let src = self.backup_dir.join(name);

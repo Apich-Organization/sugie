@@ -77,6 +77,16 @@ impl TriageService {
         &self.notifier
     }
 
+    pub fn is_repo_allowed(&self, full_name: &str) -> bool {
+        let cfg = self.config();
+        if let Some(ref allowed) = cfg.notifications.allowed_repositories {
+            if !allowed.is_empty() && !allowed.iter().any(|r| r.eq_ignore_ascii_case(full_name)) {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn auth(&self) -> &Arc<GitHubAuthManager> {
         &self.auth
     }
@@ -203,6 +213,16 @@ impl TriageService {
         let owner = &event.repository.owner.login;
         let repo = &event.repository.name;
         let full_name = &event.repository.full_name;
+
+        if !self.is_repo_allowed(full_name) {
+            info!("Ignoring issue_comment event for non-whitelisted repository: {}", full_name);
+            return Ok(());
+        }
+
+        if !self.is_repo_allowed(full_name) {
+            info!("Ignoring issues event for non-whitelisted repository: {}", full_name);
+            return Ok(());
+        }
         let issue_url = format!(
             "https://github.com/{}/{}/issues/{}",
             owner, repo, event.issue.number
@@ -423,6 +443,16 @@ impl TriageService {
         let owner = &event.repository.owner.login;
         let repo = &event.repository.name;
         let full_name = &event.repository.full_name;
+
+        if !self.is_repo_allowed(full_name) {
+            info!("Ignoring issue_comment event for non-whitelisted repository: {}", full_name);
+            return Ok(());
+        }
+
+        if !self.is_repo_allowed(full_name) {
+            info!("Ignoring pull_request event for non-whitelisted repository: {}", full_name);
+            return Ok(());
+        }
         let pr_url = format!(
             "https://github.com/{}/{}/pull/{}",
             owner, repo, event.pull_request.number
@@ -789,6 +819,11 @@ impl TriageService {
         let repo = &event.repository.name;
         let full_name = &event.repository.full_name;
 
+        if !self.is_repo_allowed(full_name) {
+            info!("Ignoring issue_comment event for non-whitelisted repository: {}", full_name);
+            return Ok(());
+        }
+
         let inst_id = match event.installation.as_ref().map(|i| i.id) {
             Some(id) => {
                 self.storage
@@ -894,6 +929,11 @@ impl TriageService {
         let owner = &event.repository.owner.login;
         let repo = &event.repository.name;
         let full_name = &event.repository.full_name;
+
+        if !self.is_repo_allowed(full_name) {
+            info!("Ignoring check_suite event for non-whitelisted repository: {}", full_name);
+            return Ok(());
+        }
 
         let inst_id = match event.installation.as_ref().map(|i| i.id) {
             Some(id) => {

@@ -592,7 +592,12 @@ async fn test_inbound_discord_ping_interaction() {
         "type": 1
     });
     let body = serde_json::to_vec(&ping_payload).unwrap();
-    let timestamp = "1620000000";
+    let timestamp_string = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
+    let timestamp = &timestamp_string;
 
     use ed25519_dalek::Signer;
     let signing_key = test_discord_signing_key();
@@ -618,6 +623,43 @@ async fn test_inbound_discord_ping_interaction() {
         .unwrap();
     let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(body_json.get("type").and_then(|v| v.as_i64()), Some(1));
+}
+
+#[tokio::test]
+async fn test_inbound_discord_replay_rejected() {
+    let (state, _) = create_test_state();
+    let app = create_router(state);
+
+    let ping_payload = serde_json::json!({
+        "type": 1
+    });
+    let body = serde_json::to_vec(&ping_payload).unwrap();
+    // Stale timestamp (10 minutes ago) to test replay attack rejection
+    let stale_ts = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() - 600)
+        .to_string();
+
+    use ed25519_dalek::Signer;
+    let signing_key = test_discord_signing_key();
+    let mut message = stale_ts.as_bytes().to_vec();
+    message.extend_from_slice(&body);
+    let signature = signing_key.sign(&message);
+    let signature_hex = hex::encode(signature.to_bytes());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/chat/discord")
+        .header("content-type", "application/json")
+        .header("X-Signature-Ed25519", signature_hex)
+        .header("X-Signature-Timestamp", stale_ts)
+        .body(Body::from(body))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    // Must be rejected with 401 Unauthorized due to timestamp expiration
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

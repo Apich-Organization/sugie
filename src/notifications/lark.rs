@@ -124,7 +124,7 @@ impl LarkNotifier {
     pub fn new(config: LarkConfig) -> Self {
         Self {
             config,
-            http: Client::new(),
+            http: crate::notifications::create_notification_http_client(),
             token_cache: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
@@ -648,6 +648,10 @@ impl LarkNotifier {
             }
         }
 
+        if !crate::notifications::is_safe_webhook_url(url_str) {
+            anyhow::bail!("Blocked unsafe or non-HTTPS Lark webhook destination (SSRF protection)");
+        }
+
         let started = std::time::Instant::now();
         let send_res = self
             .http
@@ -660,13 +664,14 @@ impl LarkNotifier {
         let resp = match send_res {
             Ok(r) => r,
             Err(e) => {
+                let safe_err = crate::notifications::sanitize_error_str(&e);
                 crate::security_log::log_notification_request(
                     "lark",
                     "POST",
                     url_str,
                     0,
                     duration_ms,
-                    &format!("title={title} error={e}"),
+                    &format!("title={title} error={safe_err}"),
                 );
                 return Err(e).context("Failed to send webhook request to Lark");
             }
@@ -676,13 +681,14 @@ impl LarkNotifier {
         let body_text = resp.text().await.unwrap_or_default();
 
         if !status.is_success() {
+            let safe_body = crate::notifications::sanitize_error_str(&body_text);
             crate::security_log::log_notification_request(
                 "lark",
                 "POST",
                 url_str,
                 status.as_u16(),
                 duration_ms,
-                &format!("title={title} http_error={body_text}"),
+                &format!("title={title} http_error={safe_body}"),
             );
             anyhow::bail!("Lark webhook HTTP error {}: {}", status, body_text);
         }

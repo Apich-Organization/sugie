@@ -234,7 +234,12 @@ pub fn init(db_path: &str) {
     }
 }
 
-pub fn record(entry: SecurityHttpLogEntry) {
+pub fn record(mut entry: SecurityHttpLogEntry) {
+    entry.actor = clean_log_str(&entry.actor);
+    entry.ip = clean_log_str(&entry.ip);
+    entry.target = clean_log_str(&entry.target);
+    entry.detail = sanitize_detail(&entry.detail, 1000);
+
     tracing::info!(
         target: "sugie::security_audit",
         direction = %entry.direction,
@@ -355,12 +360,12 @@ pub fn log_github_request(method: &str, url: &str, status: u16, duration_ms: u64
         ts: Utc::now().to_rfc3339(),
         direction: "OUTBOUND_GITHUB".to_string(),
         method: method.to_string(),
-        target: url.to_string(),
+        target: redact_url(url),
         status,
         duration_ms,
         ip: "-".to_string(),
         actor: "sugie-bot".to_string(),
-        detail: truncate_detail(detail, 1000),
+        detail: sanitize_detail(detail, 1000),
     });
 }
 
@@ -455,11 +460,24 @@ fn mask_query(query: &str) -> String {
         .join("&")
 }
 
-fn truncate_detail(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
+fn clean_log_str(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() || c == '\r' || c == '\n' { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn sanitize_detail(s: &str, max_chars: usize) -> String {
+    let clean = clean_log_str(s);
+    if clean.chars().count() <= max_chars {
+        clean
     } else {
-        let head: String = s.chars().take(max_chars).collect();
+        let head: String = clean.chars().take(max_chars).collect();
         format!("{head}…")
     }
+}
+
+fn truncate_detail(s: &str, max_chars: usize) -> String {
+    sanitize_detail(s, max_chars)
 }

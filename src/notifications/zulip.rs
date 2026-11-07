@@ -23,7 +23,7 @@ impl ZulipNotifier {
     pub fn new(config: ZulipConfig) -> Self {
         Self {
             config,
-            http: Client::new(),
+            http: crate::notifications::create_notification_http_client(),
         }
     }
 
@@ -61,6 +61,10 @@ impl ZulipNotifier {
             ("content", content),
         ];
 
+        if !crate::notifications::is_safe_webhook_url(&endpoint) {
+            anyhow::bail!("Blocked unsafe or non-HTTPS Zulip destination (SSRF protection)");
+        }
+
         let started = std::time::Instant::now();
         let send_res = self
             .http
@@ -74,13 +78,14 @@ impl ZulipNotifier {
         let resp = match send_res {
             Ok(r) => r,
             Err(e) => {
+                let safe_err = crate::notifications::sanitize_error_str(&e);
                 crate::security_log::log_notification_request(
                     "zulip",
                     "POST",
                     &endpoint,
                     0,
                     duration_ms,
-                    &format!("channel={channel} topic={topic} error={e}"),
+                    &format!("channel={channel} topic={topic} error={safe_err}"),
                 );
                 return Err(e).context("Failed to send message to Zulip API");
             }
@@ -89,13 +94,14 @@ impl ZulipNotifier {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            let safe_body = crate::notifications::sanitize_error_str(&body);
             crate::security_log::log_notification_request(
                 "zulip",
                 "POST",
                 &endpoint,
                 status.as_u16(),
                 duration_ms,
-                &format!("channel={channel} topic={topic} error={body}"),
+                &format!("channel={channel} topic={topic} error={safe_body}"),
             );
             anyhow::bail!("Zulip API request failed with HTTP {}: {}", status, body);
         }

@@ -139,6 +139,32 @@ impl GitHubClient {
 
     // --- Issues API ---
 
+    pub async fn get_user_repo_permission(
+        &self,
+        owner: &str,
+        repo: &str,
+        username: &str,
+    ) -> Result<String> {
+        let url = format!(
+            "{}/repos/{}/{}/collaborators/{}/permission",
+            self.base_url,
+            seg(owner),
+            seg(repo),
+            seg(username)
+        );
+        let resp = self.send_logged(reqwest::Method::GET, &url, None).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok("none".to_string());
+        }
+        let resp = resp.error_for_status()?;
+        let val: serde_json::Value = resp.json().await?;
+        let perm = val
+            .get("permission")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        Ok(perm.to_string())
+    }
+
     pub async fn get_issue(&self, owner: &str, repo: &str, issue_number: u64) -> Result<Issue> {
         let url = format!(
             "{}/repos/{}/{}/issues/{}",

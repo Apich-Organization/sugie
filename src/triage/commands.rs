@@ -8,7 +8,7 @@ use crate::triage::projects::ProjectsService;
 use crate::triage::reviewers::ReviewerLoadBalancer;
 use anyhow::Result;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SlashCommand {
@@ -366,6 +366,91 @@ impl<'a> CommandExecutor<'a> {
         true
     }
 
+    pub async fn is_authorized_actor(
+        &self,
+        command: &SlashCommand,
+        owner: &str,
+        repo: &str,
+        issue: &Issue,
+        sender: &User,
+    ) -> bool {
+        let is_super = self.config.super_users.iter().any(|su| {
+            su.trim_start_matches('@')
+                .eq_ignore_ascii_case(&sender.login)
+        });
+
+        if is_super {
+            return true;
+        }
+
+        if self.config.admin_only {
+            return false;
+        }
+
+        let cmd_name = command.name();
+
+        let is_restricted = self
+            .config
+            .restricted_commands
+            .iter()
+            .any(|r| r.trim_start_matches('/').eq_ignore_ascii_case(cmd_name));
+
+        if is_restricted {
+            return false;
+        }
+
+        let is_author = issue.user.login.eq_ignore_ascii_case(&sender.login);
+
+        // Check author permissions on self-actions
+        match command {
+            SlashCommand::Retest => {
+                if is_author {
+                    return true;
+                }
+            }
+            SlashCommand::Assign(users) => {
+                if is_author
+                    && (users.is_empty()
+                        || (users.len() == 1 && users[0].eq_ignore_ascii_case(&sender.login)))
+                {
+                    return true;
+                }
+            }
+            SlashCommand::Unassign(users) => {
+                if is_author
+                    && (users.is_empty()
+                        || (users.len() == 1 && users[0].eq_ignore_ascii_case(&sender.login)))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        // Verify repository collaborator/triage/write/admin permissions via GitHub API
+        match self
+            .client
+            .get_user_repo_permission(owner, repo, &sender.login)
+            .await
+        {
+            Ok(perm) => match perm.as_str() {
+                "admin" | "write" => true,
+                "triage" => !matches!(
+                    command,
+                    SlashCommand::Lock(_) | SlashCommand::Unlock | SlashCommand::Move { .. }
+                ),
+                _ => false,
+            },
+            Err(e) => {
+                warn!(
+                    "Could not determine collaborator permission for @{} on {}/{}: {}",
+                    sender.login, owner, repo, e
+                );
+                false
+            }
+        }
+    }
+
     pub async fn execute(
         &self,
         command: &SlashCommand,
@@ -380,16 +465,19 @@ impl<'a> CommandExecutor<'a> {
             owner, repo, issue.number
         );
 
-        if !self.is_authorized(command, sender) {
+        if !self
+            .is_authorized_actor(command, owner, repo, issue, sender)
+            .await
+        {
             info!(
-                "Blocked restricted command '/{}' by @{} on {}#{}",
+                "Blocked unauthorized command '/{}' by @{} on {}#{}",
                 command.name(),
                 sender.login,
                 repo_full_name,
                 issue.number
             );
             let comment_text = format!(
-                "⛔ @{}, the command `/{}` is restricted to authorized super users.",
+                "⛔ @{}, you do not have permission to execute `/{}` on this repository.",
                 sender.login,
                 command.name()
             );
@@ -806,6 +894,26 @@ impl<'a> CommandExecutor<'a> {
                 } else {
                     (owner, target_repo.as_str())
                 };
+
+                let is_valid = |s: &str| {
+                    !s.is_empty()
+                        && s.len() <= 100
+                        && !s.contains("..")
+                        && s.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+                };
+
+                if !is_valid(target_owner) || !is_valid(target_name) {
+                    self.client
+                        .create_comment(
+                            owner,
+                            repo,
+                            issue.number,
+                            "⚠️ Invalid target repository name.",
+                        )
+                        .await?;
+                    return Ok(());
+                }
 
                 if target_owner == owner && target_name == repo {
                     self.client
