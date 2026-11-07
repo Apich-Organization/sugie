@@ -1091,10 +1091,10 @@ fn load_discord_env_channels(
             }
             let parts = if let Some(p) = trimmed.split_once('=') {
                 Some(p)
-            } else if let Some(p) = trimmed.split_once("https://") {
-                Some((p.0.trim_end_matches(':'), p.1))
             } else {
-                None
+                trimmed
+                    .split_once("https://")
+                    .map(|p| (p.0.trim_end_matches(':'), p.1))
             };
             if let Some((name, rest)) = parts {
                 let name = name.trim().to_lowercase().replace('_', "-");
@@ -1207,10 +1207,10 @@ fn load_lark_env_channels(
             }
             let parts = if let Some(p) = trimmed.split_once('=') {
                 Some(p)
-            } else if let Some(p) = trimmed.split_once("https://") {
-                Some((p.0.trim_end_matches(':'), p.1))
             } else {
-                None
+                trimmed
+                    .split_once("https://")
+                    .map(|p| (p.0.trim_end_matches(':'), p.1))
             };
             if let Some((name, rest)) = parts {
                 let name = name.trim().to_lowercase().replace('_', "-");

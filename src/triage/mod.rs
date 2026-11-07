@@ -1020,10 +1020,18 @@ mod tests {
 
     #[test]
     fn test_triage_service_hot_reload() {
-        let mut config = SugieConfig::default();
-        config.host = "127.0.0.1".into();
-        config.port = 8800;
-        config.default_rules.stale.enabled = false;
+        let config = SugieConfig {
+            host: "127.0.0.1".into(),
+            port: 8800,
+            default_rules: RepoConfig {
+                stale: crate::config::StaleConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let storage = Storage::new_in_memory().unwrap();
         let auth = Arc::new(GitHubAuthManager::new(1, "key".into()));

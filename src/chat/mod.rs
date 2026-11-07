@@ -1749,19 +1749,21 @@ mod tests {
 
     #[test]
     fn test_is_super_user_platform_matching() {
-        let mut commands_cfg = crate::config::CommandsConfig::default();
-        commands_cfg.super_users = vec!["octocat".to_string(), "discord:global_mod".to_string()];
-        commands_cfg.lark_super_users = vec![
-            "ou_lark_admin".to_string(),
-            "emp_9999".to_string(),
-        ];
-        commands_cfg.discord_super_users = vec![
-            "123456789012345678".to_string(),
-            "discord_mod".to_string(),
-        ];
-        commands_cfg.zulip_super_users = vec![
-            "admin@zulip.org".to_string(),
-        ];
+        let commands_cfg = crate::config::CommandsConfig {
+            super_users: vec!["octocat".to_string(), "discord:global_mod".to_string()],
+            lark_super_users: vec![
+                "ou_lark_admin".to_string(),
+                "emp_9999".to_string(),
+            ],
+            discord_super_users: vec![
+                "123456789012345678".to_string(),
+                "discord_mod".to_string(),
+            ],
+            zulip_super_users: vec![
+                "admin@zulip.org".to_string(),
+            ],
+            ..Default::default()
+        };
 
         // Lark sender tests
         let lark_sender_ok = InboundSender {

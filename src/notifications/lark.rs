@@ -619,6 +619,7 @@ impl LarkNotifier {
     }
 
     /// Send notification to a specific Lark incoming webhook URL with optional secret.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_to_webhook(
         &self,
         webhook_url: &str,

@@ -403,26 +403,20 @@ impl<'a> CommandExecutor<'a> {
 
         // Check author permissions on self-actions
         match command {
-            SlashCommand::Retest => {
-                if is_author {
-                    return true;
-                }
-            }
-            SlashCommand::Assign(users) => {
+            SlashCommand::Retest if is_author => return true,
+            SlashCommand::Assign(users)
                 if is_author
                     && (users.is_empty()
-                        || (users.len() == 1 && users[0].eq_ignore_ascii_case(&sender.login)))
-                {
-                    return true;
-                }
+                        || (users.len() == 1 && users[0].eq_ignore_ascii_case(&sender.login))) =>
+            {
+                return true;
             }
-            SlashCommand::Unassign(users) => {
+            SlashCommand::Unassign(users)
                 if is_author
                     && (users.is_empty()
-                        || (users.len() == 1 && users[0].eq_ignore_ascii_case(&sender.login)))
-                {
-                    return true;
-                }
+                        || (users.len() == 1 && users[0].eq_ignore_ascii_case(&sender.login))) =>
+            {
+                return true;
             }
             _ => {}
         }
@@ -1559,10 +1553,12 @@ mod tests {
 
     #[test]
     fn test_command_authorization_admin_only_and_restricted() {
-        let mut config = CommandsConfig::default();
-        config.super_users = vec!["admin_user".to_string()];
-        config.restricted_commands = vec!["close".to_string()];
-        config.admin_only = false;
+        let config = CommandsConfig {
+            super_users: vec!["admin_user".to_string()],
+            restricted_commands: vec!["close".to_string()],
+            admin_only: false,
+            ..Default::default()
+        };
 
         let dummy_client = Arc::new(GitHubClient::new(
             "test_token".to_string(),

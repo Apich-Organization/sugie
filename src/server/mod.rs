@@ -113,11 +113,11 @@ async fn security_http_log_middleware(
     let gh_event = headers
         .get("X-GitHub-Event")
         .and_then(|v| v.to_str().ok())
-        .map(|s| sanitize_log_val(s));
+        .map(sanitize_log_val);
     let gh_delivery = headers
         .get("X-GitHub-Delivery")
         .and_then(|v| v.to_str().ok())
-        .map(|s| sanitize_log_val(s));
+        .map(sanitize_log_val);
 
     // One session lookup for the whole request: the audit log needs the actor
     // and the page handlers need the principal.

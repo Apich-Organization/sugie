@@ -133,7 +133,7 @@ pub async fn zulip_chat_handler(
         }
     };
 
-    let is_match = received_token.map_or(false, |tok| secret_matches(tok, expected_token));
+    let is_match = received_token.is_some_and(|tok| secret_matches(tok, expected_token));
     if !is_match {
         warn!("Zulip webhook authentication failed: invalid Zulip token");
         return (
@@ -432,7 +432,7 @@ pub async fn lark_chat_handler(
                 let matches = payload
                     .token
                     .as_deref()
-                    .map_or(false, |tok| secret_matches(tok, expected));
+                    .is_some_and(|tok| secret_matches(tok, expected));
                 if !matches {
                     warn!("Lark challenge verification token mismatch");
                     return (
@@ -467,7 +467,7 @@ pub async fn lark_chat_handler(
             .as_ref()
             .and_then(|h| h.token.as_deref())
             .or(payload.token.as_deref());
-        let matches = token_in_payload.map_or(false, |tok| secret_matches(tok, expected));
+        let matches = token_in_payload.is_some_and(|tok| secret_matches(tok, expected));
         if !matches {
             warn!(
                 "Lark event callback token verification failed: got {:?}",
