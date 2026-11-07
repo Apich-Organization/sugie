@@ -106,6 +106,11 @@ impl Storage {
                 warned_at TEXT,
                 PRIMARY KEY (repo, issue_number)
             );
+
+            CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                delivery_id TEXT PRIMARY KEY,
+                seen_at INTEGER NOT NULL
+            );
             "#,
         )?;
         Ok(())
@@ -342,6 +347,31 @@ impl Storage {
             params![repo, issue_number as i64],
         )?;
         Ok(())
+    }
+
+    // --- Persistent Webhook Deduplication ---
+
+    /// Atomically checks whether `delivery_id` has been seen within `ttl_secs`
+    /// and records it if not. Returns `true` if `delivery_id` is a duplicate/replay.
+    pub fn check_and_record_webhook_delivery(&self, delivery_id: &str, ttl_secs: i64) -> bool {
+        let clean = delivery_id.trim();
+        if clean.is_empty() {
+            return false;
+        }
+        let conn = self.lock_conn();
+        let now = Utc::now().timestamp();
+        let cutoff = now - ttl_secs.max(60);
+        let _ = conn.execute(
+            "DELETE FROM webhook_deliveries WHERE seen_at < ?1",
+            params![cutoff],
+        );
+        match conn.execute(
+            "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, seen_at) VALUES (?1, ?2)",
+            params![clean, now],
+        ) {
+            Ok(inserted) => inserted == 0,
+            Err(_) => false,
+        }
     }
 }
 

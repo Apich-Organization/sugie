@@ -191,19 +191,85 @@ pub fn clear_cookie(secure: bool) -> Vec<String> {
     }
 }
 
+fn trust_proxy_headers() -> bool {
+    if let Ok(raw) = std::env::var("SUGIE_TRUST_PROXY") {
+        if matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ) {
+            return true;
+        }
+    }
+    std::env::var("SUGIE_TRUSTED_PROXIES")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn trusted_proxy_ips() -> Vec<std::net::IpAddr> {
+    std::env::var("SUGIE_TRUSTED_PROXIES")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse::<std::net::IpAddr>().ok())
+        .collect()
+}
+
+/// Extract the client IP from proxy headers only when `SUGIE_TRUST_PROXY=true`
+/// or `SUGIE_TRUSTED_PROXIES` is configured, and strictly validate `IpAddr` syntax
+/// to prevent X-Forwarded-For spoofing and log injection.
 pub fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|v| v.trim().to_string())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.to_string())
-        })
-        .unwrap_or_else(|| "-".to_string())
+    if !trust_proxy_headers() {
+        return "-".to_string();
+    }
+    let trusted = trusted_proxy_ips();
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        let hops: Vec<std::net::IpAddr> = xff
+            .split(',')
+            .filter_map(|part| part.trim().parse::<std::net::IpAddr>().ok())
+            .collect();
+        if !hops.is_empty() {
+            if !trusted.is_empty() {
+                // Walk right-to-left and pick the first hop not in the trusted proxy set
+                if let Some(ip) = hops.iter().rev().find(|ip| !trusted.contains(ip)) {
+                    return ip.to_string();
+                }
+            }
+            // Rightmost hop appended by the reverse proxy
+            if let Some(ip) = hops.last() {
+                return ip.to_string();
+            }
+        }
+    }
+    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        if let Ok(ip) = real_ip.trim().parse::<std::net::IpAddr>() {
+            return ip.to_string();
+        }
+    }
+    "-".to_string()
+}
+
+/// Per-IP sliding-window rate limiter for `POST /admin/login` and `POST /admin/login/2fa`
+/// (max 20 attempts per 60s per IP) to prevent login / Argon2 / 2FA flood DoS.
+pub fn login_rate_limit_allowed(ip: &str) -> bool {
+    const MAX_ATTEMPTS_PER_MINUTE: u32 = 20;
+    static HITS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u32)>>,
+    > = std::sync::OnceLock::new();
+    let hits = HITS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = hits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    if guard.len() > 4096 {
+        guard.retain(|_, (since, _)| {
+            now.duration_since(*since) < std::time::Duration::from_secs(60)
+        });
+    }
+    let entry = guard.entry(ip.to_string()).or_insert((now, 0));
+    if now.duration_since(entry.0) >= std::time::Duration::from_secs(60) {
+        *entry = (now, 0);
+    }
+    entry.1 += 1;
+    entry.1 <= MAX_ATTEMPTS_PER_MINUTE
 }
 
 /// A principal resolved once per request by the audit middleware.
@@ -345,7 +411,7 @@ pub fn login(
     ip: &str,
     user_agent: &str,
 ) -> Result<LoginOutcome> {
-    if let Some(remaining) = db.login_lockout_remaining(username)? {
+    if let Some(remaining) = db.login_lockout_remaining_for_ip(username, ip)? {
         return Ok(LoginOutcome::Locked(remaining));
     }
 
@@ -353,6 +419,7 @@ pub fn login(
         // Burn the same amount of CPU as a real verification so response time
         // does not reveal whether the account exists.
         let _ = verify_password(password, dummy_hash());
+        let _ = db.record_login_failure_for_ip(username, ip, MAX_LOGIN_ATTEMPTS, LOCKOUT_SECS);
         return Ok(LoginOutcome::Invalid);
     };
     if !row.active {
@@ -364,14 +431,15 @@ pub fn login(
         return Ok(LoginOutcome::Invalid);
     };
     if !verify_password(password, &hash) {
-        let locked_for = db.record_login_failure(username, MAX_LOGIN_ATTEMPTS, LOCKOUT_SECS)?;
+        let locked_for =
+            db.record_login_failure_for_ip(username, ip, MAX_LOGIN_ATTEMPTS, LOCKOUT_SECS)?;
         if let Some(secs) = locked_for {
             return Ok(LoginOutcome::Locked(secs));
         }
         return Ok(LoginOutcome::Invalid);
     }
 
-    db.clear_login_failures(row.id)?;
+    db.clear_login_failures_for_ip(row.id, username, ip)?;
 
     if !row.is_2fa_disabled() && row.has_2fa_enrolled() {
         let pending_token = random_token();
@@ -501,5 +569,60 @@ mod tests {
         let principal = resolve_principal(&db, &HeaderMap::new());
         assert!(principal.user.is_none());
         assert!(principal.username().is_none());
+    }
+
+    #[test]
+    fn per_ip_lockout_isolates_attacker_from_legitimate_ip() {
+        let db = WebDb::new_in_memory().expect("in-memory db");
+        let pw_hash = hash_password("correct-horse-battery-staple").expect("hash");
+        db.create_user("admin", &pw_hash, Role::Owner.as_str(), "Admin")
+            .expect("create user");
+
+        // Attacker on 203.0.113.99 fails 5 times and gets locked out
+        for i in 1..=MAX_LOGIN_ATTEMPTS {
+            let outcome = login(&db, "admin", "wrong-password", "203.0.113.99", "curl").expect("login");
+            if i < MAX_LOGIN_ATTEMPTS {
+                assert!(matches!(outcome, LoginOutcome::Invalid));
+            } else {
+                assert!(matches!(outcome, LoginOutcome::Locked(_)));
+            }
+        }
+
+        // Subsequent attempt from attacker IP with even the RIGHT password is still locked
+        let attacker_retry = login(
+            &db,
+            "admin",
+            "correct-horse-battery-staple",
+            "203.0.113.99",
+            "curl",
+        )
+        .expect("login");
+        assert!(matches!(attacker_retry, LoginOutcome::Locked(_)));
+
+        // Meanwhile, legitimate admin on 198.51.100.10 can still sign in!
+        let legit = login(
+            &db,
+            "admin",
+            "correct-horse-battery-staple",
+            "198.51.100.10",
+            "Mozilla/5.0",
+        )
+        .expect("login");
+        assert!(
+            matches!(legit, LoginOutcome::Session(_)),
+            "attacker lockout on one IP must not lock out legitimate users on other IPs"
+        );
+    }
+
+    #[test]
+    fn client_ip_ignores_untrusted_proxy_headers_by_default() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("1.2.3.4, 5.6.7.8"),
+        );
+        headers.insert("x-real-ip", HeaderValue::from_static("9.9.9.9"));
+        // Without SUGIE_TRUST_PROXY / SUGIE_TRUSTED_PROXIES, spoofed headers are ignored
+        assert_eq!(client_ip(&headers), "-");
     }
 }

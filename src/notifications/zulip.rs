@@ -61,9 +61,7 @@ impl ZulipNotifier {
             ("content", content),
         ];
 
-        if !crate::notifications::is_safe_webhook_url(&endpoint) {
-            anyhow::bail!("Blocked unsafe or non-HTTPS Zulip destination (SSRF protection)");
-        }
+        crate::notifications::verify_webhook_destination(&endpoint).await?;
 
         let started = std::time::Instant::now();
         let send_res = self

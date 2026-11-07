@@ -108,11 +108,15 @@ impl WebState {
 }
 
 pub fn router(state: WebState) -> Router {
-    Router::new()
-        .route("/admin", get(dashboard))
-        .route("/admin/", get(dashboard))
+    let login_routes = Router::new()
         .route("/admin/login", get(login_page).post(login_submit))
         .route("/admin/login/2fa", post(login_2fa_submit))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024));
+
+    Router::new()
+        .merge(login_routes)
+        .route("/admin", get(dashboard))
+        .route("/admin/", get(dashboard))
         .route("/admin/logout", post(logout))
         .route("/admin/repos", get(repos_page))
         .route("/admin/api/repos/sync", post(sync_repos))
@@ -250,6 +254,8 @@ fn forbidden(msg: &str) -> Response {
 /// Baseline hardening headers for every console response.
 async fn security_headers(req: Request, next: Next) -> Response {
     let secure = auth::is_secure_request(req.headers());
+    let path = req.uri().path().to_string();
+    let is_static_asset = path.starts_with("/admin/assets/") || path == "/favicon.ico";
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
     // The UI uses inline style attributes and a few inline handlers, so
@@ -258,9 +264,9 @@ async fn security_headers(req: Request, next: Next) -> Response {
     headers.insert(
         "content-security-policy",
         HeaderValue::from_static(
-            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+            "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; \
              script-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self'; \
-             frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
+             frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'",
         ),
     );
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
@@ -273,6 +279,9 @@ async fn security_headers(req: Request, next: Next) -> Response {
         "permissions-policy",
         HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
     );
+    if !is_static_asset {
+        headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    }
     if secure {
         headers.insert(
             "strict-transport-security",
@@ -428,10 +437,25 @@ struct LoginForm {
 
 async fn login_submit(
     State(state): State<WebState>,
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let ip = auth::client_ip(&headers);
+    let ip = match peer {
+        Some(Extension(ConnectInfo(addr))) if !addr.ip().is_loopback() => addr.ip().to_string(),
+        _ => auth::client_ip(&headers),
+    };
+    if !auth::login_rate_limit_allowed(&ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            html(pages::login_page(
+                Some("Too many login requests from your IP. Please wait a minute and retry.".to_string()),
+                form.next,
+                None,
+            )),
+        )
+            .into_response();
+    }
     let ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -565,10 +589,25 @@ struct Login2faForm {
 
 async fn login_2fa_submit(
     State(state): State<WebState>,
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     Form(form): Form<Login2faForm>,
 ) -> Response {
-    let ip = auth::client_ip(&headers);
+    let ip = match peer {
+        Some(Extension(ConnectInfo(addr))) if !addr.ip().is_loopback() => addr.ip().to_string(),
+        _ => auth::client_ip(&headers),
+    };
+    if !auth::login_rate_limit_allowed(&ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            html(pages::login_page(
+                Some("Too many verification attempts from your IP. Please wait a minute and retry.".to_string()),
+                form.next,
+                None,
+            )),
+        )
+            .into_response();
+    }
     let ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -584,7 +623,7 @@ async fn login_2fa_submit(
         ));
     };
 
-    let Some((secret, enabled)) = state.db.get_totp_secret(user.id).ok().flatten() else {
+    let Some((secret, enabled, last_step)) = state.db.get_totp_state(user.id).ok().flatten() else {
         return html(pages::login_page(
             Some("Authenticator OTP is not configured for this account.".to_string()),
             form.next,
@@ -592,7 +631,14 @@ async fn login_2fa_submit(
         ));
     };
 
-    if !enabled || !totp::verify_totp(&secret, &form.totp_code) {
+    let verified_step = if enabled {
+        totp::verify_totp_step(&secret, &form.totp_code, last_step)
+            .filter(|&step| state.db.record_totp_step(user.id, step).unwrap_or(false))
+    } else {
+        None
+    };
+
+    if verified_step.is_none() {
         let attempts = state
             .db
             .bump_pending_2fa_attempts(&token_hash)
@@ -1481,7 +1527,7 @@ async fn totp_activate(
     let secret = form.secret.trim();
     let code = form.code.trim();
 
-    if !totp::verify_totp(secret, code) {
+    let Some(matched_step) = totp::verify_totp_step(secret, code, 0) else {
         state.db.audit(
             &user.username,
             "2fa.totp.activate",
@@ -1494,9 +1540,9 @@ async fn totp_activate(
             false,
             "Invalid 8-digit verification code. Please check your authenticator app and try again.",
         );
-    }
+    };
 
-    match state.db.activate_totp(user.id, secret) {
+    match state.db.activate_totp_with_step(user.id, secret, matched_step) {
         Ok(_) => {
             state.db.audit(
                 &user.username,
@@ -1550,6 +1596,12 @@ async fn totp_disable(
         return security_flash(false, &format!("Failed to disable OTP: {e}"));
     }
 
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
     state.db.audit(
         &user.username,
         "2fa.totp.disable",
@@ -1558,7 +1610,14 @@ async fn totp_disable(
         &ip,
         true,
     );
-    security_flash(true, "Authenticator OTP disabled")
+    let mut resp = security_flash(true, "Authenticator OTP disabled. Other sessions were signed out.");
+    if let Ok(token) = auth::mint_session_for_user(&state.db, user.id, &ip, &ua) {
+        let secure = auth::is_secure_request(&headers);
+        if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&token, secure)) {
+            resp.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+    resp
 }
 
 #[derive(Deserialize)]

@@ -43,11 +43,12 @@ pub fn create_router(state: AppState) -> Router {
 /// Build the bot router and optionally mount the admin console at `/admin`.
 pub fn create_router_with_web(state: AppState, web: Option<crate::web::WebState>) -> Router {
     let web_db = web.as_ref().map(|w| w.db.clone());
-    let router = Router::new()
-        .route("/health", get(health_check))
-        .route("/status", get(status_check))
+    let github_webhook_routes = Router::new()
         .route("/webhook", post(github_webhook_handler))
         .route("/api/github/webhook", post(github_webhook_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024));
+
+    let chat_webhook_routes = Router::new()
         .route("/api/chat/zulip", post(chat::zulip_chat_handler))
         .route("/api/chat/lark", post(chat::lark_chat_handler))
         .route("/api/chat/discord", post(chat::discord_chat_handler))
@@ -55,6 +56,13 @@ pub fn create_router_with_web(state: AppState, web: Option<crate::web::WebState>
             "/api/chat/command",
             post(chat::generic_chat_command_handler),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024));
+
+    let router = Router::new()
+        .route("/health", get(health_check))
+        .route("/status", get(status_check))
+        .merge(github_webhook_routes)
+        .merge(chat_webhook_routes)
         .with_state(state);
 
     let merged = match web {
@@ -152,10 +160,28 @@ async fn security_http_log_middleware(
     // Resolve the session once and hand it to the inner router through a
     // task-local, so page handlers do not repeat the lookup. Anonymous and
     // non-admin routes skip the scope entirely.
-    let resp = match principal {
+    let secure = crate::web::auth::is_secure_request(headers);
+    let mut resp = match principal {
         Some(p) => crate::web::auth::scope_principal(p, next.run(req)).await,
         None => next.run(req).await,
     };
+    {
+        let resp_headers = resp.headers_mut();
+        resp_headers
+            .entry("x-content-type-options")
+            .or_insert(axum::http::HeaderValue::from_static("nosniff"));
+        resp_headers
+            .entry("x-frame-options")
+            .or_insert(axum::http::HeaderValue::from_static("DENY"));
+        resp_headers
+            .entry("referrer-policy")
+            .or_insert(axum::http::HeaderValue::from_static("same-origin"));
+        if secure {
+            resp_headers.entry("strict-transport-security").or_insert(
+                axum::http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+            );
+        }
+    }
     if !skip_log {
         let status = resp.status().as_u16();
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -213,10 +239,9 @@ fn is_duplicate_github_delivery(delivery_id: &str) -> bool {
     if clean.is_empty() {
         return false;
     }
-    let mut cache = match GITHUB_DEDUP_CACHE.lock() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+    let mut cache = GITHUB_DEDUP_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = std::time::Instant::now();
     cache.retain(|_, seen_at| now.duration_since(*seen_at).as_secs() < 600);
     if cache.contains_key(clean) {
@@ -275,17 +300,26 @@ async fn github_webhook_handler(
         );
     }
 
-    // Deduplicate deliveries using X-GitHub-Delivery (replay attack prevention)
+    // Deduplicate deliveries using X-GitHub-Delivery (replay attack prevention,
+    // backed by both in-memory cache and persistent SQLite storage)
     if let Some(delivery) = headers
         .get("X-GitHub-Delivery")
         .and_then(|v| v.to_str().ok())
     {
-        if is_duplicate_github_delivery(delivery) {
-            info!("Ignoring replayed GitHub webhook delivery: {}", delivery);
-            return (
-                StatusCode::OK,
-                Json(json!({ "message": "Duplicate delivery ignored" })),
-            );
+        let clean = delivery.trim();
+        if !clean.is_empty() {
+            let db_dup = state
+                .triage
+                .storage()
+                .check_and_record_webhook_delivery(&format!("github:{clean}"), 3600);
+            let mem_dup = is_duplicate_github_delivery(clean);
+            if db_dup || mem_dup {
+                info!("Ignoring replayed GitHub webhook delivery: {}", clean);
+                return (
+                    StatusCode::OK,
+                    Json(json!({ "message": "Duplicate delivery ignored" })),
+                );
+            }
         }
     }
 

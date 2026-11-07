@@ -115,8 +115,57 @@ impl ConfigFiles {
             }
         }
         if let Some(ref z) = cfg.notifications.zulip {
-            if !z.site_url.starts_with("http") {
-                return Err("zulip.site_url must start with http:// or https://".to_string());
+            if !z.site_url.trim().is_empty() && !crate::notifications::is_safe_webhook_url(&z.site_url) {
+                return Err(
+                    "zulip.site_url must be a public https:// URL (private/internal IPs and http:// are not allowed)"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(ref d) = cfg.notifications.discord {
+            if !d.webhook_url.trim().is_empty()
+                && !crate::notifications::is_safe_webhook_url(&d.webhook_url)
+            {
+                return Err(
+                    "discord.webhook_url must be a public https:// URL".to_string(),
+                );
+            }
+            if let Some(ref r_url) = d.reports_webhook_url {
+                if !r_url.trim().is_empty() && !crate::notifications::is_safe_webhook_url(r_url) {
+                    return Err(
+                        "discord.reports_webhook_url must be a public https:// URL".to_string(),
+                    );
+                }
+            }
+            for wh in &d.webhooks {
+                if !wh.url.trim().is_empty() && !crate::notifications::is_safe_webhook_url(&wh.url)
+                {
+                    return Err(format!(
+                        "discord webhook `{}` must be a public https:// URL",
+                        wh.name
+                    ));
+                }
+            }
+        }
+        if let Some(ref l) = cfg.notifications.lark {
+            if !l.webhook_url.trim().is_empty()
+                && !crate::notifications::is_safe_webhook_url(&l.webhook_url)
+            {
+                return Err("lark.webhook_url must be a public https:// URL".to_string());
+            }
+            if !l.api_base.trim().is_empty()
+                && !crate::notifications::is_safe_webhook_url(&l.api_base)
+            {
+                return Err("lark.api_base must be a public https:// URL".to_string());
+            }
+            for wh in &l.webhooks {
+                if !wh.url.trim().is_empty() && !crate::notifications::is_safe_webhook_url(&wh.url)
+                {
+                    return Err(format!(
+                        "lark webhook `{}` must be a public https:// URL",
+                        wh.name
+                    ));
+                }
             }
         }
         // Keep secrets sourced from .env rather than the TOML file.

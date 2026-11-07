@@ -73,61 +73,77 @@ pub fn generate_totp_setup(issuer: &str, account_name: &str) -> Result<TotpSetup
     })
 }
 
-/// Verifies an 8-digit TOTP code against a Base32 encoded secret.
-/// Primary validation uses SHA512 with 8 digits, with fallbacks for SHA1/SHA256 8-digit configurations.
-pub fn verify_totp(secret_encoded: &str, code: &str) -> bool {
+/// Verifies an 8-digit SHA512 TOTP code against a Base32 encoded secret and checks
+/// that the matched 30-second time step is strictly greater than `last_used_step`
+/// (RFC 6238 replay prevention). Returns the matched time step on success.
+pub fn verify_totp_step(secret_encoded: &str, code: &str, last_used_step: i64) -> Option<i64> {
     let clean_code = code.trim().replace(' ', "");
     let clean_secret = secret_encoded.trim().replace(' ', "").to_uppercase();
 
-    if clean_code.is_empty() || clean_secret.is_empty() {
-        return false;
+    if clean_code.len() != 8 || !clean_code.chars().all(|c| c.is_ascii_digit()) || clean_secret.is_empty() {
+        return None;
     }
 
-    let Ok(secret) = Secret::try_from_base32(&clean_secret) else {
-        return false;
-    };
+    let secret = Secret::try_from_base32(&clean_secret).ok()?;
 
-    // 1. Primary standard: SHA512, 8 digits, 30s step, 1 step tolerance
-    if let Ok(totp) = Builder::new()
+    // Strictly use SHA512 (8 digits, 30s step) as enrolled by Sugie.
+    // Do not fall back to SHA1/SHA256 so the brute-force guess surface is not multiplied by 3x.
+    let totp = Builder::new()
         .with_algorithm(Algorithm::SHA512)
-        .with_digits(8)
-        .with_skew(1)
-        .with_step_duration(30)
-        .with_secret(secret.clone())
-        .build()
-    {
-        if totp.check_current(&clean_code).is_some() {
-            return true;
-        }
-    }
-
-    // 2. Fallback: SHA1, 8 digits
-    if let Ok(totp) = Builder::new()
-        .with_algorithm(Algorithm::SHA1)
-        .with_digits(8)
-        .with_skew(1)
-        .with_step_duration(30)
-        .with_secret(secret.clone())
-        .build()
-    {
-        if totp.check_current(&clean_code).is_some() {
-            return true;
-        }
-    }
-
-    // 3. Fallback: SHA256, 8 digits
-    if let Ok(totp) = Builder::new()
-        .with_algorithm(Algorithm::SHA256)
         .with_digits(8)
         .with_skew(1)
         .with_step_duration(30)
         .with_secret(secret)
         .build()
-    {
-        if totp.check_current(&clean_code).is_some() {
-            return true;
-        }
-    }
+        .ok()?;
 
-    false
+    let matched_time = totp.check_current(&clean_code)?;
+    let matched_step = if matched_time > 100_000_000 {
+        (matched_time / 30) as i64
+    } else {
+        matched_time as i64
+    };
+    if matched_step <= last_used_step {
+        return None;
+    }
+    Some(matched_step)
+}
+
+/// Verifies an 8-digit TOTP code against a Base32 encoded secret without prior step history
+/// (used during initial TOTP activation).
+pub fn verify_totp(secret_encoded: &str, code: &str) -> bool {
+    verify_totp_step(secret_encoded, code, 0).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_totp_step_and_replay_prevention() {
+        let setup = generate_totp_setup("Sugie", "alice").expect("setup");
+        let secret = Secret::try_from_base32(&setup.secret).expect("secret");
+        let totp = Builder::new()
+            .with_algorithm(Algorithm::SHA512)
+            .with_digits(8)
+            .with_skew(1)
+            .with_step_duration(30)
+            .with_secret(secret)
+            .build()
+            .expect("build");
+
+        let code = totp.generate_current().to_string();
+        let step = verify_totp_step(&setup.secret, &code, 0).expect("first verification must succeed");
+        assert!(step > 0);
+
+        // Replaying the exact same code at the same or older step must be rejected
+        assert!(
+            verify_totp_step(&setup.secret, &code, step).is_none(),
+            "replayed TOTP code in the same step must be rejected"
+        );
+        assert!(
+            verify_totp_step(&setup.secret, &code, step + 1).is_none(),
+            "older TOTP step must be rejected"
+        );
+    }
 }

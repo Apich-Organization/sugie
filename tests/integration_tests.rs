@@ -877,3 +877,124 @@ async fn test_unconfigured_chat_webhook_endpoints_reject_requests() {
         StatusCode::SERVICE_UNAVAILABLE
     );
 }
+
+#[tokio::test]
+async fn test_chat_command_bearer_auth_and_sender_spoofing_defense() {
+    let (mut state, storage) = create_test_state();
+    storage
+        .upsert_repository(100, "StarLabsSI/ensia", 12345)
+        .unwrap();
+
+    // Configure super_users to grant `api:ci-bot` super_user status, while `api:token-client` is unprivileged
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.default_rules.commands.super_users = vec!["api:ci-bot".to_string()];
+        cfg.default_rules.commands.restricted_commands = vec!["close".to_string()];
+        state.triage.reload_config(cfg.clone());
+    }
+    state.chat_api_token = Some(Arc::from("unprivileged-secret,ci-bot:privileged-secret"));
+    let app = create_router(state);
+
+    // 1. Caller with unprivileged token tries to spoof `sender: "api:ci-bot"` to run restricted `/close`
+    let spoof_payload = serde_json::json!({
+        "command": "close StarLabsSI/ensia#1",
+        "sender": "api:ci-bot"
+    });
+    let req_spoof = Request::builder()
+        .method("POST")
+        .uri("/api/chat/command")
+        .header("content-type", "application/json")
+        .header("Authorization", "Bearer unprivileged-secret")
+        .body(Body::from(serde_json::to_vec(&spoof_payload).unwrap()))
+        .unwrap();
+    let resp_spoof = app.clone().oneshot(req_spoof).await.unwrap();
+    assert_eq!(resp_spoof.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp_spoof.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let reply = json["response"].as_str().unwrap_or("");
+    assert!(
+        reply.contains("restricted to authorized super users")
+            && reply.contains("api:token-client"),
+        "unprivileged token must not be able to spoof super_user sender identity: got {reply}"
+    );
+
+    // 2. Caller with named `ci-bot` Bearer token can authenticate via Authorization: Bearer
+    let valid_payload = serde_json::json!({
+        "command": "repos",
+        "sender": "ignored"
+    });
+    let req_bearer = Request::builder()
+        .method("POST")
+        .uri("/api/chat/command")
+        .header("content-type", "application/json")
+        .header("Authorization", "Bearer privileged-secret")
+        .body(Body::from(serde_json::to_vec(&valid_payload).unwrap()))
+        .unwrap();
+    let resp_bearer = app.oneshot(req_bearer).await.unwrap();
+    assert_eq!(resp_bearer.status(), StatusCode::OK);
+    assert_eq!(
+        resp_bearer
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        resp_bearer
+            .headers()
+            .get("x-frame-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("DENY")
+    );
+}
+
+#[tokio::test]
+async fn test_persistent_webhook_deduplication() {
+    let (state, storage) = create_test_state();
+    let secret = "webhook-secret-123";
+    let payload = br#"{"action":"ping"}"#;
+    let signature = generate_test_signature(secret, payload);
+    let delivery_id = "persistent-delivery-uuid-99999";
+
+    // First delivery succeeds and records in SQLite storage
+    let app1 = create_router(state.clone());
+    let req1 = Request::builder()
+        .uri("/webhook")
+        .method("POST")
+        .header("X-GitHub-Event", "ping")
+        .header("X-GitHub-Delivery", delivery_id)
+        .header("X-Hub-Signature-256", &signature)
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    let resp1 = app1.oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let b1 = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&b1).contains("Pong"));
+
+    // Verify storage directly reports the delivery as already seen
+    assert!(
+        storage.check_and_record_webhook_delivery(&format!("github:{delivery_id}"), 3600),
+        "SQLite storage must persist seen webhook delivery ID"
+    );
+
+    // Second delivery with same X-GitHub-Delivery is ignored as duplicate
+    let app2 = create_router(state);
+    let req2 = Request::builder()
+        .uri("/webhook")
+        .method("POST")
+        .header("X-GitHub-Event", "ping")
+        .header("X-GitHub-Delivery", delivery_id)
+        .header("X-Hub-Signature-256", &signature)
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    let resp2 = app2.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let b2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&b2).contains("Duplicate delivery ignored"));
+}

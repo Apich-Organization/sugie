@@ -25,7 +25,9 @@ fn is_duplicate_lark_message(msg_id: &str) -> bool {
     if msg_id.is_empty() {
         return false;
     }
-    let mut cache = LARK_DEDUP_CACHE.lock().unwrap();
+    let mut cache = LARK_DEDUP_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = std::time::Instant::now();
     cache.retain(|_, seen_at| now.duration_since(*seen_at).as_secs() < 600);
     if cache.contains_key(msg_id) {
@@ -551,9 +553,23 @@ pub async fn lark_chat_handler(
 
         // Deduplicate: If Lark delivers both Schema 1.0 and 2.0 (or retries), ignore duplicate
         if let Some(ref mid) = message_id {
-            if is_duplicate_lark_message(mid) {
-                info!("Ignoring duplicate Lark message delivery for message_id={:?}", mid);
-                return (StatusCode::OK, Json(json!({ "code": 0, "msg": "duplicate ignored" })));
+            let clean_mid = mid.trim();
+            if !clean_mid.is_empty() {
+                let db_dup = state
+                    .triage
+                    .storage()
+                    .check_and_record_webhook_delivery(&format!("lark:{clean_mid}"), 3600);
+                let mem_dup = is_duplicate_lark_message(clean_mid);
+                if db_dup || mem_dup {
+                    info!(
+                        "Ignoring duplicate Lark message delivery for message_id={:?}",
+                        clean_mid
+                    );
+                    return (
+                        StatusCode::OK,
+                        Json(json!({ "code": 0, "msg": "duplicate ignored" })),
+                    );
+                }
             }
         }
 
@@ -895,6 +911,36 @@ fn secret_matches(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
+/// Extract the authenticated API client identity from `SUGIE_CHAT_API_TOKEN`.
+///
+/// Supports either a single token (`SUGIE_CHAT_API_TOKEN=secret`, which maps to
+/// the fixed identity `"token-client"`) or comma-separated named tokens
+/// (`SUGIE_CHAT_API_TOKEN="ci-bot:secret1,deploy:secret2"`, which maps to the
+/// token's configured name). The sender identity used for authorization is always
+/// bound to the authenticated token, never to the unverified `payload.sender` field.
+fn resolve_api_token_identity(provided: &str, configured: &str) -> Option<String> {
+    if provided.is_empty() || configured.trim().is_empty() {
+        return None;
+    }
+    let mut matched_identity: Option<String> = None;
+    for entry in configured.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some((name, secret)) = entry.split_once(':') {
+            let name = name.trim();
+            let secret = secret.trim();
+            if !name.is_empty() && !secret.is_empty() && secret_matches(provided, secret) {
+                matched_identity = Some(name.to_string());
+            }
+        } else if secret_matches(provided, entry) {
+            matched_identity = Some("token-client".to_string());
+        }
+    }
+    matched_identity
+}
+
 pub async fn generic_chat_command_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -915,8 +961,22 @@ pub async fn generic_chat_command_handler(
     let provided = headers
         .get("x-sugie-chat-token")
         .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| {
+                    v.strip_prefix("Bearer ")
+                        .or_else(|| v.strip_prefix("bearer "))
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or("");
-    if !secret_matches(provided, expected) {
+
+    let Some(token_identity) = resolve_api_token_identity(provided, expected) else {
         // `{:?}` escapes control characters and the value is truncated, so a
         // caller cannot forge or flood log lines through the sender field.
         let claimed: Option<String> = payload
@@ -926,25 +986,27 @@ pub async fn generic_chat_command_handler(
         warn!("Rejected unauthenticated /api/chat/command call (sender={claimed:?})");
         return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "Missing or invalid X-Sugie-Chat-Token"})),
+            Json(json!({"error": "Missing or invalid X-Sugie-Chat-Token or Authorization Bearer token"})),
         )
             .into_response();
-    }
+    };
 
     let config = state.config();
-    let sender_name = payload.sender.unwrap_or_else(|| "api_user".to_string());
-    // Prefix sender ID with api: so generic API requests cannot spoof GitHub or other platform identities
-    let sender_id = if sender_name.starts_with("api:") {
-        sender_name.clone()
-    } else {
-        format!("api:{}", sender_name)
-    };
+    // Bind authorization identity strictly to the authenticated token name (`api:<token_identity>`)
+    // so callers cannot spoof arbitrary super_user identities via `payload.sender`.
+    let sender_id = format!("api:{token_identity}");
+    let display_name = payload
+        .sender
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(64).collect::<String>());
     let inbound = InboundChatMessage {
         platform: ChatPlatform::Api,
         sender: InboundSender {
             id: sender_id.clone(),
-            username: sender_name,
-            display_name: None,
+            username: sender_id.clone(),
+            display_name,
             extra_ids: vec![sender_id],
         },
         raw_content: payload.command,

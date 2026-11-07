@@ -26,6 +26,10 @@ pub const KEY_CONSOLE_HISTORY_KEEP: &str = "console_history_keep";
 /// would rather cap it — chat history in total, console history per user.
 const HISTORY_KEEP_DEFAULT: i64 = 0;
 
+/// Maximum period of inactivity (2 hours) before an admin session expires,
+/// enforced alongside the 12-hour absolute session TTL.
+pub const SESSION_IDLE_TIMEOUT_SECS: i64 = 2 * 3600;
+
 #[derive(Clone)]
 pub struct WebDb {
     conn: Arc<Mutex<Connection>>,
@@ -333,9 +337,18 @@ impl WebDb {
                 last_login TEXT,
                 totp_secret TEXT NOT NULL DEFAULT '',
                 totp_enabled INTEGER NOT NULL DEFAULT 0,
+                last_totp_step INTEGER NOT NULL DEFAULT 0,
                 two_fa_policy TEXT NOT NULL DEFAULT 'default',
                 failed_attempts INTEGER NOT NULL DEFAULT 0,
                 locked_until TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS web_login_attempts (
+                username TEXT NOT NULL COLLATE NOCASE,
+                ip TEXT NOT NULL,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                locked_until TEXT,
+                PRIMARY KEY (username, ip)
             );
 
             CREATE TABLE IF NOT EXISTS web_sessions (
@@ -343,6 +356,7 @@ impl WebDb {
                 user_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
+                last_active_at TEXT NOT NULL DEFAULT '',
                 ip TEXT NOT NULL DEFAULT '',
                 user_agent TEXT NOT NULL DEFAULT ''
             );
@@ -466,6 +480,14 @@ impl WebDb {
         );
         let _ = conn.execute(
             "ALTER TABLE web_users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE web_users ADD COLUMN last_totp_step INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE web_sessions ADD COLUMN last_active_at TEXT NOT NULL DEFAULT ''",
             [],
         );
         let _ = conn.execute(
@@ -825,13 +847,14 @@ impl WebDb {
 
     // ------------------------------------------------------ login throttling
 
-    /// Seconds until the account may try again, or `None` when it is not locked.
-    pub fn login_lockout_remaining(&self, username: &str) -> Result<Option<i64>> {
+    /// Seconds until `(username, ip)` may try again, or `None` when not locked.
+    pub fn login_lockout_remaining_for_ip(&self, username: &str, ip: &str) -> Result<Option<i64>> {
         let conn = self.lock_conn();
         let locked: Option<Option<String>> = conn
             .query_row(
-                "SELECT locked_until FROM web_users WHERE username = ?1 COLLATE NOCASE",
-                params![username],
+                "SELECT locked_until FROM web_login_attempts
+                 WHERE username = ?1 COLLATE NOCASE AND ip = ?2",
+                params![username, ip],
                 |r| r.get::<_, Option<String>>(0),
             )
             .optional()?;
@@ -847,6 +870,62 @@ impl WebDb {
         }
     }
 
+    /// Increment the per-(username, ip) failure counter and lock that source IP
+    /// for the account once `threshold` is reached, preventing an unauthenticated
+    /// attacker on one IP from globally locking out the account for legitimate users.
+    pub fn record_login_failure_for_ip(
+        &self,
+        username: &str,
+        ip: &str,
+        threshold: i64,
+        lock_secs: i64,
+    ) -> Result<Option<i64>> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO web_login_attempts (username, ip, failed_attempts, locked_until)
+             VALUES (?1, ?2, 1, NULL)
+             ON CONFLICT(username, ip) DO UPDATE SET
+                 failed_attempts = web_login_attempts.failed_attempts + 1",
+            params![username, ip],
+        )?;
+        let attempts: Option<i64> = conn
+            .query_row(
+                "SELECT failed_attempts FROM web_login_attempts
+                 WHERE username = ?1 COLLATE NOCASE AND ip = ?2",
+                params![username, ip],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if attempts.unwrap_or(0) >= threshold {
+            let until = Utc::now() + chrono::Duration::seconds(lock_secs);
+            conn.execute(
+                "UPDATE web_login_attempts SET locked_until = ?3, failed_attempts = 0
+                 WHERE username = ?1 COLLATE NOCASE AND ip = ?2",
+                params![username, ip, until.to_rfc3339()],
+            )?;
+            return Ok(Some(lock_secs));
+        }
+        Ok(None)
+    }
+
+    pub fn clear_login_failures_for_ip(&self, user_id: i64, username: &str, ip: &str) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE web_users SET failed_attempts = 0, locked_until = NULL WHERE id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM web_login_attempts WHERE username = ?1 COLLATE NOCASE AND ip = ?2",
+            params![username, ip],
+        )?;
+        Ok(())
+    }
+
+    /// Seconds until the account may try again, or `None` when it is not locked.
+    pub fn login_lockout_remaining(&self, username: &str) -> Result<Option<i64>> {
+        self.login_lockout_remaining_for_ip(username, "-")
+    }
+
     /// Increment the failure counter and lock the account once `threshold` is
     /// reached. Returns the lock duration in seconds when the account just got
     /// locked.
@@ -856,29 +935,7 @@ impl WebDb {
         threshold: i64,
         lock_secs: i64,
     ) -> Result<Option<i64>> {
-        let conn = self.lock_conn();
-        conn.execute(
-            "UPDATE web_users SET failed_attempts = failed_attempts + 1
-             WHERE username = ?1 COLLATE NOCASE",
-            params![username],
-        )?;
-        let attempts: Option<i64> = conn
-            .query_row(
-                "SELECT failed_attempts FROM web_users WHERE username = ?1 COLLATE NOCASE",
-                params![username],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if attempts.unwrap_or(0) >= threshold {
-            let until = Utc::now() + chrono::Duration::seconds(lock_secs);
-            conn.execute(
-                "UPDATE web_users SET locked_until = ?2, failed_attempts = 0
-                 WHERE username = ?1 COLLATE NOCASE",
-                params![username, until.to_rfc3339()],
-            )?;
-            return Ok(Some(lock_secs));
-        }
-        Ok(None)
+        self.record_login_failure_for_ip(username, "-", threshold, lock_secs)
     }
 
     pub fn clear_login_failures(&self, user_id: i64) -> Result<()> {
@@ -919,7 +976,8 @@ impl WebDb {
                         (SELECT COUNT(*) FROM web_passkeys p WHERE p.user_id = u.id),
                         (SELECT GROUP_CONCAT(repo, char(31)) FROM web_repo_perms r WHERE r.user_id = u.id),
                         (SELECT GROUP_CONCAT(command, char(31)) FROM web_command_perms c WHERE c.user_id = u.id),
-                        s.expires_at
+                        s.expires_at,
+                        s.last_active_at
                  FROM web_sessions s JOIN web_users u ON u.id = s.user_id
                  WHERE s.token_hash = ?1",
                 params![token_hash],
@@ -939,19 +997,28 @@ impl WebDb {
                     let repos: Option<String> = r.get(10)?;
                     let commands: Option<String> = r.get(11)?;
                     let expires_at: String = r.get(12)?;
-                    Ok((user, split_grants(repos), split_grants(commands), expires_at))
+                    let last_active_at: String = r.get::<_, Option<String>>(13)?.unwrap_or_default();
+                    Ok((user, split_grants(repos), split_grants(commands), expires_at, last_active_at))
                 },
             )
             .optional()?;
 
-        let Some((user, repos, commands, expires_at)) = row else {
+        let Some((user, repos, commands, expires_at, last_active_at)) = row else {
             return Ok(None);
         };
 
+        let now = Utc::now();
         let expired = chrono::DateTime::parse_from_rfc3339(&expires_at)
-            .map(|d| d.with_timezone(&Utc) < Utc::now())
+            .map(|d| d.with_timezone(&Utc) < now)
             .unwrap_or(true);
-        if expired {
+        let idle_expired = if !last_active_at.trim().is_empty() {
+            chrono::DateTime::parse_from_rfc3339(&last_active_at)
+                .map(|d| (now - d.with_timezone(&Utc)).num_seconds() > SESSION_IDLE_TIMEOUT_SECS)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if expired || idle_expired {
             conn.execute(
                 "DELETE FROM web_sessions WHERE token_hash = ?1",
                 params![token_hash],
@@ -961,6 +1028,10 @@ impl WebDb {
         if !user.active {
             return Ok(None);
         }
+        let _ = conn.execute(
+            "UPDATE web_sessions SET last_active_at = ?2 WHERE token_hash = ?1",
+            params![token_hash, now.to_rfc3339()],
+        );
         Ok(Some((user, repos, commands)))
     }
 
@@ -1006,21 +1077,65 @@ impl WebDb {
         Ok(row)
     }
 
+    pub fn get_totp_state(&self, user_id: i64) -> Result<Option<(String, bool, i64)>> {
+        let conn = self.lock_conn();
+        let row = conn
+            .query_row(
+                "SELECT totp_secret, totp_enabled, last_totp_step FROM web_users WHERE id = ?1",
+                params![user_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? == 1,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Atomically records the matched TOTP time step only if it is strictly greater
+    /// than the previously accepted step for `user_id` (defeating concurrent or sequential
+    /// TOTP replay attacks within the 30s/skew window).
+    pub fn record_totp_step(&self, user_id: i64, step: i64) -> Result<bool> {
+        let conn = self.lock_conn();
+        let affected = conn.execute(
+            "UPDATE web_users SET last_totp_step = ?2 WHERE id = ?1 AND last_totp_step < ?2",
+            params![user_id, step],
+        )?;
+        Ok(affected > 0)
+    }
+
     pub fn activate_totp(&self, user_id: i64, secret: &str) -> Result<()> {
+        self.activate_totp_with_step(user_id, secret, 0)
+    }
+
+    pub fn activate_totp_with_step(&self, user_id: i64, secret: &str, step: i64) -> Result<()> {
         let conn = self.lock_conn();
         conn.execute(
-            "UPDATE web_users SET totp_secret = ?2, totp_enabled = 1 WHERE id = ?1",
-            params![user_id, secret],
+            "UPDATE web_users SET totp_secret = ?2, totp_enabled = 1, last_totp_step = ?3 WHERE id = ?1",
+            params![user_id, secret, step],
         )?;
         Ok(())
     }
 
     pub fn disable_totp(&self, user_id: i64) -> Result<()> {
-        let conn = self.lock_conn();
-        conn.execute(
-            "UPDATE web_users SET totp_secret = '', totp_enabled = 0 WHERE id = ?1",
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE web_users SET totp_secret = '', totp_enabled = 0, last_totp_step = 0 WHERE id = ?1",
             params![user_id],
         )?;
+        tx.execute(
+            "DELETE FROM web_sessions WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM web_pending_2fa WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1028,7 +1143,7 @@ impl WebDb {
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         tx.execute(
-            "UPDATE web_users SET totp_secret = '', totp_enabled = 0 WHERE id = ?1",
+            "UPDATE web_users SET totp_secret = '', totp_enabled = 0, last_totp_step = 0 WHERE id = ?1",
             params![user_id],
         )?;
         tx.execute(
@@ -1039,6 +1154,10 @@ impl WebDb {
         // session created with the removed factor cannot linger.
         tx.execute(
             "DELETE FROM web_sessions WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM web_pending_2fa WHERE user_id = ?1",
             params![user_id],
         )?;
         tx.commit()?;
@@ -1136,15 +1255,17 @@ impl WebDb {
     ) -> Result<()> {
         let conn = self.lock_conn();
         let now = Utc::now();
+        let now_str = now.to_rfc3339();
         let expires = now + chrono::Duration::hours(ttl_hours);
         conn.execute(
-            "INSERT INTO web_sessions (token_hash, user_id, created_at, expires_at, ip, user_agent)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO web_sessions (token_hash, user_id, created_at, expires_at, last_active_at, ip, user_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 token_hash,
                 user_id,
-                now.to_rfc3339(),
+                now_str,
                 expires.to_rfc3339(),
+                now_str,
                 ip,
                 user_agent
             ],
@@ -1155,29 +1276,48 @@ impl WebDb {
     /// Returns the user for a live session token hash, purging it when expired.
     pub fn session_user(&self, token_hash: &str) -> Result<Option<UserRow>> {
         let conn = self.lock_conn();
-        let found: Option<(String, i64)> = conn
+        let found: Option<(String, String, i64)> = conn
             .query_row(
-                "SELECT expires_at, user_id FROM web_sessions WHERE token_hash = ?1",
+                "SELECT expires_at, last_active_at, user_id FROM web_sessions WHERE token_hash = ?1",
                 params![token_hash],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
             )
             .optional()?;
 
-        let Some((expires_at, user_id)) = found else {
+        let Some((expires_at, last_active_at, user_id)) = found else {
             return Ok(None);
         };
 
+        let now = Utc::now();
         let expired = chrono::DateTime::parse_from_rfc3339(&expires_at)
-            .map(|d| d.with_timezone(&Utc) < Utc::now())
+            .map(|d| d.with_timezone(&Utc) < now)
             .unwrap_or(true);
+        let idle_expired = if !last_active_at.trim().is_empty() {
+            chrono::DateTime::parse_from_rfc3339(&last_active_at)
+                .map(|d| (now - d.with_timezone(&Utc)).num_seconds() > SESSION_IDLE_TIMEOUT_SECS)
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
-        if expired {
+        if expired || idle_expired {
             conn.execute(
                 "DELETE FROM web_sessions WHERE token_hash = ?1",
                 params![token_hash],
             )?;
             return Ok(None);
         }
+
+        let _ = conn.execute(
+            "UPDATE web_sessions SET last_active_at = ?2 WHERE token_hash = ?1",
+            params![token_hash, now.to_rfc3339()],
+        );
 
         let sql = format!("{USER_SELECT_SQL} WHERE u.id = ?1");
         let row = conn

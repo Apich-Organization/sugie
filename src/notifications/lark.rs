@@ -244,6 +244,7 @@ impl LarkNotifier {
             self.config.api_base.trim_end_matches('/')
         };
         let token_url = format!("{}/open-apis/auth/v3/tenant_access_token/internal", api_base);
+        crate::notifications::verify_webhook_destination(&token_url).await?;
 
         let body = json!({
             "app_id": app_id,
@@ -469,6 +470,7 @@ impl LarkNotifier {
             self.config.api_base.trim_end_matches('/')
         };
         let send_url = format!("{}/open-apis/im/v1/messages?receive_id_type=chat_id", api_base);
+        crate::notifications::verify_webhook_destination(&send_url).await?;
 
         let card = Self::build_interactive_card(title, message, url, color_template, fields);
         let payload = json!({
@@ -551,6 +553,7 @@ impl LarkNotifier {
             self.config.api_base.trim_end_matches('/')
         };
         let reply_url = format!("{}/open-apis/im/v1/messages/{}/reply", api_base, message_id);
+        crate::notifications::verify_webhook_destination(&reply_url).await?;
 
         let card = Self::build_interactive_card(title, message, url, color_template, fields);
         let payload = json!({
@@ -648,9 +651,7 @@ impl LarkNotifier {
             }
         }
 
-        if !crate::notifications::is_safe_webhook_url(url_str) {
-            anyhow::bail!("Blocked unsafe or non-HTTPS Lark webhook destination (SSRF protection)");
-        }
+        crate::notifications::verify_webhook_destination(url_str).await?;
 
         let started = std::time::Instant::now();
         let send_res = self

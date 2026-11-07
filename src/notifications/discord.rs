@@ -219,9 +219,7 @@ impl DiscordNotifier {
         title: &str,
         is_report: bool,
     ) -> Result<()> {
-        if !crate::notifications::is_safe_webhook_url(target_url) {
-            anyhow::bail!("Blocked unsafe or non-HTTPS webhook destination (SSRF protection)");
-        }
+        crate::notifications::verify_webhook_destination(target_url).await?;
 
         let mut request = self.http.post(target_url).json(payload);
         if let Some(auth) = auth {

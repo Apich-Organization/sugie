@@ -19,6 +19,53 @@ pub fn create_notification_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+pub fn is_safe_ip(ip: std::net::IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            if v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || octets[0] == 0 // 0.0.0.0/8 ("this" network)
+                || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64) // 100.64.0.0/10 (CGNAT / cloud internal)
+                || (octets[0] == 198 && (octets[1] & 0xfe) == 18) // 198.18.0.0/15 (benchmarking)
+                || octets[0] >= 240 // 240.0.0.0/4 (reserved)
+            {
+                return false;
+            }
+            true
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (segs[0] & 0xfe00) == 0xfc00 // fc00::/7 Unique Local Address (ULA)
+                || (segs[0] & 0xffc0) == 0xfe80 // fe80::/10 Link-Local Unicast
+                || (segs[0] == 0x2001 && segs[1] == 0x0db8) // 2001:db8::/32 Documentation
+            {
+                return false;
+            }
+            // Check IPv4-compatible IPv6 addresses (::a.b.c.d)
+            if segs[0..6] == [0, 0, 0, 0, 0, 0] {
+                let v4 = std::net::Ipv4Addr::new(
+                    (segs[6] >> 8) as u8,
+                    (segs[6] & 0xff) as u8,
+                    (segs[7] >> 8) as u8,
+                    (segs[7] & 0xff) as u8,
+                );
+                return is_safe_ip(std::net::IpAddr::V4(v4));
+            }
+            true
+        }
+    }
+}
+
 pub fn is_safe_webhook_url(raw_url: &str) -> bool {
     let parsed = match url::Url::parse(raw_url) {
         Ok(u) => u,
@@ -27,39 +74,74 @@ pub fn is_safe_webhook_url(raw_url: &str) -> bool {
     if parsed.scheme() != "https" {
         return false;
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
     let host = match parsed.host() {
         Some(h) => h,
         None => return false,
     };
     match host {
         url::Host::Ipv4(ip) => {
-            if ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_unspecified()
-            {
+            if !is_safe_ip(std::net::IpAddr::V4(ip)) {
                 return false;
             }
         }
         url::Host::Ipv6(ip) => {
-            if ip.is_loopback() || ip.is_unspecified() {
+            if !is_safe_ip(std::net::IpAddr::V6(ip)) {
                 return false;
             }
         }
         url::Host::Domain(d) => {
-            let lower = d.to_ascii_lowercase();
-            if lower == "localhost"
+            let lower = d.trim_end_matches('.').to_ascii_lowercase();
+            if lower.is_empty()
+                || lower == "localhost"
                 || lower.ends_with(".localhost")
                 || lower.ends_with(".local")
+                || lower.ends_with(".internal")
                 || lower == "metadata.google.internal"
                 || lower == "instance-data"
             {
                 return false;
             }
+            if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+                if !is_safe_ip(ip) {
+                    return false;
+                }
+            }
         }
     }
     true
+}
+
+/// Validates the webhook URL syntax/scheme and performs async DNS resolution to verify
+/// that all resolved IP addresses are public and safe (defending against DNS rebinding SSRF).
+pub async fn verify_webhook_destination(raw_url: &str) -> anyhow::Result<()> {
+    if !is_safe_webhook_url(raw_url) {
+        anyhow::bail!("Blocked unsafe or non-HTTPS webhook destination (SSRF protection)");
+    }
+    let parsed = url::Url::parse(raw_url)
+        .map_err(|_| anyhow::anyhow!("Invalid webhook URL"))?;
+    if let Some(url::Host::Domain(domain)) = parsed.host() {
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let addrs = tokio::net::lookup_host((domain, port))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to resolve webhook host '{domain}': {e}"))?;
+        let mut count = 0usize;
+        for addr in addrs {
+            count += 1;
+            if !is_safe_ip(addr.ip()) {
+                anyhow::bail!(
+                    "Blocked webhook destination '{domain}': resolved to non-public IP {} (SSRF protection)",
+                    addr.ip()
+                );
+            }
+        }
+        if count == 0 {
+            anyhow::bail!("Webhook host '{domain}' did not resolve to any IP addresses");
+        }
+    }
+    Ok(())
 }
 
 pub fn sanitize_error_str(err: &dyn std::fmt::Display) -> String {
@@ -436,6 +518,21 @@ mod tests {
         assert!(!is_safe_webhook_url("https://192.168.1.1/internal"));
         assert!(!is_safe_webhook_url("https://172.16.0.1/secret"));
         assert!(!is_safe_webhook_url("https://metadata.google.internal/computeMetadata"));
+
+        // IPv4 CGNAT (Alibaba Cloud metadata 100.100.100.200 / Tailscale / RFC 6598) & 0.0.0.0/8
+        assert!(!is_safe_webhook_url("https://100.64.0.1/webhook"));
+        assert!(!is_safe_webhook_url("https://100.100.100.200/latest/meta-data"));
+        assert!(!is_safe_webhook_url("https://0.0.0.0/webhook"));
+        assert!(!is_safe_webhook_url("https://0.1.2.3/webhook"));
+
+        // IPv6 loopback, ULA (fc00::/7), link-local (fe80::/10), and IPv4-mapped IPv6 (::ffff:...)
+        assert!(!is_safe_webhook_url("https://[::1]/webhook"));
+        assert!(!is_safe_webhook_url("https://[fc00::1]/webhook"));
+        assert!(!is_safe_webhook_url("https://[fd12:3456:789a::1]/webhook"));
+        assert!(!is_safe_webhook_url("https://[fe80::1]/webhook"));
+        assert!(!is_safe_webhook_url("https://[::ffff:127.0.0.1]/webhook"));
+        assert!(!is_safe_webhook_url("https://[::ffff:169.254.169.254]/latest/meta-data"));
+        assert!(!is_safe_webhook_url("https://[::ffff:10.0.0.1]/admin"));
     }
 
     #[test]
