@@ -1028,6 +1028,15 @@ pub fn load_dotenv() {
                 if let Some((key, value)) = line.split_once('=') {
                     let key = key.trim();
                     let mut value = value.trim();
+                    // Validate that key is non-empty, contains no null bytes, and matches valid env var identifiers.
+                    // Lines like `=========================` split on `=` have an empty key `""`,
+                    // which causes std::env::set_var to panic with "Invalid argument (os error 22)".
+                    if key.is_empty()
+                        || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        || !key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    {
+                        continue;
+                    }
                     // A quoted value keeps its inner text; the length check is
                     // part of the same condition so the slice below is always
                     // in range.
