@@ -95,6 +95,13 @@ pub struct DiscordBotChannel {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiscordConfig {
+    /// Notification delivery mode: "auto", "webhook", "bot", or "both".
+    /// - "webhook": send only via incoming webhook URL to default group
+    /// - "bot": send only via bot API to Discord channel(s)
+    /// - "both": send to both webhook URL and bot channel(s)
+    /// - "auto": prefers bot channel if configured, otherwise falls back to webhook URL
+    #[serde(default = "default_notify_mode")]
+    pub mode: String,
     /// Channel webhook. Kept for existing installs; superseded by `bot_token`.
     #[serde(default)]
     pub webhook_url: String,
@@ -126,6 +133,10 @@ pub struct DiscordConfig {
 
 fn default_discord_username() -> String {
     "sugie-bot".to_string()
+}
+
+pub fn default_notify_mode() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,6 +216,13 @@ pub struct LarkWebhookChannel {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LarkConfig {
+    /// Notification delivery mode: "auto", "webhook", "bot", or "both".
+    /// - "webhook": send only via incoming webhook URL to default group
+    /// - "bot": send only via Lark Open API to group chat(s)
+    /// - "both": send to both webhook URL and bot chat(s)
+    /// - "auto": prefers bot channels if configured, otherwise falls back to webhook URL
+    #[serde(default = "default_notify_mode")]
+    pub mode: String,
     /// Custom Robot incoming webhook URL (single group chat)
     #[serde(default)]
     pub webhook_url: String,
@@ -1328,6 +1346,13 @@ impl SugieConfig {
 
         // Discord notification settings (merge env secrets/overrides into TOML config)
         if let Some(ref mut discord) = config.notifications.discord {
+            if let Ok(mode) = std::env::var("SUGIE_DISCORD_NOTIFY_MODE")
+                .or_else(|_| std::env::var("SUGIE_DISCORD_MODE"))
+            {
+                if !mode.trim().is_empty() {
+                    discord.mode = mode.trim().to_lowercase();
+                }
+            }
             if let Ok(url) = std::env::var("SUGIE_DISCORD_WEBHOOK_URL") {
                 if !url.trim().is_empty() {
                     discord.webhook_url = url;
@@ -1377,7 +1402,11 @@ impl SugieConfig {
                     .or_else(|_| std::env::var("SUGIE_DISCORD_REPOS"))
                     .ok()
                     .and_then(|r| parse_repo_list(&r));
+                let mode = std::env::var("SUGIE_DISCORD_NOTIFY_MODE")
+                    .or_else(|_| std::env::var("SUGIE_DISCORD_MODE"))
+                    .unwrap_or_else(|_| default_notify_mode());
                 config.notifications.discord = Some(DiscordConfig {
+                    mode,
                     webhook_url,
                     reports_webhook_url: env_trimmed("SUGIE_DISCORD_REPORTS_WEBHOOK_URL"),
                     bot_token,
@@ -1479,6 +1508,13 @@ impl SugieConfig {
 
         // Lark notification settings (merge env secrets/overrides into TOML config)
         if let Some(ref mut lark) = config.notifications.lark {
+            if let Ok(mode) = std::env::var("SUGIE_LARK_NOTIFY_MODE")
+                .or_else(|_| std::env::var("SUGIE_LARK_MODE"))
+            {
+                if !mode.trim().is_empty() {
+                    lark.mode = mode.trim().to_lowercase();
+                }
+            }
             if let Ok(url) = std::env::var("SUGIE_LARK_WEBHOOK_URL") {
                 if !url.trim().is_empty() {
                     lark.webhook_url = url;
@@ -1553,7 +1589,11 @@ impl SugieConfig {
                     .or_else(|_| std::env::var("SUGIE_LARK_REPOS"))
                     .ok()
                     .and_then(|r| parse_repo_list(&r));
+                let mode = std::env::var("SUGIE_LARK_NOTIFY_MODE")
+                    .or_else(|_| std::env::var("SUGIE_LARK_MODE"))
+                    .unwrap_or_else(|_| default_notify_mode());
                 config.notifications.lark = Some(LarkConfig {
+                    mode,
                     webhook_url: lark_url.unwrap_or_default(),
                     secret,
                     app_id,

@@ -64,9 +64,16 @@ impl DiscordNotifier {
     /// Whether this configuration can send anything at all.
     ///
     /// A token without a channel id still counts as configured: the send then
-    /// fails with an explicit message instead of the channel going quiet.
+    /// falls back to webhook or fails with an explicit message instead of the channel going quiet.
     pub fn is_configured(&self) -> bool {
-        self.has_webhook() || self.has_bot()
+        let mode = self.config.mode.trim().to_ascii_lowercase();
+        if mode == "webhook" {
+            self.has_webhook()
+        } else if mode == "bot" {
+            self.has_bot()
+        } else {
+            self.has_webhook() || self.has_bot()
+        }
     }
 
     pub fn has_webhook(&self) -> bool {
@@ -129,42 +136,25 @@ impl DiscordNotifier {
         list
     }
 
-    /// Pick the destination for this message.
-    ///
-    /// A bot token takes precedence: one credential covers every channel the bot
-    /// has been invited to, instead of one webhook URL per channel. Webhooks stay
-    /// supported so existing configurations keep working unchanged.
-    fn target(&self, is_report: bool) -> Result<DiscordTarget> {
-        let has_token = self
-            .config
-            .bot_token
-            .as_deref()
-            .is_some_and(|t| !t.trim().is_empty());
+    pub fn resolve_bot_channel(&self, is_report: bool) -> Option<String> {
+        let channel = if is_report {
+            self.config
+                .reports_channel_id
+                .as_deref()
+                .or(self.config.channel_id.as_deref())
+                .or_else(|| self.config.bot_channels.iter().find(|c| c.name == "reports" || c.name == "default").map(|c| c.channel_id.as_str()))
+                .or_else(|| self.config.bot_channels.first().map(|c| c.channel_id.as_str()))
+        } else {
+            self.config
+                .channel_id
+                .as_deref()
+                .or_else(|| self.config.bot_channels.iter().find(|c| c.name == "default").map(|c| c.channel_id.as_str()))
+                .or_else(|| self.config.bot_channels.first().map(|c| c.channel_id.as_str()))
+        };
+        channel.map(str::trim).filter(|c| !c.is_empty()).map(|s| s.to_string())
+    }
 
-        if has_token {
-            let channel = if is_report {
-                self.config
-                    .reports_channel_id
-                    .as_deref()
-                    .or(self.config.channel_id.as_deref())
-                    .or_else(|| self.config.bot_channels.iter().find(|c| c.name == "reports" || c.name == "default").map(|c| c.channel_id.as_str()))
-                    .or_else(|| self.config.bot_channels.first().map(|c| c.channel_id.as_str()))
-            } else {
-                self.config
-                    .channel_id
-                    .as_deref()
-                    .or_else(|| self.config.bot_channels.iter().find(|c| c.name == "default").map(|c| c.channel_id.as_str()))
-                    .or_else(|| self.config.bot_channels.first().map(|c| c.channel_id.as_str()))
-            };
-            return match channel.map(str::trim).filter(|c| !c.is_empty()) {
-                Some(id) => Ok(DiscordTarget::Channel(id.to_string())),
-                None => anyhow::bail!(
-                    "Discord bot token is set but channel_id is missing; \
-                     add channel_id (or reports_channel_id) to [notifications.discord]"
-                ),
-            };
-        }
-
+    pub fn resolve_webhook_url(&self, is_report: bool) -> Option<String> {
         let url = if is_report {
             self.config
                 .reports_webhook_url
@@ -180,14 +170,65 @@ impl DiscordNotifier {
         } else {
             ""
         };
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
 
-        if url.trim().is_empty() {
+    /// Pick the destination for this message based on `mode`:
+    /// - "webhook": always post to webhook URL
+    /// - "bot": always post as bot to channel
+    /// - "auto": prefers bot if channel_id/bot_channels is configured, otherwise falls back to webhook
+    fn target(&self, is_report: bool) -> Result<DiscordTarget> {
+        let mode = self.config.mode.trim().to_ascii_lowercase();
+
+        if mode == "webhook" {
+            if let Some(url) = self.resolve_webhook_url(is_report) {
+                return Ok(DiscordTarget::Webhook(url));
+            }
+            anyhow::bail!("Discord mode is 'webhook' but no webhook URL is configured");
+        }
+
+        if mode == "bot" {
+            if !self.has_bot() {
+                anyhow::bail!("Discord mode is 'bot' but SUGIE_DISCORD_BOT_TOKEN is not configured");
+            }
+            if let Some(ch) = self.resolve_bot_channel(is_report) {
+                return Ok(DiscordTarget::Channel(ch));
+            }
             anyhow::bail!(
-                "Discord is not configured: set SUGIE_DISCORD_BOT_TOKEN with a channel_id, \
-                 or SUGIE_DISCORD_WEBHOOK_URL"
+                "Discord mode is 'bot' but channel_id is missing; \
+                 add channel_id (or reports_channel_id) to [notifications.discord]"
             );
         }
-        Ok(DiscordTarget::Webhook(url.to_string()))
+
+        // "auto" mode (default)
+        let has_token = self.has_bot();
+        if has_token {
+            if let Some(ch) = self.resolve_bot_channel(is_report) {
+                return Ok(DiscordTarget::Channel(ch));
+            }
+            // Graceful fallback: If bot token is set but channel_id is missing, fall back to webhook!
+            if let Some(url) = self.resolve_webhook_url(is_report) {
+                return Ok(DiscordTarget::Webhook(url));
+            }
+            anyhow::bail!(
+                "Discord bot token is set but channel_id is missing and no webhook URL is configured; \
+                 add channel_id (or reports_channel_id) to [notifications.discord] or set SUGIE_DISCORD_WEBHOOK_URL"
+            );
+        }
+
+        if let Some(url) = self.resolve_webhook_url(is_report) {
+            return Ok(DiscordTarget::Webhook(url));
+        }
+
+        anyhow::bail!(
+            "Discord is not configured: set SUGIE_DISCORD_BOT_TOKEN with a channel_id, \
+             or SUGIE_DISCORD_WEBHOOK_URL"
+        );
     }
 
     fn create_embed(
@@ -329,9 +370,47 @@ impl DiscordNotifier {
         fields: Vec<DiscordEmbedField>,
         is_report: bool,
     ) -> Result<()> {
+        let mode = self.config.mode.trim().to_ascii_lowercase();
+
+        if mode == "both" {
+            let mut sent_any = false;
+            let mut errors = Vec::new();
+
+            if self.has_bot() {
+                if let Some(id) = self.resolve_bot_channel(is_report) {
+                    match self.send_to_channel(&id, title, description, url, color, fields.clone()).await {
+                        Ok(_) => sent_any = true,
+                        Err(e) => errors.push(format!("Bot channel {id}: {e}")),
+                    }
+                }
+            }
+            if let Some(url_str) = self.resolve_webhook_url(is_report) {
+                match self.send_to_webhook(&url_str, title, description, url, color, fields).await {
+                    Ok(_) => sent_any = true,
+                    Err(e) => errors.push(format!("Webhook: {e}")),
+                }
+            }
+            if !sent_any {
+                anyhow::bail!("Discord 'both' mode failed: {}", errors.join("; "));
+            }
+            return Ok(());
+        }
+
         match self.target(is_report)? {
             DiscordTarget::Channel(id) => {
-                self.send_to_channel(&id, title, description, url, color, fields).await
+                match self.send_to_channel(&id, title, description, url, color, fields.clone()).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        // In auto mode, if bot send fails (e.g. HTTP 404 unknown channel), fall back to webhook if available
+                        if mode == "auto" || mode.is_empty() {
+                            if let Some(url_str) = self.resolve_webhook_url(is_report) {
+                                tracing::warn!("Discord bot send to channel {id} failed ({e}); falling back to webhook URL");
+                                return self.send_to_webhook(&url_str, title, description, url, color, fields).await;
+                            }
+                        }
+                        Err(e)
+                    }
+                }
             }
             DiscordTarget::Webhook(url_str) => {
                 self.send_to_webhook(&url_str, title, description, url, color, fields).await
@@ -467,6 +546,34 @@ mod tests {
         assert_eq!(
             notifier.target(true).expect("target"),
             DiscordTarget::Channel("99".to_string())
+        );
+    }
+
+    #[test]
+    fn mode_webhook_forces_webhook_even_with_token_and_channel() {
+        let mut config = cfg(
+            "https://discord.com/api/webhooks/x/y",
+            Some("tok"),
+            Some("42"),
+        );
+        config.mode = "webhook".to_string();
+        let notifier = DiscordNotifier::new(config);
+        assert_eq!(
+            notifier.target(false).expect("target"),
+            DiscordTarget::Webhook("https://discord.com/api/webhooks/x/y".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_mode_falls_back_to_webhook_when_channel_is_missing() {
+        let notifier = DiscordNotifier::new(cfg(
+            "https://discord.com/api/webhooks/x/y",
+            Some("tok"),
+            None,
+        ));
+        assert_eq!(
+            notifier.target(false).expect("target"),
+            DiscordTarget::Webhook("https://discord.com/api/webhooks/x/y".to_string())
         );
     }
 

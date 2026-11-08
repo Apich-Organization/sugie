@@ -171,7 +171,14 @@ impl LarkNotifier {
 
     /// Whether Lark can send notifications at all (either as bot or via webhook).
     pub fn is_configured(&self) -> bool {
-        self.has_bot() || self.has_webhook()
+        let mode = self.config.mode.trim().to_ascii_lowercase();
+        if mode == "webhook" {
+            self.has_webhook()
+        } else if mode == "bot" {
+            self.has_bot()
+        } else {
+            self.has_bot() || self.has_webhook()
+        }
     }
 
     /// Registered named channel (group chat) destinations.
@@ -755,8 +762,11 @@ impl LarkNotifier {
         Ok(())
     }
 
-    /// Dispatch notification automatically: prefers Bot channels if configured,
-    /// otherwise falls back to incoming webhook URL.
+    /// Dispatch notification according to delivery mode:
+    /// - "webhook": always sends to incoming webhook URL (default group)
+    /// - "bot": sends via Lark Open API to group chat(s)
+    /// - "both": sends to both Lark Open API chat(s) and incoming webhook URL
+    /// - "auto" (default): prefers Bot channels if configured; falls back to incoming webhook URL if bot fails or is unconfigured
     pub async fn send_notification(
         &self,
         title: &str,
@@ -765,39 +775,100 @@ impl LarkNotifier {
         color_template: &str,
         fields: &[(&str, &str)],
     ) -> Result<()> {
-        if self.has_bot() {
+        let mode = self.config.mode.trim().to_ascii_lowercase();
+
+        if mode == "webhook" {
+            return self.send_webhook_notification(title, message, url, color_template, fields).await;
+        }
+
+        if mode == "both" {
+            let mut sent_any = false;
+            let mut errors = Vec::new();
+
+            if self.has_bot() {
+                if !self.config.channels.is_empty() {
+                    for ch in &self.config.channels {
+                        match self.send_to_chat(&ch.chat_id, title, message, url, color_template, fields).await {
+                            Ok(_) => sent_any = true,
+                            Err(e) => errors.push(format!("Lark channel {}: {e}", ch.name)),
+                        }
+                    }
+                } else if let Some(ref default_cid) = self.config.default_chat_id {
+                    match self.send_to_chat(default_cid, title, message, url, color_template, fields).await {
+                        Ok(_) => sent_any = true,
+                        Err(e) => errors.push(format!("Lark default chat: {e}")),
+                    }
+                }
+            }
+
+            if self.has_webhook() {
+                match self.send_webhook_notification(title, message, url, color_template, fields).await {
+                    Ok(_) => sent_any = true,
+                    Err(e) => errors.push(format!("Lark webhook: {e}")),
+                }
+            }
+
+            if !sent_any {
+                anyhow::bail!("Lark 'both' mode failed: {}", errors.join("; "));
+            }
+            return Ok(());
+        }
+
+        if mode == "bot" {
+            if !self.has_bot() {
+                anyhow::bail!("Lark mode is 'bot' but SUGIE_LARK_APP_ID/SUGIE_LARK_APP_SECRET are not configured");
+            }
             if !self.config.channels.is_empty() {
                 for ch in &self.config.channels {
-                    self.send_to_chat(
-                        &ch.chat_id,
-                        title,
-                        message,
-                        url,
-                        color_template,
-                        fields,
-                    )
-                    .await?;
+                    self.send_to_chat(&ch.chat_id, title, message, url, color_template, fields).await?;
                 }
-                Ok(())
+                return Ok(());
             } else if let Some(ref default_cid) = self.config.default_chat_id {
-                self.send_to_chat(
-                    default_cid,
-                    title,
-                    message,
-                    url,
-                    color_template,
-                    fields,
-                )
-                .await
-            } else if self.has_webhook() {
-                self.send_webhook_notification(title, message, url, color_template, fields).await
+                return self.send_to_chat(default_cid, title, message, url, color_template, fields).await;
             } else {
-                anyhow::bail!("Lark Bot is configured but no channels or default_chat_id specified")
+                anyhow::bail!("Lark mode is 'bot' but no channels or default_chat_id specified");
+            }
+        }
+
+        // "auto" mode (default)
+        if self.has_bot() {
+            if !self.config.channels.is_empty() {
+                let mut bot_err = None;
+                for ch in &self.config.channels {
+                    if let Err(e) = self.send_to_chat(&ch.chat_id, title, message, url, color_template, fields).await {
+                        tracing::warn!("Lark bot send to {} ({}) failed: {e}", ch.name, ch.chat_id);
+                        bot_err = Some(e);
+                    }
+                }
+                if bot_err.is_none() {
+                    return Ok(());
+                }
+                // Fall back to webhook if available
+                if self.has_webhook() {
+                    tracing::warn!("Lark bot channels failed; falling back to webhook URL");
+                    return self.send_webhook_notification(title, message, url, color_template, fields).await;
+                }
+                Err(bot_err.unwrap())
+            } else if let Some(ref default_cid) = self.config.default_chat_id {
+                match self.send_to_chat(default_cid, title, message, url, color_template, fields).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        if self.has_webhook() {
+                            tracing::warn!("Lark bot send to default_chat_id failed ({e}); falling back to webhook URL");
+                            return self.send_webhook_notification(title, message, url, color_template, fields).await;
+                        }
+                        Err(e)
+                    }
+                }
+            } else if self.has_webhook() {
+                return self.send_webhook_notification(title, message, url, color_template, fields).await;
+            } else {
+                anyhow::bail!("Lark Bot is configured but no channels or default_chat_id specified");
             }
         } else if self.has_webhook() {
-            self.send_webhook_notification(title, message, url, color_template, fields).await
+            return self.send_webhook_notification(title, message, url, color_template, fields).await;
         } else {
-            anyhow::bail!("Lark is not configured (missing Bot credentials or Webhook URL)")
+            anyhow::bail!("Lark is not configured (missing Bot credentials or Webhook URL)");
         }
     }
 
@@ -865,6 +936,19 @@ mod tests {
         assert!(n_bot.has_bot());
         assert!(!n_bot.has_webhook());
         assert!(n_bot.is_configured());
+
+        // 4. Mode selection tests
+        let cfg_both = LarkConfig {
+            mode: "webhook".into(),
+            webhook_url: "https://open.larksuite.com/open-apis/bot/v2/hook/abc".into(),
+            app_id: Some("cli_12345".into()),
+            app_secret: Some("secret_67890".into()),
+            ..Default::default()
+        };
+        let n_mode_wh = LarkNotifier::new(cfg_both);
+        assert!(n_mode_wh.has_bot());
+        assert!(n_mode_wh.has_webhook());
+        assert!(n_mode_wh.is_configured());
     }
 
     #[test]

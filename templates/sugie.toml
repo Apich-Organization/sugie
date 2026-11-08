@@ -22,6 +22,8 @@ private_key_path = "sugie.private-key.pem"
 # 2. Discord & Zulip Integrations & Granular Event Sync
 # ------------------------------------------------------------------------------
 [notifications.discord]
+# Notification delivery mode: "webhook" (force default group webhook URL), "bot" (force bot channel), "both", or "auto" (default)
+mode = "auto"
 # Two ways to post. A bot token needs one credential for every channel the bot
 # has been invited to; a webhook needs one URL per channel.
 #
@@ -78,6 +80,8 @@ topic_assigns = "assignments"
 # topic = "alerts"
 
 [notifications.lark]
+# Notification delivery mode: "webhook" (force default group webhook URL), "bot" (force Lark Open API), "both", or "auto" (default)
+mode = "auto"
 # 1. Bot Mode (Recommended - single bot send & receive across multiple channels):
 # App credentials can be configured here or in .env (SUGIE_LARK_APP_ID & SUGIE_LARK_APP_SECRET)
 # app_id = "cli_xxxxxxxxxxxx"
