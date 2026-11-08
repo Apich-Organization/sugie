@@ -18,8 +18,9 @@ use tracing::{debug, error, info, warn};
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 
-static LARK_DEDUP_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static LARK_DEDUP_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 fn is_duplicate_lark_message(msg_id: &str) -> bool {
     if msg_id.is_empty() {
@@ -491,10 +492,14 @@ pub async fn lark_chat_handler(
             .unwrap_or(false);
         if is_bot {
             debug!("Ignoring Lark message event from bot sender");
-            return (StatusCode::OK, Json(json!({ "code": 0, "msg": "ignored bot sender" })));
+            return (
+                StatusCode::OK,
+                Json(json!({ "code": 0, "msg": "ignored bot sender" })),
+            );
         }
 
-        let (raw_text, sender_id, extra_ids, chat_id, message_id) = if let Some(msg) = event.message {
+        let (raw_text, sender_id, extra_ids, chat_id, message_id) = if let Some(msg) = event.message
+        {
             // Schema 2.0
             let text = if let Some(content_str) = msg.content {
                 if let Ok(json_obj) = serde_json::from_str::<serde_json::Value>(&content_str) {
@@ -546,7 +551,13 @@ pub async fn lark_chat_handler(
                     extras.push(un_id);
                 }
             }
-            (text, main_id, extras, event.open_chat_id, event.open_message_id)
+            (
+                text,
+                main_id,
+                extras,
+                event.open_chat_id,
+                event.open_message_id,
+            )
         } else {
             (String::new(), String::new(), Vec::new(), None, None)
         };
@@ -610,15 +621,39 @@ pub async fn lark_chat_handler(
                         // When Bot credentials are configured:
                         // First preference: reply directly into the message thread
                         if let Some(ref mid) = inbound.message_id {
-                            lark.reply_to_message(mid, "🤖 Sugie Bot Response", &reply, None, "blue", &[]).await
+                            lark.reply_to_message(
+                                mid,
+                                "🤖 Sugie Bot Response",
+                                &reply,
+                                None,
+                                "blue",
+                                &[],
+                            )
+                            .await
                         } else if let Some(ref cid) = inbound.stream_or_channel {
-                            lark.send_to_chat(cid, "🤖 Sugie Bot Response", &reply, None, "blue", &[]).await
+                            lark.send_to_chat(
+                                cid,
+                                "🤖 Sugie Bot Response",
+                                &reply,
+                                None,
+                                "blue",
+                                &[],
+                            )
+                            .await
                         } else {
-                            lark.send_notification("🤖 Sugie Bot Response", &reply, None, "blue", &[]).await
+                            lark.send_notification(
+                                "🤖 Sugie Bot Response",
+                                &reply,
+                                None,
+                                "blue",
+                                &[],
+                            )
+                            .await
                         }
                     } else {
                         // Fallback to webhook mode
-                        lark.send_notification("🤖 Sugie Bot Response", &reply, None, "blue", &[]).await
+                        lark.send_notification("🤖 Sugie Bot Response", &reply, None, "blue", &[])
+                            .await
                     };
 
                     match result {
@@ -741,21 +776,47 @@ pub async fn discord_chat_handler(
 
     let (user_id, username, display_name) = if let Some(member) = payload.get("member") {
         let u = member.get("user");
-        let uid = u.and_then(|x| x.get("id")).and_then(|v| v.as_str()).unwrap_or("discord_user");
-        let uname = u.and_then(|x| x.get("username")).and_then(|v| v.as_str()).unwrap_or(uid);
-        let dname = member.get("nick").and_then(|v| v.as_str()).or_else(|| u.and_then(|x| x.get("global_name")).and_then(|v| v.as_str()));
-        (uid.to_string(), uname.to_string(), dname.map(|s| s.to_string()))
+        let uid = u
+            .and_then(|x| x.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("discord_user");
+        let uname = u
+            .and_then(|x| x.get("username"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(uid);
+        let dname = member.get("nick").and_then(|v| v.as_str()).or_else(|| {
+            u.and_then(|x| x.get("global_name"))
+                .and_then(|v| v.as_str())
+        });
+        (
+            uid.to_string(),
+            uname.to_string(),
+            dname.map(|s| s.to_string()),
+        )
     } else if let Some(u) = payload.get("user") {
-        let uid = u.get("id").and_then(|v| v.as_str()).unwrap_or("discord_user");
+        let uid = u
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("discord_user");
         let uname = u.get("username").and_then(|v| v.as_str()).unwrap_or(uid);
         let dname = u.get("global_name").and_then(|v| v.as_str());
-        (uid.to_string(), uname.to_string(), dname.map(|s| s.to_string()))
+        (
+            uid.to_string(),
+            uname.to_string(),
+            dname.map(|s| s.to_string()),
+        )
     } else {
         ("discord_user".to_string(), "discord_user".to_string(), None)
     };
 
-    let channel_id = payload.get("channel_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let guild_id = payload.get("guild_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let channel_id = payload
+        .get("channel_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let guild_id = payload
+        .get("guild_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     info!(
         "Received Discord interaction from @{} (id: {}): {:?}",
@@ -822,7 +883,10 @@ fn verify_discord_signature(
     let ts_num: i64 = match timestamp.trim().parse() {
         Ok(t) => t,
         Err(_) => {
-            warn!("Discord signature verification rejected: invalid timestamp integer '{}'", timestamp);
+            warn!(
+                "Discord signature verification rejected: invalid timestamp integer '{}'",
+                timestamp
+            );
             return false;
         }
     };
@@ -946,7 +1010,11 @@ pub async fn generic_chat_command_handler(
     headers: HeaderMap,
     Json(payload): Json<GenericCommandRequest>,
 ) -> impl IntoResponse {
-    let expected = match state.chat_api_token.as_deref().filter(|t| !t.trim().is_empty()) {
+    let expected = match state
+        .chat_api_token
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+    {
         Some(t) => t,
         None => {
             warn!("Rejected /api/chat/command: SUGIE_CHAT_API_TOKEN is not configured in .env");

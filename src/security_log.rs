@@ -462,7 +462,13 @@ fn mask_query(query: &str) -> String {
 
 fn clean_log_str(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() || c == '\r' || c == '\n' { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || c == '\r' || c == '\n' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect::<String>()
         .trim()
         .to_string()

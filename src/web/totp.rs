@@ -80,7 +80,10 @@ pub fn verify_totp_step(secret_encoded: &str, code: &str, last_used_step: i64) -
     let clean_code = code.trim().replace(' ', "");
     let clean_secret = secret_encoded.trim().replace(' ', "").to_uppercase();
 
-    if clean_code.len() != 8 || !clean_code.chars().all(|c| c.is_ascii_digit()) || clean_secret.is_empty() {
+    if clean_code.len() != 8
+        || !clean_code.chars().all(|c| c.is_ascii_digit())
+        || clean_secret.is_empty()
+    {
         return None;
     }
 
@@ -133,7 +136,8 @@ mod tests {
             .expect("build");
 
         let code = totp.generate_current().to_string();
-        let step = verify_totp_step(&setup.secret, &code, 0).expect("first verification must succeed");
+        let step =
+            verify_totp_step(&setup.secret, &code, 0).expect("first verification must succeed");
         assert!(step > 0);
 
         // Replaying the exact same code at the same or older step must be rejected

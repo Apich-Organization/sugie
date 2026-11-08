@@ -2,9 +2,9 @@ pub mod discord;
 pub mod lark;
 pub mod zulip;
 
+pub use crate::config::{LarkChannelConfig, LarkWebhookChannel};
 pub use discord::{DiscordBotChannel, DiscordEmbedField, DiscordNotifier, DiscordWebhookChannel};
 pub use lark::{LarkChannel, LarkNotifier};
-pub use crate::config::{LarkChannelConfig, LarkWebhookChannel};
 pub use zulip::{ZulipChannelConfig, ZulipNotifier, ZulipTopicCategory};
 
 use crate::config::NotificationsConfig;
@@ -34,7 +34,8 @@ pub fn is_safe_ip(ip: std::net::IpAddr) -> bool {
                 || octets[0] == 0 // 0.0.0.0/8 ("this" network)
                 || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64) // 100.64.0.0/10 (CGNAT / cloud internal)
                 || (octets[0] == 198 && (octets[1] & 0xfe) == 18) // 198.18.0.0/15 (benchmarking)
-                || octets[0] >= 240 // 240.0.0.0/4 (reserved)
+                || octets[0] >= 240
+            // 240.0.0.0/4 (reserved)
             {
                 return false;
             }
@@ -47,7 +48,8 @@ pub fn is_safe_ip(ip: std::net::IpAddr) -> bool {
                 || v6.is_multicast()
                 || (segs[0] & 0xfe00) == 0xfc00 // fc00::/7 Unique Local Address (ULA)
                 || (segs[0] & 0xffc0) == 0xfe80 // fe80::/10 Link-Local Unicast
-                || (segs[0] == 0x2001 && segs[1] == 0x0db8) // 2001:db8::/32 Documentation
+                || (segs[0] == 0x2001 && segs[1] == 0x0db8)
+            // 2001:db8::/32 Documentation
             {
                 return false;
             }
@@ -120,8 +122,7 @@ pub async fn verify_webhook_destination(raw_url: &str) -> anyhow::Result<()> {
     if !is_safe_webhook_url(raw_url) {
         anyhow::bail!("Blocked unsafe or non-HTTPS webhook destination (SSRF protection)");
     }
-    let parsed = url::Url::parse(raw_url)
-        .map_err(|_| anyhow::anyhow!("Invalid webhook URL"))?;
+    let parsed = url::Url::parse(raw_url).map_err(|_| anyhow::anyhow!("Invalid webhook URL"))?;
     if let Some(url::Host::Domain(domain)) = parsed.host() {
         let port = parsed.port_or_known_default().unwrap_or(443);
         let addrs = tokio::net::lookup_host((domain, port))
@@ -502,26 +503,40 @@ mod tests {
     #[test]
     fn test_is_safe_webhook_url() {
         // Safe HTTPS URLs
-        assert!(is_safe_webhook_url("https://discord.com/api/webhooks/123/token"));
-        assert!(is_safe_webhook_url("https://open.larksuite.com/open-apis/bot/v2/hook/abc"));
-        assert!(is_safe_webhook_url("https://zulip.example.com/api/v1/messages"));
+        assert!(is_safe_webhook_url(
+            "https://discord.com/api/webhooks/123/token"
+        ));
+        assert!(is_safe_webhook_url(
+            "https://open.larksuite.com/open-apis/bot/v2/hook/abc"
+        ));
+        assert!(is_safe_webhook_url(
+            "https://zulip.example.com/api/v1/messages"
+        ));
 
         // Insecure scheme
-        assert!(!is_safe_webhook_url("http://discord.com/api/webhooks/123/token"));
+        assert!(!is_safe_webhook_url(
+            "http://discord.com/api/webhooks/123/token"
+        ));
         assert!(!is_safe_webhook_url("ftp://example.com"));
 
         // Loopback and private / link-local addresses (SSRF)
         assert!(!is_safe_webhook_url("https://127.0.0.1/webhook"));
         assert!(!is_safe_webhook_url("https://localhost/webhook"));
-        assert!(!is_safe_webhook_url("https://169.254.169.254/latest/meta-data"));
+        assert!(!is_safe_webhook_url(
+            "https://169.254.169.254/latest/meta-data"
+        ));
         assert!(!is_safe_webhook_url("https://10.0.0.1/admin"));
         assert!(!is_safe_webhook_url("https://192.168.1.1/internal"));
         assert!(!is_safe_webhook_url("https://172.16.0.1/secret"));
-        assert!(!is_safe_webhook_url("https://metadata.google.internal/computeMetadata"));
+        assert!(!is_safe_webhook_url(
+            "https://metadata.google.internal/computeMetadata"
+        ));
 
         // IPv4 CGNAT (Alibaba Cloud metadata 100.100.100.200 / Tailscale / RFC 6598) & 0.0.0.0/8
         assert!(!is_safe_webhook_url("https://100.64.0.1/webhook"));
-        assert!(!is_safe_webhook_url("https://100.100.100.200/latest/meta-data"));
+        assert!(!is_safe_webhook_url(
+            "https://100.100.100.200/latest/meta-data"
+        ));
         assert!(!is_safe_webhook_url("https://0.0.0.0/webhook"));
         assert!(!is_safe_webhook_url("https://0.1.2.3/webhook"));
 
@@ -531,7 +546,9 @@ mod tests {
         assert!(!is_safe_webhook_url("https://[fd12:3456:789a::1]/webhook"));
         assert!(!is_safe_webhook_url("https://[fe80::1]/webhook"));
         assert!(!is_safe_webhook_url("https://[::ffff:127.0.0.1]/webhook"));
-        assert!(!is_safe_webhook_url("https://[::ffff:169.254.169.254]/latest/meta-data"));
+        assert!(!is_safe_webhook_url(
+            "https://[::ffff:169.254.169.254]/latest/meta-data"
+        ));
         assert!(!is_safe_webhook_url("https://[::ffff:10.0.0.1]/admin"));
     }
 

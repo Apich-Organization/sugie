@@ -1095,7 +1095,10 @@ fn load_discord_env_channels(
         } else if let Some(rest) = k.strip_prefix("SUGIE_DISCORD_BOT_CHANNEL_") {
             let name = rest.to_lowercase().replace('_', "-");
             if !bot_channels.iter().any(|c| c.name == name) {
-                bot_channels.push(DiscordBotChannel { name, channel_id: v });
+                bot_channels.push(DiscordBotChannel {
+                    name,
+                    channel_id: v,
+                });
             }
         }
     }
@@ -1139,7 +1142,10 @@ fn load_discord_env_channels(
             if let Some((name, id)) = parts {
                 let name = name.trim().to_lowercase().replace('_', "-");
                 let channel_id = id.trim().to_string();
-                if !name.is_empty() && !channel_id.is_empty() && !bot_channels.iter().any(|c| c.name == name) {
+                if !name.is_empty()
+                    && !channel_id.is_empty()
+                    && !bot_channels.iter().any(|c| c.name == name)
+                {
                     bot_channels.push(DiscordBotChannel { name, channel_id });
                 }
             }
@@ -1161,7 +1167,11 @@ fn load_zulip_env_channels(channels: &mut Vec<ZulipChannelConfig>) {
                 None => (v, default_zulip_channel_topic()),
             };
             if !channel.is_empty() && !channels.iter().any(|c| c.name == name) {
-                channels.push(ZulipChannelConfig { name, channel, topic });
+                channels.push(ZulipChannelConfig {
+                    name,
+                    channel,
+                    topic,
+                });
             }
         }
     }
@@ -1179,8 +1189,15 @@ fn load_zulip_env_channels(channels: &mut Vec<ZulipChannelConfig>) {
                     Some((ch, tp)) => (ch.trim().to_string(), tp.trim().to_string()),
                     None => (rest.trim().to_string(), default_zulip_channel_topic()),
                 };
-                if !name.is_empty() && !channel.is_empty() && !channels.iter().any(|c| c.name == name) {
-                    channels.push(ZulipChannelConfig { name, channel, topic });
+                if !name.is_empty()
+                    && !channel.is_empty()
+                    && !channels.iter().any(|c| c.name == name)
+                {
+                    channels.push(ZulipChannelConfig {
+                        name,
+                        channel,
+                        topic,
+                    });
                 }
             }
         }
@@ -1204,9 +1221,16 @@ fn load_lark_env_channels(
             }
             let name = rest.to_lowercase().replace('_', "-");
             let secret_key = format!("SUGIE_LARK_SECRET_{rest}");
-            let secret = vars.get(&secret_key).cloned().filter(|s| !s.trim().is_empty());
+            let secret = vars
+                .get(&secret_key)
+                .cloned()
+                .filter(|s| !s.trim().is_empty());
             if !webhooks.iter().any(|w| w.name == name) {
-                webhooks.push(LarkWebhookChannel { name, url: v, secret });
+                webhooks.push(LarkWebhookChannel {
+                    name,
+                    url: v,
+                    secret,
+                });
             }
         } else if let Some(rest) = k.strip_prefix("SUGIE_LARK_CHANNEL_") {
             let name = rest.to_lowercase().replace('_', "-");
@@ -1233,7 +1257,10 @@ fn load_lark_env_channels(
             if let Some((name, rest)) = parts {
                 let name = name.trim().to_lowercase().replace('_', "-");
                 let (url_part, secret) = if let Some((u, s)) = rest.split_once('#') {
-                    (u.trim(), Some(s.trim().to_string()).filter(|s| !s.is_empty()))
+                    (
+                        u.trim(),
+                        Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+                    )
                 } else {
                     (rest.trim(), None)
                 };
@@ -1397,7 +1424,11 @@ impl SugieConfig {
             let mut bot_channels = Vec::new();
             load_discord_env_channels(&mut webhooks, &mut bot_channels);
 
-            if !webhook_url.is_empty() || bot_token.is_some() || !webhooks.is_empty() || !bot_channels.is_empty() {
+            if !webhook_url.is_empty()
+                || bot_token.is_some()
+                || !webhooks.is_empty()
+                || !bot_channels.is_empty()
+            {
                 let allowed_repositories = std::env::var("SUGIE_DISCORD_REPOSITORIES")
                     .or_else(|_| std::env::var("SUGIE_DISCORD_REPOS"))
                     .ok()
@@ -1571,7 +1602,11 @@ impl SugieConfig {
             let mut channels = Vec::new();
             load_lark_env_channels(&mut webhooks, &mut channels);
 
-            if app_id.is_some() || lark_url.is_some() || !webhooks.is_empty() || !channels.is_empty() {
+            if app_id.is_some()
+                || lark_url.is_some()
+                || !webhooks.is_empty()
+                || !channels.is_empty()
+            {
                 let secret = std::env::var("SUGIE_LARK_SignatureVerification")
                     .or_else(|_| std::env::var("SUGIE_LARK_SIGNATURE_VERIFICATION"))
                     .or_else(|_| std::env::var("SUGIE_LARK_SECRET"))

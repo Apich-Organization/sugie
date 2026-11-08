@@ -908,7 +908,12 @@ impl WebDb {
         Ok(None)
     }
 
-    pub fn clear_login_failures_for_ip(&self, user_id: i64, username: &str, ip: &str) -> Result<()> {
+    pub fn clear_login_failures_for_ip(
+        &self,
+        user_id: i64,
+        username: &str,
+        ip: &str,
+    ) -> Result<()> {
         let conn = self.lock_conn();
         conn.execute(
             "UPDATE web_users SET failed_attempts = 0, locked_until = NULL WHERE id = ?1",

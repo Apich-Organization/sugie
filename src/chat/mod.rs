@@ -566,7 +566,8 @@ impl<'a> ChatCommandExecutor<'a> {
                 let clean = r.trim().trim_start_matches('/');
                 clean.eq_ignore_ascii_case(cmd_name)
                     || (cmd_name == "chatid"
-                        && (clean.eq_ignore_ascii_case("chat_id") || clean.eq_ignore_ascii_case("chat-id")))
+                        && (clean.eq_ignore_ascii_case("chat_id")
+                            || clean.eq_ignore_ascii_case("chat-id")))
             });
 
         if is_restricted && !is_super {
@@ -581,7 +582,8 @@ impl<'a> ChatCommandExecutor<'a> {
         // /help and /chatid are exempt so users can discover their ID, UNLESS
         // they are explicitly placed in restricted_commands.
         if self.config.default_rules.commands.admin_only && !is_super {
-            let is_exempt = matches!(cmd, ChatCommand::ChatId | ChatCommand::Help) && !is_restricted;
+            let is_exempt =
+                matches!(cmd, ChatCommand::ChatId | ChatCommand::Help) && !is_restricted;
             if !is_exempt {
                 return format!(
                     "⛔ Access Denied: Sugie is configured in admin-only mode (`admin_only = true`).\nOnly authorized administrators can run commands.\n\nYour User ID is `{}` (@{}). Type `/chatid` to see how to request access.",
@@ -617,7 +619,8 @@ impl<'a> ChatCommandExecutor<'a> {
                 number,
                 command,
             } => {
-                self.execute_issue_action(message, &repo, number, command).await
+                self.execute_issue_action(message, &repo, number, command)
+                    .await
             }
             ChatCommand::Unknown(text) => {
                 format!(
@@ -778,7 +781,11 @@ impl<'a> ChatCommandExecutor<'a> {
                 "- **Current User**: `{}` (@{}) — {}\n{}",
                 m.sender.id,
                 m.sender.username,
-                if is_admin { "🟢 Super User" } else { "⚪ Standard User" },
+                if is_admin {
+                    "🟢 Super User"
+                } else {
+                    "⚪ Standard User"
+                },
                 if let Some(ref ch) = m.stream_or_channel {
                     format!("- **Current Chat ID**: `{}`\n", ch)
                 } else {
@@ -798,7 +805,10 @@ impl<'a> ChatCommandExecutor<'a> {
             super_summary.push(format!("Lark: {}", cmd_cfg.lark_super_users.join(", ")));
         }
         if !cmd_cfg.discord_super_users.is_empty() {
-            super_summary.push(format!("Discord: {}", cmd_cfg.discord_super_users.join(", ")));
+            super_summary.push(format!(
+                "Discord: {}",
+                cmd_cfg.discord_super_users.join(", ")
+            ));
         }
         if !cmd_cfg.zulip_super_users.is_empty() {
             super_summary.push(format!("Zulip: {}", cmd_cfg.zulip_super_users.join(", ")));
@@ -822,10 +832,16 @@ impl<'a> ChatCommandExecutor<'a> {
             ch_whitelist_summary.push(format!("Lark: {} groups", cmd_cfg.lark_allowed_chats.len()));
         }
         if !cmd_cfg.discord_allowed_channels.is_empty() {
-            ch_whitelist_summary.push(format!("Discord: {} channels", cmd_cfg.discord_allowed_channels.len()));
+            ch_whitelist_summary.push(format!(
+                "Discord: {} channels",
+                cmd_cfg.discord_allowed_channels.len()
+            ));
         }
         if !cmd_cfg.zulip_allowed_channels.is_empty() {
-            ch_whitelist_summary.push(format!("Zulip: {} streams", cmd_cfg.zulip_allowed_channels.len()));
+            ch_whitelist_summary.push(format!(
+                "Zulip: {} streams",
+                cmd_cfg.zulip_allowed_channels.len()
+            ));
         }
         let ch_whitelist_str = if ch_whitelist_summary.is_empty() {
             "Open (all groups/channels permitted)".to_string()
@@ -984,7 +1000,10 @@ impl<'a> ChatCommandExecutor<'a> {
             return true;
         }
 
-        commands_cfg.super_users.iter().any(|su| matches_user(su, false))
+        commands_cfg
+            .super_users
+            .iter()
+            .any(|su| matches_user(su, false))
     }
 
     pub fn is_channel_allowed(&self, message: &InboundChatMessage) -> bool {
@@ -1048,7 +1067,9 @@ impl<'a> ChatCommandExecutor<'a> {
             .ok_or_else(|| format!("⚠️ Please specify repository: `{cmd_hint} <owner/repo>`."))?;
 
         if !self.is_repo_allowed(&repo) {
-            return Err(format!("⛔ Access to repository `{repo}` is not permitted by configuration."));
+            return Err(format!(
+                "⛔ Access to repository `{repo}` is not permitted by configuration."
+            ));
         }
         Ok(repo)
     }
@@ -1194,18 +1215,46 @@ impl<'a> ChatCommandExecutor<'a> {
             } else {
                 s.allowed_repositories.join(", ")
             },
-            if cmd_cfg.admin_only { "🔒 ON (all commands require admin)" } else { "off" },
+            if cmd_cfg.admin_only {
+                "🔒 ON (all commands require admin)"
+            } else {
+                "off"
+            },
             if s.super_users.is_empty() {
                 "(none)".to_string()
             } else {
                 s.super_users.join(", ")
             },
-            if cmd_cfg.lark_super_users.is_empty() { "none".to_string() } else { cmd_cfg.lark_super_users.join(", ") },
-            if cmd_cfg.discord_super_users.is_empty() { "none".to_string() } else { cmd_cfg.discord_super_users.join(", ") },
-            if cmd_cfg.zulip_super_users.is_empty() { "none".to_string() } else { cmd_cfg.zulip_super_users.join(", ") },
-            if cmd_cfg.lark_allowed_chats.is_empty() { "all".to_string() } else { format!("{} chats", cmd_cfg.lark_allowed_chats.len()) },
-            if cmd_cfg.discord_allowed_channels.is_empty() { "all".to_string() } else { format!("{} channels", cmd_cfg.discord_allowed_channels.len()) },
-            if cmd_cfg.zulip_allowed_channels.is_empty() { "all".to_string() } else { format!("{} streams", cmd_cfg.zulip_allowed_channels.len()) },
+            if cmd_cfg.lark_super_users.is_empty() {
+                "none".to_string()
+            } else {
+                cmd_cfg.lark_super_users.join(", ")
+            },
+            if cmd_cfg.discord_super_users.is_empty() {
+                "none".to_string()
+            } else {
+                cmd_cfg.discord_super_users.join(", ")
+            },
+            if cmd_cfg.zulip_super_users.is_empty() {
+                "none".to_string()
+            } else {
+                cmd_cfg.zulip_super_users.join(", ")
+            },
+            if cmd_cfg.lark_allowed_chats.is_empty() {
+                "all".to_string()
+            } else {
+                format!("{} chats", cmd_cfg.lark_allowed_chats.len())
+            },
+            if cmd_cfg.discord_allowed_channels.is_empty() {
+                "all".to_string()
+            } else {
+                format!("{} channels", cmd_cfg.discord_allowed_channels.len())
+            },
+            if cmd_cfg.zulip_allowed_channels.is_empty() {
+                "all".to_string()
+            } else {
+                format!("{} streams", cmd_cfg.zulip_allowed_channels.len())
+            },
             if s.restricted_commands.is_empty() {
                 "(none)".to_string()
             } else {
@@ -1751,17 +1800,9 @@ mod tests {
     fn test_is_super_user_platform_matching() {
         let commands_cfg = crate::config::CommandsConfig {
             super_users: vec!["octocat".to_string(), "discord:global_mod".to_string()],
-            lark_super_users: vec![
-                "ou_lark_admin".to_string(),
-                "emp_9999".to_string(),
-            ],
-            discord_super_users: vec![
-                "123456789012345678".to_string(),
-                "discord_mod".to_string(),
-            ],
-            zulip_super_users: vec![
-                "admin@zulip.org".to_string(),
-            ],
+            lark_super_users: vec!["ou_lark_admin".to_string(), "emp_9999".to_string()],
+            discord_super_users: vec!["123456789012345678".to_string(), "discord_mod".to_string()],
+            zulip_super_users: vec!["admin@zulip.org".to_string()],
             ..Default::default()
         };
 
@@ -1772,7 +1813,11 @@ mod tests {
             display_name: None,
             extra_ids: vec!["emp_1234".to_string()],
         };
-        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Lark, &lark_sender_ok));
+        assert!(ChatCommandExecutor::check_super_user(
+            &commands_cfg,
+            ChatPlatform::Lark,
+            &lark_sender_ok
+        ));
 
         let lark_sender_extra_match = InboundSender {
             id: "ou_other".to_string(),
@@ -1780,7 +1825,11 @@ mod tests {
             display_name: None,
             extra_ids: vec!["emp_9999".to_string()],
         };
-        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Lark, &lark_sender_extra_match));
+        assert!(ChatCommandExecutor::check_super_user(
+            &commands_cfg,
+            ChatPlatform::Lark,
+            &lark_sender_extra_match
+        ));
 
         let lark_sender_fail = InboundSender {
             id: "ou_regular".to_string(),
@@ -1788,7 +1837,11 @@ mod tests {
             display_name: None,
             extra_ids: vec![],
         };
-        assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Lark, &lark_sender_fail));
+        assert!(!ChatCommandExecutor::check_super_user(
+            &commands_cfg,
+            ChatPlatform::Lark,
+            &lark_sender_fail
+        ));
 
         // Discord sender tests
         let discord_sender_id_match = InboundSender {
@@ -1797,7 +1850,11 @@ mod tests {
             display_name: None,
             extra_ids: vec![],
         };
-        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &discord_sender_id_match));
+        assert!(ChatCommandExecutor::check_super_user(
+            &commands_cfg,
+            ChatPlatform::Discord,
+            &discord_sender_id_match
+        ));
 
         let discord_sender_user_match = InboundSender {
             id: "9999999".to_string(),
@@ -1805,7 +1862,11 @@ mod tests {
             display_name: None,
             extra_ids: vec![],
         };
-        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &discord_sender_user_match));
+        assert!(ChatCommandExecutor::check_super_user(
+            &commands_cfg,
+            ChatPlatform::Discord,
+            &discord_sender_user_match
+        ));
 
         // Platform-prefixed in general super_users: "discord:global_mod"
         let discord_prefixed_match = InboundSender {
@@ -1814,9 +1875,17 @@ mod tests {
             display_name: None,
             extra_ids: vec![],
         };
-        assert!(ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &discord_prefixed_match));
+        assert!(ChatCommandExecutor::check_super_user(
+            &commands_cfg,
+            ChatPlatform::Discord,
+            &discord_prefixed_match
+        ));
         // Same username on Lark should NOT match "discord:global_mod"
-        assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Lark, &discord_prefixed_match));
+        assert!(!ChatCommandExecutor::check_super_user(
+            &commands_cfg,
+            ChatPlatform::Lark,
+            &discord_prefixed_match
+        ));
 
         // Unprefixed entry in general super_users: "octocat"
         // Must NOT match on Discord because unprefixed general super_users is reserved for GitHub.
@@ -1826,7 +1895,11 @@ mod tests {
             display_name: None,
             extra_ids: vec![],
         };
-        assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &github_fallback));
+        assert!(!ChatCommandExecutor::check_super_user(
+            &commands_cfg,
+            ChatPlatform::Discord,
+            &github_fallback
+        ));
 
         // SECURITY: Attempting to spoof super user via mutable display_name / nickname MUST fail
         let display_name_spoof_attempt = InboundSender {
@@ -1835,7 +1908,11 @@ mod tests {
             display_name: Some("discord_mod".to_string()),
             extra_ids: vec![],
         };
-        assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Discord, &display_name_spoof_attempt));
+        assert!(!ChatCommandExecutor::check_super_user(
+            &commands_cfg,
+            ChatPlatform::Discord,
+            &display_name_spoof_attempt
+        ));
 
         // SECURITY: Generic API caller cannot spoof GitHub super_users ("octocat") without explicit api: prefix
         let api_caller_spoof = InboundSender {
@@ -1844,30 +1921,47 @@ mod tests {
             display_name: None,
             extra_ids: vec!["api:octocat".to_string()],
         };
-        assert!(!ChatCommandExecutor::check_super_user(&commands_cfg, ChatPlatform::Api, &api_caller_spoof));
+        assert!(!ChatCommandExecutor::check_super_user(
+            &commands_cfg,
+            ChatPlatform::Api,
+            &api_caller_spoof
+        ));
 
         // When explicitly configured with "api:service_bot", it matches
         let mut api_super_cfg = commands_cfg.clone();
-        api_super_cfg.super_users.push("api:service_bot".to_string());
+        api_super_cfg
+            .super_users
+            .push("api:service_bot".to_string());
         let api_caller_ok = InboundSender {
             id: "api:service_bot".to_string(),
             username: "service_bot".to_string(),
             display_name: None,
             extra_ids: vec!["api:service_bot".to_string()],
         };
-        assert!(ChatCommandExecutor::check_super_user(&api_super_cfg, ChatPlatform::Api, &api_caller_ok));
+        assert!(ChatCommandExecutor::check_super_user(
+            &api_super_cfg,
+            ChatPlatform::Api,
+            &api_caller_ok
+        ));
     }
 
     #[tokio::test]
     async fn test_restricted_commands_including_status_and_chatid() {
         let mut config = SugieConfig::default();
         config.default_rules.commands.lark_super_users = vec!["ou_admin_ok".to_string()];
-        config.default_rules.commands.restricted_commands = vec!["status".to_string(), "chatid".to_string()];
+        config.default_rules.commands.restricted_commands =
+            vec!["status".to_string(), "chatid".to_string()];
 
         let storage = crate::storage::Storage::new_in_memory().unwrap();
-        let auth = std::sync::Arc::new(crate::github::auth::GitHubAuthManager::new(1, "key".into()));
+        let auth =
+            std::sync::Arc::new(crate::github::auth::GitHubAuthManager::new(1, "key".into()));
         let notifier = crate::notifications::NotificationDispatcher::new(&config.notifications);
-        let triage = crate::triage::TriageService::new(std::sync::Arc::new(config.clone()), storage, notifier, auth);
+        let triage = crate::triage::TriageService::new(
+            std::sync::Arc::new(config.clone()),
+            storage,
+            notifier,
+            auth,
+        );
         let executor = ChatCommandExecutor::new(&config, &triage);
 
         // Standard user running /status
@@ -1886,7 +1980,9 @@ mod tests {
         };
 
         let reply = executor.execute(&standard_user_msg).await;
-        assert!(reply.contains("⛔ Sorry @Support, the command `/status` is restricted to authorized super users."));
+        assert!(reply.contains(
+            "⛔ Sorry @Support, the command `/status` is restricted to authorized super users."
+        ));
 
         // Standard user running /chatid
         let chatid_msg = InboundChatMessage {
@@ -1903,7 +1999,9 @@ mod tests {
             extra_channel_ids: vec![],
         };
         let reply_chatid = executor.execute(&chatid_msg).await;
-        assert!(reply_chatid.contains("⛔ Sorry @Support, the command `/chatid` is restricted to authorized super users."));
+        assert!(reply_chatid.contains(
+            "⛔ Sorry @Support, the command `/chatid` is restricted to authorized super users."
+        ));
 
         // Authorized super user running /status
         let super_user_msg = InboundChatMessage {
@@ -1927,13 +2025,21 @@ mod tests {
     async fn test_channel_whitelist_authorization() {
         let mut config = SugieConfig::default();
         config.default_rules.commands.lark_allowed_chats = vec!["oc_allowed_group".to_string()];
-        config.default_rules.commands.discord_allowed_channels = vec!["111222333".to_string(), "guild:guild_999".to_string()];
-        config.default_rules.commands.zulip_allowed_channels = vec!["authorized_stream".to_string()];
+        config.default_rules.commands.discord_allowed_channels =
+            vec!["111222333".to_string(), "guild:guild_999".to_string()];
+        config.default_rules.commands.zulip_allowed_channels =
+            vec!["authorized_stream".to_string()];
 
         let storage = crate::storage::Storage::new_in_memory().unwrap();
-        let auth = std::sync::Arc::new(crate::github::auth::GitHubAuthManager::new(1, "key".into()));
+        let auth =
+            std::sync::Arc::new(crate::github::auth::GitHubAuthManager::new(1, "key".into()));
         let notifier = crate::notifications::NotificationDispatcher::new(&config.notifications);
-        let triage = crate::triage::TriageService::new(std::sync::Arc::new(config.clone()), storage, notifier, auth);
+        let triage = crate::triage::TriageService::new(
+            std::sync::Arc::new(config.clone()),
+            storage,
+            notifier,
+            auth,
+        );
         let executor = ChatCommandExecutor::new(&config, &triage);
 
         // 1. Lark in unauthorized group

@@ -580,7 +580,8 @@ mod tests {
 
         // Attacker on 203.0.113.99 fails 5 times and gets locked out
         for i in 1..=MAX_LOGIN_ATTEMPTS {
-            let outcome = login(&db, "admin", "wrong-password", "203.0.113.99", "curl").expect("login");
+            let outcome =
+                login(&db, "admin", "wrong-password", "203.0.113.99", "curl").expect("login");
             if i < MAX_LOGIN_ATTEMPTS {
                 assert!(matches!(outcome, LoginOutcome::Invalid));
             } else {

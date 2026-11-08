@@ -80,7 +80,13 @@ pub fn create_router_with_web(state: AppState, web: Option<crate::web::WebState>
 
 fn sanitize_log_val(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() || c == '\r' || c == '\n' { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || c == '\r' || c == '\n' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect::<String>()
         .trim()
         .to_string()

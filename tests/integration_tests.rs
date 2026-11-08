@@ -638,7 +638,8 @@ async fn test_inbound_discord_replay_rejected() {
     let stale_ts = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() - 600)
+        .as_secs()
+        - 600)
         .to_string();
 
     use ed25519_dalek::Signer;
@@ -870,7 +871,9 @@ async fn test_unconfigured_chat_webhook_endpoints_reject_requests() {
         .uri("/api/chat/lark")
         .method("POST")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"type":"url_verification","challenge":"xyz"}"#))
+        .body(Body::from(
+            r#"{"type":"url_verification","challenge":"xyz"}"#,
+        ))
         .unwrap();
     assert_eq!(
         app.oneshot(req_lark).await.unwrap().status(),

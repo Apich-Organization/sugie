@@ -12,9 +12,8 @@ pub use crate::config::LarkChannelConfig as LarkChannel;
 
 type HmacSha256 = Hmac<Sha256>;
 
-static LARK_OPEN_ID_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"@(?P<id>ou_[0-9a-zA-Z]+)").unwrap()
-});
+static LARK_OPEN_ID_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"@(?P<id>ou_[0-9a-zA-Z]+)").unwrap());
 
 /// Replaces Lark Open ID mentions with Lark native `<at>` tag and converts global mentions.
 pub fn convert_lark_mentions(text: &str) -> String {
@@ -250,7 +249,10 @@ impl LarkNotifier {
         } else {
             self.config.api_base.trim_end_matches('/')
         };
-        let token_url = format!("{}/open-apis/auth/v3/tenant_access_token/internal", api_base);
+        let token_url = format!(
+            "{}/open-apis/auth/v3/tenant_access_token/internal",
+            api_base
+        );
         crate::notifications::verify_webhook_destination(&token_url).await?;
 
         let body = json!({
@@ -283,8 +285,8 @@ impl LarkNotifier {
             anyhow::bail!("Lark token request HTTP error {}: {}", status, body_text);
         }
 
-        let resp_json: serde_json::Value = serde_json::from_str(&body_text)
-            .context("Failed to parse Lark token response")?;
+        let resp_json: serde_json::Value =
+            serde_json::from_str(&body_text).context("Failed to parse Lark token response")?;
 
         let code = resp_json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
@@ -309,7 +311,10 @@ impl LarkNotifier {
             .ok_or_else(|| anyhow::anyhow!("Missing tenant_access_token in response"))?
             .to_string();
 
-        let expire_secs = resp_json.get("expire").and_then(|v| v.as_u64()).unwrap_or(7200);
+        let expire_secs = resp_json
+            .get("expire")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(7200);
         // Refresh 5 minutes before expiration (or 30s minimum if expire is short)
         let ttl_secs = expire_secs.saturating_sub(300).max(30);
         let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs);
@@ -476,7 +481,10 @@ impl LarkNotifier {
         } else {
             self.config.api_base.trim_end_matches('/')
         };
-        let send_url = format!("{}/open-apis/im/v1/messages?receive_id_type=chat_id", api_base);
+        let send_url = format!(
+            "{}/open-apis/im/v1/messages?receive_id_type=chat_id",
+            api_base
+        );
         crate::notifications::verify_webhook_destination(&send_url).await?;
 
         let card = Self::build_interactive_card(title, message, url, color_template, fields);
@@ -512,8 +520,8 @@ impl LarkNotifier {
             anyhow::bail!("Lark API HTTP error {}: {}", status, body_text);
         }
 
-        let resp_json: serde_json::Value = serde_json::from_str(&body_text)
-            .context("Failed to parse Lark message response")?;
+        let resp_json: serde_json::Value =
+            serde_json::from_str(&body_text).context("Failed to parse Lark message response")?;
         let code = resp_json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
             let msg = resp_json
@@ -594,8 +602,8 @@ impl LarkNotifier {
             anyhow::bail!("Lark API HTTP error {}: {}", status, body_text);
         }
 
-        let resp_json: serde_json::Value = serde_json::from_str(&body_text)
-            .context("Failed to parse Lark reply response")?;
+        let resp_json: serde_json::Value =
+            serde_json::from_str(&body_text).context("Failed to parse Lark reply response")?;
         let code = resp_json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
             let msg = resp_json
@@ -662,12 +670,7 @@ impl LarkNotifier {
         crate::notifications::verify_webhook_destination(url_str).await?;
 
         let started = std::time::Instant::now();
-        let send_res = self
-            .http
-            .post(url_str)
-            .json(&payload)
-            .send()
-            .await;
+        let send_res = self.http.post(url_str).json(&payload).send().await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let resp = match send_res {
@@ -778,7 +781,9 @@ impl LarkNotifier {
         let mode = self.config.mode.trim().to_ascii_lowercase();
 
         if mode == "webhook" {
-            return self.send_webhook_notification(title, message, url, color_template, fields).await;
+            return self
+                .send_webhook_notification(title, message, url, color_template, fields)
+                .await;
         }
 
         if mode == "both" {
@@ -788,13 +793,19 @@ impl LarkNotifier {
             if self.has_bot() {
                 if !self.config.channels.is_empty() {
                     for ch in &self.config.channels {
-                        match self.send_to_chat(&ch.chat_id, title, message, url, color_template, fields).await {
+                        match self
+                            .send_to_chat(&ch.chat_id, title, message, url, color_template, fields)
+                            .await
+                        {
                             Ok(_) => sent_any = true,
                             Err(e) => errors.push(format!("Lark channel {}: {e}", ch.name)),
                         }
                     }
                 } else if let Some(ref default_cid) = self.config.default_chat_id {
-                    match self.send_to_chat(default_cid, title, message, url, color_template, fields).await {
+                    match self
+                        .send_to_chat(default_cid, title, message, url, color_template, fields)
+                        .await
+                    {
                         Ok(_) => sent_any = true,
                         Err(e) => errors.push(format!("Lark default chat: {e}")),
                     }
@@ -802,7 +813,10 @@ impl LarkNotifier {
             }
 
             if self.has_webhook() {
-                match self.send_webhook_notification(title, message, url, color_template, fields).await {
+                match self
+                    .send_webhook_notification(title, message, url, color_template, fields)
+                    .await
+                {
                     Ok(_) => sent_any = true,
                     Err(e) => errors.push(format!("Lark webhook: {e}")),
                 }
@@ -820,11 +834,14 @@ impl LarkNotifier {
             }
             if !self.config.channels.is_empty() {
                 for ch in &self.config.channels {
-                    self.send_to_chat(&ch.chat_id, title, message, url, color_template, fields).await?;
+                    self.send_to_chat(&ch.chat_id, title, message, url, color_template, fields)
+                        .await?;
                 }
                 return Ok(());
             } else if let Some(ref default_cid) = self.config.default_chat_id {
-                return self.send_to_chat(default_cid, title, message, url, color_template, fields).await;
+                return self
+                    .send_to_chat(default_cid, title, message, url, color_template, fields)
+                    .await;
             } else {
                 anyhow::bail!("Lark mode is 'bot' but no channels or default_chat_id specified");
             }
@@ -835,7 +852,10 @@ impl LarkNotifier {
             if !self.config.channels.is_empty() {
                 let mut bot_err = None;
                 for ch in &self.config.channels {
-                    if let Err(e) = self.send_to_chat(&ch.chat_id, title, message, url, color_template, fields).await {
+                    if let Err(e) = self
+                        .send_to_chat(&ch.chat_id, title, message, url, color_template, fields)
+                        .await
+                    {
                         tracing::warn!("Lark bot send to {} ({}) failed: {e}", ch.name, ch.chat_id);
                         bot_err = Some(e);
                     }
@@ -846,27 +866,46 @@ impl LarkNotifier {
                 // Fall back to webhook if available
                 if self.has_webhook() {
                     tracing::warn!("Lark bot channels failed; falling back to webhook URL");
-                    return self.send_webhook_notification(title, message, url, color_template, fields).await;
+                    return self
+                        .send_webhook_notification(title, message, url, color_template, fields)
+                        .await;
                 }
                 Err(bot_err.unwrap())
             } else if let Some(ref default_cid) = self.config.default_chat_id {
-                match self.send_to_chat(default_cid, title, message, url, color_template, fields).await {
+                match self
+                    .send_to_chat(default_cid, title, message, url, color_template, fields)
+                    .await
+                {
                     Ok(_) => Ok(()),
                     Err(e) => {
                         if self.has_webhook() {
                             tracing::warn!("Lark bot send to default_chat_id failed ({e}); falling back to webhook URL");
-                            return self.send_webhook_notification(title, message, url, color_template, fields).await;
+                            return self
+                                .send_webhook_notification(
+                                    title,
+                                    message,
+                                    url,
+                                    color_template,
+                                    fields,
+                                )
+                                .await;
                         }
                         Err(e)
                     }
                 }
             } else if self.has_webhook() {
-                return self.send_webhook_notification(title, message, url, color_template, fields).await;
+                return self
+                    .send_webhook_notification(title, message, url, color_template, fields)
+                    .await;
             } else {
-                anyhow::bail!("Lark Bot is configured but no channels or default_chat_id specified");
+                anyhow::bail!(
+                    "Lark Bot is configured but no channels or default_chat_id specified"
+                );
             }
         } else if self.has_webhook() {
-            return self.send_webhook_notification(title, message, url, color_template, fields).await;
+            return self
+                .send_webhook_notification(title, message, url, color_template, fields)
+                .await;
         } else {
             anyhow::bail!("Lark is not configured (missing Bot credentials or Webhook URL)");
         }
@@ -884,18 +923,37 @@ impl LarkNotifier {
     ) -> Result<()> {
         if let Some(target) = target_channel {
             // Check if target matches a configured webhook channel
-            if let Some(wh) = self.webhook_channels().iter().find(|w| w.name.eq_ignore_ascii_case(target)) {
-                return self.send_to_webhook(&wh.url, wh.secret.as_deref(), title, message, url, color_template, fields).await;
+            if let Some(wh) = self
+                .webhook_channels()
+                .iter()
+                .find(|w| w.name.eq_ignore_ascii_case(target))
+            {
+                return self
+                    .send_to_webhook(
+                        &wh.url,
+                        wh.secret.as_deref(),
+                        title,
+                        message,
+                        url,
+                        color_template,
+                        fields,
+                    )
+                    .await;
             }
         }
 
         if self.has_bot() {
-            let chat_id = self
-                .resolve_chat_id(target_channel)
-                .ok_or_else(|| anyhow::anyhow!("Could not resolve Lark channel target: {:?}", target_channel))?;
-            self.send_to_chat(&chat_id, title, message, url, color_template, fields).await
+            let chat_id = self.resolve_chat_id(target_channel).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not resolve Lark channel target: {:?}",
+                    target_channel
+                )
+            })?;
+            self.send_to_chat(&chat_id, title, message, url, color_template, fields)
+                .await
         } else if self.has_webhook() {
-            self.send_webhook_notification(title, message, url, color_template, fields).await
+            self.send_webhook_notification(title, message, url, color_template, fields)
+                .await
         } else {
             anyhow::bail!("Lark is not configured")
         }
@@ -1026,7 +1084,10 @@ mod tests {
             Some("green")
         );
         assert_eq!(
-            header.get("title").and_then(|t| t.get("content")).and_then(|v| v.as_str()),
+            header
+                .get("title")
+                .and_then(|t| t.get("content"))
+                .and_then(|v| v.as_str()),
             Some("Test Card")
         );
 
@@ -1061,7 +1122,10 @@ mod tests {
         let whs1 = n1.webhook_channels();
         assert_eq!(whs1.len(), 1);
         assert_eq!(whs1[0].name, "default");
-        assert_eq!(whs1[0].url, "https://open.larksuite.com/open-apis/bot/v2/hook/wh1");
+        assert_eq!(
+            whs1[0].url,
+            "https://open.larksuite.com/open-apis/bot/v2/hook/wh1"
+        );
         assert_eq!(whs1[0].secret.as_deref(), Some("sec1"));
 
         // 2. Multiple named webhooks
@@ -1084,7 +1148,10 @@ mod tests {
         let whs2 = n2.webhook_channels();
         assert_eq!(whs2.len(), 2);
         assert_eq!(whs2[0].name, "devops");
-        assert_eq!(whs2[0].url, "https://open.larksuite.com/open-apis/bot/v2/hook/wh-devops");
+        assert_eq!(
+            whs2[0].url,
+            "https://open.larksuite.com/open-apis/bot/v2/hook/wh-devops"
+        );
         assert_eq!(whs2[0].secret.as_deref(), Some("sec-devops"));
         assert_eq!(whs2[1].name, "alerts");
         assert_eq!(whs2[1].secret, None);
@@ -1114,7 +1181,8 @@ admin_only = true\n\
         assert!(formatted.contains("  • **Sub-item**: Value"));
 
         // Blockquote converted to visual quote block
-        assert!(formatted.contains("▎ Important notice for <at id=\"ou_test123\"></at> and <at id=all></at>"));
+        assert!(formatted
+            .contains("▎ Important notice for <at id=\"ou_test123\"></at> and <at id=all></at>"));
 
         // Code block preserves hash comment without converting to bold and maps toml to yaml
         assert!(formatted.contains("# This is a comment"));
@@ -1133,7 +1201,10 @@ admin_only = true\n\
         let header = card.get("header").unwrap();
         // Dynamic title extracted from heading
         assert_eq!(
-            header.get("title").and_then(|t| t.get("content")).and_then(|v| v.as_str()),
+            header
+                .get("title")
+                .and_then(|t| t.get("content"))
+                .and_then(|v| v.as_str()),
             Some("🤖 Bot Digest")
         );
 
@@ -1144,8 +1215,14 @@ admin_only = true\n\
             .unwrap();
         // Two markdown sections and one hr divider between them
         assert_eq!(elements.len(), 3);
-        assert_eq!(elements[0].get("tag").and_then(|v| v.as_str()), Some("markdown"));
+        assert_eq!(
+            elements[0].get("tag").and_then(|v| v.as_str()),
+            Some("markdown")
+        );
         assert_eq!(elements[1].get("tag").and_then(|v| v.as_str()), Some("hr"));
-        assert_eq!(elements[2].get("tag").and_then(|v| v.as_str()), Some("markdown"));
+        assert_eq!(
+            elements[2].get("tag").and_then(|v| v.as_str()),
+            Some("markdown")
+        );
     }
 }

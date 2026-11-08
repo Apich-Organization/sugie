@@ -64,7 +64,9 @@ impl WebState {
         shutdown: Arc<tokio::sync::Notify>,
     ) -> anyhow::Result<Self> {
         let (db_path, port) = {
-            let c = config.read().map_err(|e| anyhow::anyhow!("RwLock poisoned: {e}"))?;
+            let c = config
+                .read()
+                .map_err(|e| anyhow::anyhow!("RwLock poisoned: {e}"))?;
             (c.db_path.clone(), c.port)
         };
         let db = WebDb::open(&db_path)?;
@@ -129,7 +131,10 @@ pub fn router(state: WebState) -> Router {
         .route("/admin/audit", get(audit_page))
         .route("/admin/notify", get(notify_page))
         .route("/admin/notify/send", post(notify_send))
-        .route("/admin/api/discord/sync-commands", post(sync_discord_commands))
+        .route(
+            "/admin/api/discord/sync-commands",
+            post(sync_discord_commands),
+        )
         .route("/admin/audit/settings", post(save_audit_settings))
         .route("/admin/audit/purge", post(purge_audit_logs))
         .route("/admin/audit/export", get(export_audit_csv))
@@ -449,7 +454,10 @@ async fn login_submit(
         return (
             StatusCode::TOO_MANY_REQUESTS,
             html(pages::login_page(
-                Some("Too many login requests from your IP. Please wait a minute and retry.".to_string()),
+                Some(
+                    "Too many login requests from your IP. Please wait a minute and retry."
+                        .to_string(),
+                ),
                 form.next,
                 None,
             )),
@@ -601,7 +609,10 @@ async fn login_2fa_submit(
         return (
             StatusCode::TOO_MANY_REQUESTS,
             html(pages::login_page(
-                Some("Too many verification attempts from your IP. Please wait a minute and retry.".to_string()),
+                Some(
+                    "Too many verification attempts from your IP. Please wait a minute and retry."
+                        .to_string(),
+                ),
                 form.next,
                 None,
             )),
@@ -1291,7 +1302,11 @@ fn render_config_response(
         discord_super_users: cfg.default_rules.commands.discord_super_users.join("\n"),
         zulip_super_users: cfg.default_rules.commands.zulip_super_users.join("\n"),
         lark_allowed_chats: cfg.default_rules.commands.lark_allowed_chats.join("\n"),
-        discord_allowed_channels: cfg.default_rules.commands.discord_allowed_channels.join("\n"),
+        discord_allowed_channels: cfg
+            .default_rules
+            .commands
+            .discord_allowed_channels
+            .join("\n"),
         zulip_allowed_channels: cfg.default_rules.commands.zulip_allowed_channels.join("\n"),
         restricted_commands: cfg.default_rules.commands.restricted_commands.join("\n"),
         stale_enabled: cfg.default_rules.stale.enabled,
@@ -1542,7 +1557,10 @@ async fn totp_activate(
         );
     };
 
-    match state.db.activate_totp_with_step(user.id, secret, matched_step) {
+    match state
+        .db
+        .activate_totp_with_step(user.id, secret, matched_step)
+    {
         Ok(_) => {
             state.db.audit(
                 &user.username,
@@ -1610,7 +1628,10 @@ async fn totp_disable(
         &ip,
         true,
     );
-    let mut resp = security_flash(true, "Authenticator OTP disabled. Other sessions were signed out.");
+    let mut resp = security_flash(
+        true,
+        "Authenticator OTP disabled. Other sessions were signed out.",
+    );
     if let Ok(token) = auth::mint_session_for_user(&state.db, user.id, &ip, &ua) {
         let secure = auth::is_secure_request(&headers);
         if let Ok(value) = HeaderValue::from_str(&auth::session_cookie(&token, secure)) {
@@ -2312,7 +2333,12 @@ async fn notify_send(
     let want_discord_webhook =
         form.contains_key("ch_discord_webhook") || form.contains_key("ch_discord");
     let want_discord_bot = form.contains_key("ch_discord_bot");
-    if !(want_lark_webhook || want_lark_bot || want_zulip || want_discord_webhook || want_discord_bot) {
+    if !(want_lark_webhook
+        || want_lark_bot
+        || want_zulip
+        || want_discord_webhook
+        || want_discord_bot)
+    {
         return notify_flash(false, "Select at least one channel");
     }
 
@@ -2380,7 +2406,9 @@ async fn notify_send(
         match notifier.lark() {
             Some(l) => {
                 if !l.has_bot() {
-                    failed.push("Lark Bot: not configured (missing App ID or App Secret)".to_string());
+                    failed.push(
+                        "Lark Bot: not configured (missing App ID or App Secret)".to_string(),
+                    );
                 } else {
                     let all_channels = l.bot_channels();
                     let target_channels: Vec<_> = all_channels
@@ -2569,8 +2597,14 @@ async fn notify_send(
                 } else {
                     for zc in channels_to_send {
                         match z.send_to_channel(&zc.channel, &zc.topic, &text).await {
-                            Ok(_) => sent.push(format!("Zulip ({} -> #{} > {})", zc.name, zc.channel, zc.topic)),
-                            Err(e) => failed.push(format!("Zulip ({} -> #{}:{}): {e}", zc.name, zc.channel, zc.topic)),
+                            Ok(_) => sent.push(format!(
+                                "Zulip ({} -> #{} > {})",
+                                zc.name, zc.channel, zc.topic
+                            )),
+                            Err(e) => failed.push(format!(
+                                "Zulip ({} -> #{}:{}): {e}",
+                                zc.name, zc.channel, zc.topic
+                            )),
                         }
                     }
                 }
@@ -2602,10 +2636,7 @@ async fn notify_send(
     notify_flash(ok, msg.trim())
 }
 
-async fn sync_discord_commands(
-    State(state): State<WebState>,
-    headers: HeaderMap,
-) -> Response {
+async fn sync_discord_commands(State(state): State<WebState>, headers: HeaderMap) -> Response {
     let user = match gate_admin(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
@@ -2698,7 +2729,10 @@ fn csv_cell(v: &str) -> String {
     let mut s = v.to_string();
     let trimmed = s.trim_start();
     // Neutralise spreadsheet formula injection.
-    if matches!(trimmed.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r')) {
+    if matches!(
+        trimmed.chars().next(),
+        Some('=' | '+' | '-' | '@' | '\t' | '\r')
+    ) {
         s.insert(0, '\'');
     }
     format!("\"{}\"", s.replace('"', "\"\""))
@@ -3296,7 +3330,11 @@ async fn save_structured(
                 config_tab_flash("basic", false, &format!("Failed to save: {e}"))
             }
         },
-        Err(e) => config_tab_flash("basic", false, &format!("Configuration validation failed: {e}")),
+        Err(e) => config_tab_flash(
+            "basic",
+            false,
+            &format!("Configuration validation failed: {e}"),
+        ),
     }
 }
 
@@ -3389,7 +3427,11 @@ async fn save_env(
                 &auth::client_ip(&headers),
                 true,
             );
-            config_tab_flash("env", true, "Saved .env; changes will take effect after restart")
+            config_tab_flash(
+                "env",
+                true,
+                "Saved .env; changes will take effect after restart",
+            )
         }
         Err(e) => {
             state.db.audit(
@@ -3416,7 +3458,11 @@ async fn restore_backup(
     };
     let name = form.get("name").cloned().unwrap_or_default();
     if name.starts_with(".env") && !user.is_owner() {
-        return config_tab_flash("backup", false, "Restoring .env backups containing secrets requires Owner role.");
+        return config_tab_flash(
+            "backup",
+            false,
+            "Restoring .env backups containing secrets requires Owner role.",
+        );
     }
     match state.files.restore_backup(&name) {
         Ok(_) => {
@@ -3433,7 +3479,11 @@ async fn restore_backup(
                 &auth::client_ip(&headers),
                 true,
             );
-            config_tab_flash("backup", true, &format!("Restored to {name} — configuration hot-reloaded!"))
+            config_tab_flash(
+                "backup",
+                true,
+                &format!("Restored to {name} — configuration hot-reloaded!"),
+            )
         }
         Err(e) => config_tab_flash("backup", false, &format!("Failed to restore backup: {e}")),
     }

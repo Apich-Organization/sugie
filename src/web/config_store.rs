@@ -115,7 +115,9 @@ impl ConfigFiles {
             }
         }
         if let Some(ref z) = cfg.notifications.zulip {
-            if !z.site_url.trim().is_empty() && !crate::notifications::is_safe_webhook_url(&z.site_url) {
+            if !z.site_url.trim().is_empty()
+                && !crate::notifications::is_safe_webhook_url(&z.site_url)
+            {
                 return Err(
                     "zulip.site_url must be a public https:// URL (private/internal IPs and http:// are not allowed)"
                         .to_string(),
@@ -126,14 +128,12 @@ impl ConfigFiles {
             if !d.webhook_url.trim().is_empty()
                 && !crate::notifications::is_safe_webhook_url(&d.webhook_url)
             {
-                return Err(
-                    "discord.webhook_url must be a public https:// URL".to_string(),
-                );
+                return Err("discord.webhook_url must be a public https:// URL".to_string());
             }
             if let Some(ref r_url) = d.reports_webhook_url {
                 if !r_url.trim().is_empty() && !crate::notifications::is_safe_webhook_url(r_url) {
                     return Err(
-                        "discord.reports_webhook_url must be a public https:// URL".to_string(),
+                        "discord.reports_webhook_url must be a public https:// URL".to_string()
                     );
                 }
             }
@@ -362,7 +362,11 @@ impl ConfigFiles {
 
     pub fn restore_backup(&self, name: &str) -> Result<()> {
         // Reject traversal: backups are flat file names only.
-        if name.contains('/') || name.contains('\\') || name.contains("..") || name.trim().is_empty() {
+        if name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || name.trim().is_empty()
+        {
             return Err(anyhow!("Invalid backup filename"));
         }
         let src = self.backup_dir.join(name);

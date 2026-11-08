@@ -36,7 +36,12 @@ impl TriageService {
         notifier: NotificationDispatcher,
         auth: Arc<GitHubAuthManager>,
     ) -> Self {
-        Self::with_shared_config(Arc::new(RwLock::new((*config).clone())), storage, notifier, auth)
+        Self::with_shared_config(
+            Arc::new(RwLock::new((*config).clone())),
+            storage,
+            notifier,
+            auth,
+        )
     }
 
     pub fn with_shared_config(
@@ -215,12 +220,18 @@ impl TriageService {
         let full_name = &event.repository.full_name;
 
         if !self.is_repo_allowed(full_name) {
-            info!("Ignoring issue_comment event for non-whitelisted repository: {}", full_name);
+            info!(
+                "Ignoring issue_comment event for non-whitelisted repository: {}",
+                full_name
+            );
             return Ok(());
         }
 
         if !self.is_repo_allowed(full_name) {
-            info!("Ignoring issues event for non-whitelisted repository: {}", full_name);
+            info!(
+                "Ignoring issues event for non-whitelisted repository: {}",
+                full_name
+            );
             return Ok(());
         }
         let issue_url = format!(
@@ -445,12 +456,18 @@ impl TriageService {
         let full_name = &event.repository.full_name;
 
         if !self.is_repo_allowed(full_name) {
-            info!("Ignoring issue_comment event for non-whitelisted repository: {}", full_name);
+            info!(
+                "Ignoring issue_comment event for non-whitelisted repository: {}",
+                full_name
+            );
             return Ok(());
         }
 
         if !self.is_repo_allowed(full_name) {
-            info!("Ignoring pull_request event for non-whitelisted repository: {}", full_name);
+            info!(
+                "Ignoring pull_request event for non-whitelisted repository: {}",
+                full_name
+            );
             return Ok(());
         }
         let pr_url = format!(
@@ -820,7 +837,10 @@ impl TriageService {
         let full_name = &event.repository.full_name;
 
         if !self.is_repo_allowed(full_name) {
-            info!("Ignoring issue_comment event for non-whitelisted repository: {}", full_name);
+            info!(
+                "Ignoring issue_comment event for non-whitelisted repository: {}",
+                full_name
+            );
             return Ok(());
         }
 
@@ -931,7 +951,10 @@ impl TriageService {
         let full_name = &event.repository.full_name;
 
         if !self.is_repo_allowed(full_name) {
-            info!("Ignoring check_suite event for non-whitelisted repository: {}", full_name);
+            info!(
+                "Ignoring check_suite event for non-whitelisted repository: {}",
+                full_name
+            );
             return Ok(());
         }
 

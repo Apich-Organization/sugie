@@ -142,16 +142,41 @@ impl DiscordNotifier {
                 .reports_channel_id
                 .as_deref()
                 .or(self.config.channel_id.as_deref())
-                .or_else(|| self.config.bot_channels.iter().find(|c| c.name == "reports" || c.name == "default").map(|c| c.channel_id.as_str()))
-                .or_else(|| self.config.bot_channels.first().map(|c| c.channel_id.as_str()))
+                .or_else(|| {
+                    self.config
+                        .bot_channels
+                        .iter()
+                        .find(|c| c.name == "reports" || c.name == "default")
+                        .map(|c| c.channel_id.as_str())
+                })
+                .or_else(|| {
+                    self.config
+                        .bot_channels
+                        .first()
+                        .map(|c| c.channel_id.as_str())
+                })
         } else {
             self.config
                 .channel_id
                 .as_deref()
-                .or_else(|| self.config.bot_channels.iter().find(|c| c.name == "default").map(|c| c.channel_id.as_str()))
-                .or_else(|| self.config.bot_channels.first().map(|c| c.channel_id.as_str()))
+                .or_else(|| {
+                    self.config
+                        .bot_channels
+                        .iter()
+                        .find(|c| c.name == "default")
+                        .map(|c| c.channel_id.as_str())
+                })
+                .or_else(|| {
+                    self.config
+                        .bot_channels
+                        .first()
+                        .map(|c| c.channel_id.as_str())
+                })
         };
-        channel.map(str::trim).filter(|c| !c.is_empty()).map(|s| s.to_string())
+        channel
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(|s| s.to_string())
     }
 
     pub fn resolve_webhook_url(&self, is_report: bool) -> Option<String> {
@@ -160,12 +185,24 @@ impl DiscordNotifier {
                 .reports_webhook_url
                 .as_deref()
                 .filter(|u| !u.trim().is_empty())
-                .or_else(|| self.config.webhooks.iter().find(|w| w.name == "reports" || w.name == "default").map(|w| w.url.as_str()))
+                .or_else(|| {
+                    self.config
+                        .webhooks
+                        .iter()
+                        .find(|w| w.name == "reports" || w.name == "default")
+                        .map(|w| w.url.as_str())
+                })
                 .or_else(|| self.config.webhooks.first().map(|w| w.url.as_str()))
                 .unwrap_or(&self.config.webhook_url)
         } else if !self.config.webhook_url.trim().is_empty() {
             &self.config.webhook_url
-        } else if let Some(first) = self.config.webhooks.iter().find(|w| w.name == "default").or_else(|| self.config.webhooks.first()) {
+        } else if let Some(first) = self
+            .config
+            .webhooks
+            .iter()
+            .find(|w| w.name == "default")
+            .or_else(|| self.config.webhooks.first())
+        {
             &first.url
         } else {
             ""
@@ -194,7 +231,9 @@ impl DiscordNotifier {
 
         if mode == "bot" {
             if !self.has_bot() {
-                anyhow::bail!("Discord mode is 'bot' but SUGIE_DISCORD_BOT_TOKEN is not configured");
+                anyhow::bail!(
+                    "Discord mode is 'bot' but SUGIE_DISCORD_BOT_TOKEN is not configured"
+                );
             }
             if let Some(ch) = self.resolve_bot_channel(is_report) {
                 return Ok(DiscordTarget::Channel(ch));
@@ -337,7 +376,8 @@ impl DiscordNotifier {
         if let Some(ref avatar) = self.config.avatar_url {
             payload["avatar_url"] = json!(avatar);
         }
-        self.post_json(webhook_url, &payload, None, title, false).await
+        self.post_json(webhook_url, &payload, None, title, false)
+            .await
     }
 
     pub async fn send_to_channel(
@@ -358,7 +398,8 @@ impl DiscordNotifier {
         let target_url = format!("{DISCORD_API}/channels/{channel_id}/messages");
         let payload = json!({ "embeds": [embed] });
         let auth = format!("Bot {}", token.trim());
-        self.post_json(&target_url, &payload, Some(&auth), title, false).await
+        self.post_json(&target_url, &payload, Some(&auth), title, false)
+            .await
     }
 
     pub async fn send_embed(
@@ -378,14 +419,20 @@ impl DiscordNotifier {
 
             if self.has_bot() {
                 if let Some(id) = self.resolve_bot_channel(is_report) {
-                    match self.send_to_channel(&id, title, description, url, color, fields.clone()).await {
+                    match self
+                        .send_to_channel(&id, title, description, url, color, fields.clone())
+                        .await
+                    {
                         Ok(_) => sent_any = true,
                         Err(e) => errors.push(format!("Bot channel {id}: {e}")),
                     }
                 }
             }
             if let Some(url_str) = self.resolve_webhook_url(is_report) {
-                match self.send_to_webhook(&url_str, title, description, url, color, fields).await {
+                match self
+                    .send_to_webhook(&url_str, title, description, url, color, fields)
+                    .await
+                {
                     Ok(_) => sent_any = true,
                     Err(e) => errors.push(format!("Webhook: {e}")),
                 }
@@ -398,14 +445,26 @@ impl DiscordNotifier {
 
         match self.target(is_report)? {
             DiscordTarget::Channel(id) => {
-                match self.send_to_channel(&id, title, description, url, color, fields.clone()).await {
+                match self
+                    .send_to_channel(&id, title, description, url, color, fields.clone())
+                    .await
+                {
                     Ok(_) => Ok(()),
                     Err(e) => {
                         // In auto mode, if bot send fails (e.g. HTTP 404 unknown channel), fall back to webhook if available
                         if mode == "auto" || mode.is_empty() {
                             if let Some(url_str) = self.resolve_webhook_url(is_report) {
                                 tracing::warn!("Discord bot send to channel {id} failed ({e}); falling back to webhook URL");
-                                return self.send_to_webhook(&url_str, title, description, url, color, fields).await;
+                                return self
+                                    .send_to_webhook(
+                                        &url_str,
+                                        title,
+                                        description,
+                                        url,
+                                        color,
+                                        fields,
+                                    )
+                                    .await;
                             }
                         }
                         Err(e)
@@ -413,7 +472,8 @@ impl DiscordNotifier {
                 }
             }
             DiscordTarget::Webhook(url_str) => {
-                self.send_to_webhook(&url_str, title, description, url, color, fields).await
+                self.send_to_webhook(&url_str, title, description, url, color, fields)
+                    .await
             }
         }
     }
@@ -487,7 +547,9 @@ impl DiscordNotifier {
                     for g in guilds {
                         if let Some(gid) = g["id"].as_str() {
                             let _ = http
-                                .put(format!("{DISCORD_API}/applications/{app_id}/guilds/{gid}/commands"))
+                                .put(format!(
+                                    "{DISCORD_API}/applications/{app_id}/guilds/{gid}/commands"
+                                ))
                                 .header(reqwest::header::AUTHORIZATION, &auth)
                                 .json(&commands_payload)
                                 .send()
@@ -499,7 +561,9 @@ impl DiscordNotifier {
             }
         }
 
-        Ok(format!("Synced 10 commands globally and to {guild_count} server(s)"))
+        Ok(format!(
+            "Synced 10 commands globally and to {guild_count} server(s)"
+        ))
     }
 }
 

@@ -2944,13 +2944,8 @@ mod tests {
             }],
         };
 
-        let html = crate::web::ui::render(notify_page(
-            user,
-            discord_opt,
-            lark_opt,
-            zulip_opt,
-            None,
-        ));
+        let html =
+            crate::web::ui::render(notify_page(user, discord_opt, lark_opt, zulip_opt, None));
 
         // All platform checkboxes must be checked
         assert!(html.contains(r#"name="ch_lark_webhook" checked"#));
@@ -2995,7 +2990,9 @@ mod tests {
             backups,
             None,
         ));
-        assert!(html.contains(r#"href="/admin/config/backup/download?name=sugie.toml.2026-11-04T12-00-00""#));
+        assert!(html.contains(
+            r#"href="/admin/config/backup/download?name=sugie.toml.2026-11-04T12-00-00""#
+        ));
         assert!(html.contains(r#"download="sugie.toml.2026-11-04T12-00-00""#));
         assert!(html.contains("Restore"));
     }

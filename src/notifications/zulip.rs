@@ -125,7 +125,8 @@ impl ZulipNotifier {
             ZulipTopicCategory::Custom(c) => c,
         };
 
-        self.send_to_channel(&self.config.stream, topic, content).await
+        self.send_to_channel(&self.config.stream, topic, content)
+            .await
     }
 }
 

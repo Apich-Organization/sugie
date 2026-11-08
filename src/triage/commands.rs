@@ -1580,7 +1580,13 @@ mod tests {
         };
 
         // Open command (/label) allowed for regular user when admin_only=false
-        assert!(executor.is_authorized(&SlashCommand::Label { add: vec!["bug".to_string()], remove: vec![] }, &regular_user));
+        assert!(executor.is_authorized(
+            &SlashCommand::Label {
+                add: vec!["bug".to_string()],
+                remove: vec![]
+            },
+            &regular_user
+        ));
         // Restricted command (/close) denied for regular user
         assert!(!executor.is_authorized(&SlashCommand::Close(None), &regular_user));
         // Restricted command (/close) allowed for super user
@@ -1589,9 +1595,27 @@ mod tests {
         // When admin_only is enabled, even open commands require super user
         let mut admin_only_config = config.clone();
         admin_only_config.admin_only = true;
-        let executor_admin_only = CommandExecutor::new(&dummy_client, &projects, &notifier, &admin_only_config, None);
+        let executor_admin_only = CommandExecutor::new(
+            &dummy_client,
+            &projects,
+            &notifier,
+            &admin_only_config,
+            None,
+        );
 
-        assert!(!executor_admin_only.is_authorized(&SlashCommand::Label { add: vec!["bug".to_string()], remove: vec![] }, &regular_user));
-        assert!(executor_admin_only.is_authorized(&SlashCommand::Label { add: vec!["bug".to_string()], remove: vec![] }, &admin_user));
+        assert!(!executor_admin_only.is_authorized(
+            &SlashCommand::Label {
+                add: vec!["bug".to_string()],
+                remove: vec![]
+            },
+            &regular_user
+        ));
+        assert!(executor_admin_only.is_authorized(
+            &SlashCommand::Label {
+                add: vec!["bug".to_string()],
+                remove: vec![]
+            },
+            &admin_user
+        ));
     }
 }

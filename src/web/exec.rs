@@ -851,10 +851,8 @@ async fn run(ctx: &Ctx<'_>, cmd: &str, args: &[String]) -> bool {
             };
             let config = ctx.state.config();
             let cfg = config.default_rules.reports.clone();
-            let reporter = MetricsReporter::new(
-                cfg,
-                NotificationDispatcher::new(&config.notifications),
-            );
+            let reporter =
+                MetricsReporter::new(cfg, NotificationDispatcher::new(&config.notifications));
             let days = if monthly { 30 } else { 7 };
             let label = if monthly { "Monthly" } else { "Weekly" };
             ctx.info(format!("Generating {label} report (past {days} days)…"));
